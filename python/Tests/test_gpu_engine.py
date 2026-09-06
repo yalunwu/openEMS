@@ -8,10 +8,13 @@
 # (at your option) any later version.
 #
 
+import os
+import tempfile
 import unittest
 import numpy as np
 
 from CSXCAD import ContinuousStructure
+from CSXCAD.CSProperties import CSPropLorentzMaterial
 from openEMS.openEMS import openEMS
 
 
@@ -26,50 +29,55 @@ def _make_grid():
 
 
 class Test_GPUEngine(unittest.TestCase):
+    def setUp(self):
+        self.sim_dir = os.path.join(tempfile.gettempdir(), 'test_gpu_openems')
+
     def test_gpu_command_line_option(self):
-        """Verify that openEMS accepts --engine=webgpu and --engine=gpu arguments."""
-        fdtd = openEMS()
-        self.assertIsNotNone(fdtd)
-        # Passing GPU options should be accepted cleanly
-        fdtd.SetLibraryArguments(["--engine=webgpu"])
-        fdtd_gpu = openEMS()
-        fdtd_gpu.SetLibraryArguments(["--engine=gpu"])
+        """Verify that openEMS accepts engine='webgpu' and engine='gpu' keyword arguments."""
+        csx = _make_grid()
+        fdtd = openEMS(NrTS=15)
+        fdtd.SetCSX(csx)
+        fdtd.SetGaussExcite(1e9, 0.5e9)
+        fdtd.SetBoundaryCond(['PML_8'] * 6)
+        ret_webgpu = fdtd.Run(self.sim_dir, setup_only=True, engine='webgpu')
+        self.assertEqual(ret_webgpu, 0)
+
+        fdtd2 = openEMS(NrTS=15)
+        fdtd2.SetCSX(_make_grid())
+        fdtd2.SetGaussExcite(1e9, 0.5e9)
+        fdtd2.SetBoundaryCond(['PML_8'] * 6)
+        ret_gpu = fdtd2.Run(self.sim_dir, setup_only=True, engine='gpu')
+        self.assertEqual(ret_gpu, 0)
 
     def test_graceful_fallback_lorentz_material(self):
         """Verify that a model with unsupported Lorentz material falls back gracefully."""
         csx = _make_grid()
-        # Add a Lorentz dispersive material
-        mat = csx.AddLorentzMaterial('DispersivePlasma')
-        mat.SetParams(eps_inf=1.0, f0=1e9, gamma=1e6)
-        start = [-10, -10, -2]
-        stop = [10, 10, 2]
-        mat.AddBox(start, stop)
+        lorentz = CSPropLorentzMaterial(csx.GetParameterSet(), epsilon=2.0, order=1)
+        lorentz.SetName('DispersivePlasma')
+        csx.AddProperty(lorentz)
+        lorentz.AddBox(start=[-10, -10, -2], stop=[10, 10, 2])
 
-        fdtd = openEMS(NrTS=50)
+        fdtd = openEMS(NrTS=15)
         fdtd.SetCSX(csx)
         fdtd.SetGaussExcite(1e9, 0.5e9)
-        fdtd.SetBoundaryCond(['PML_8', 'PML_8', 'PML_8', 'PML_8', 'PML_8', 'PML_8'])
-        fdtd.SetLibraryArguments(["--engine=gpu"])
+        fdtd.SetBoundaryCond(['PML_8'] * 6)
 
-        # SetupFDTD should detect Lorentz material and fall back to CPU without throwing an exception
-        ret = fdtd.SetupFDTD()
+        # Run with engine='gpu' should detect Lorentz and fall back to multithreaded CPU
+        ret = fdtd.Run(self.sim_dir, setup_only=True, engine='gpu')
         self.assertEqual(ret, 0)
 
     def test_standard_model_gpu_setup(self):
-        """Verify that a standard antenna/microwave model with UPML boundaries initializes."""
+        """Verify that a standard model with UPML boundaries initializes on GPU engine."""
         csx = _make_grid()
         metal = csx.AddMetal('PEC_Sheet')
-        start = [-5, -5, 0]
-        stop = [5, 5, 0]
-        metal.AddBox(start, stop)
+        metal.AddBox(start=[-5, -5, 0], stop=[5, 5, 0])
 
-        fdtd = openEMS(NrTS=50)
+        fdtd = openEMS(NrTS=15)
         fdtd.SetCSX(csx)
         fdtd.SetGaussExcite(1e9, 0.5e9)
-        fdtd.SetBoundaryCond(['PML_8', 'PML_8', 'PML_8', 'PML_8', 'PML_8', 'PML_8'])
-        fdtd.SetLibraryArguments(["--engine=gpu"])
+        fdtd.SetBoundaryCond(['PML_8'] * 6)
 
-        ret = fdtd.SetupFDTD()
+        ret = fdtd.Run(self.sim_dir, setup_only=True, engine='webgpu')
         self.assertEqual(ret, 0)
 
 

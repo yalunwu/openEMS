@@ -22,21 +22,22 @@ bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStruct
 
 	if (csx)
 	{
+		ContinuousStructure* nonConstCSX = const_cast<ContinuousStructure*>(csx);
 		// Check for dispersive media
-		if (csx->GetQtyPropertyType(CSProperties::LORENTZMATERIAL) > 0)
+		if (nonConstCSX->GetQtyPropertyType(CSProperties::LORENTZMATERIAL) > 0)
 		{
 			unsupportedReason = "Dispersive material (Lorentz) is not supported on WebGPU.";
 			return false;
 		}
 
-		if (csx->GetQtyPropertyType(CSProperties::DEBYEMATERIAL) > 0)
+		if (nonConstCSX->GetQtyPropertyType(CSProperties::DEBYEMATERIAL) > 0)
 		{
 			unsupportedReason = "Dispersive material (Debye) is not supported on WebGPU.";
 			return false;
 		}
 
 		// Check for conducting sheets
-		if (csx->GetQtyPropertyType(CSProperties::CONDUCTINGSHEET) > 0)
+		if (nonConstCSX->GetQtyPropertyType(CSProperties::CONDUCTINGSHEET) > 0)
 		{
 			unsupportedReason = "Conducting sheets are not supported on WebGPU.";
 			return false;

@@ -21,10 +21,19 @@ elseif(UNIX)
 endif()
 
 # Check for local or system wgpu-native installation
+set(WEBGPU_SEARCH_PATHS
+    ${WEBGPU_ROOT_DIR}
+    ${CMAKE_BINARY_DIR}/wgpu_test
+    ${PROJECT_SOURCE_DIR}/build/wgpu_test
+    ${PROJECT_SOURCE_DIR}/wgpu_native
+)
+
 find_path(WEBGPU_INCLUDE_DIR
     NAMES webgpu/webgpu.h webgpu.h
     PATHS
-        ${WEBGPU_ROOT_DIR}/include
+        ${WEBGPU_SEARCH_PATHS}
+    PATH_SUFFIXES
+        include
         /usr/local/include
         /opt/homebrew/include
 )
@@ -32,17 +41,36 @@ find_path(WEBGPU_INCLUDE_DIR
 find_library(WEBGPU_LIBRARY
     NAMES wgpu_native wgpu
     PATHS
-        ${WEBGPU_ROOT_DIR}/lib
-        ${WEBGPU_ROOT_DIR}/bin
+        ${WEBGPU_SEARCH_PATHS}
+    PATH_SUFFIXES
+        lib
+        bin
         /usr/local/lib
         /opt/homebrew/lib
 )
 
 if(WEBGPU_INCLUDE_DIR AND WEBGPU_LIBRARY)
-    message(STATUS "Found existing wgpu-native: ${WEBGPU_LIBRARY}")
+    message(STATUS "Found existing wgpu-native library: ${WEBGPU_LIBRARY}")
+    message(STATUS "Found existing wgpu-native include: ${WEBGPU_INCLUDE_DIR}")
     include_directories(${WEBGPU_INCLUDE_DIR})
     set(WEBGPU_LIBRARIES ${WEBGPU_LIBRARY})
     add_definitions(-DENABLE_WEBGPU)
+
+    if(WIN32)
+        find_file(WEBGPU_DLL
+            NAMES wgpu_native.dll
+            PATHS
+                ${WEBGPU_SEARCH_PATHS}
+            PATH_SUFFIXES
+                lib
+                bin
+        )
+        if(WEBGPU_DLL)
+            message(STATUS "Found wgpu-native DLL: ${WEBGPU_DLL}")
+            file(COPY ${WEBGPU_DLL} DESTINATION ${CMAKE_BINARY_DIR})
+            install(FILES ${WEBGPU_DLL} DESTINATION bin)
+        endif()
+    endif()
 else()
     message(STATUS "wgpu-native target platform: ${WGPU_ARCH}")
     message(STATUS "To link against wgpu-native, set -DWEBGPU_ROOT_DIR=<path_to_wgpu_native>")

@@ -19,7 +19,7 @@ class Operator;
 class ContinuousStructure;
 
 //! High-performance GPU acceleration engine powered by WebGPU (Metal, Vulkan, DX12).
-class EngineWebGPU : public EngineBackend
+class OPENEMS_EXPORT EngineWebGPU : public EngineBackend
 {
 public:
 	explicit EngineWebGPU(const Operator* op);
@@ -69,6 +69,15 @@ private:
 	WGPUBuffer m_bufGridUniforms;
 	WGPUBuffer m_bufProbeHistory;
 
+	// Staging buffers for readback
+	WGPUBuffer m_bufStagingVolt;
+	WGPUBuffer m_bufStagingCurr;
+
+	// Shader module and layouts
+	WGPUShaderModule m_shaderModule;
+	WGPUBindGroupLayout m_bindGroupLayoutFields;
+	WGPUPipelineLayout m_pipelineLayout;
+
 	// Compute pipelines
 	WGPUComputePipeline m_pipelineVolt;
 	WGPUComputePipeline m_pipelineCurr;
@@ -87,6 +96,7 @@ private:
 	bool AllocateBuffers();
 	bool CompileShaders();
 	void DispatchWorkgroups(WGPUComputePipeline pipeline, uint32_t gx, uint32_t gy, uint32_t gz);
+	void ApplyExcitation(unsigned int step);
 	size_t GetLinearIndex(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const;
 };
 

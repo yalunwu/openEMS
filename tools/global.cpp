@@ -120,6 +120,8 @@ void Global::parseLibraryArguments(std::vector<std::string> allOptions)
 
 	for (std::string& option : allOptions)
 	{
+		if (option.empty() || option[0] == '-')
+			continue;
 		if (option.length() == 1)
 			option = "-" + option;
 		else

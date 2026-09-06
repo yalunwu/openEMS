@@ -26,6 +26,8 @@ typedef struct WGPUBufferImpl* WGPUBuffer;
 typedef struct WGPUComputePipelineImpl* WGPUComputePipeline;
 typedef struct WGPUBindGroupImpl* WGPUBindGroup;
 typedef struct WGPUBindGroupLayoutImpl* WGPUBindGroupLayout;
+typedef struct WGPUShaderModuleImpl* WGPUShaderModule;
+typedef struct WGPUPipelineLayoutImpl* WGPUPipelineLayout;
 typedef struct WGPUCommandEncoderImpl* WGPUCommandEncoder;
 typedef struct WGPUCommandBufferImpl* WGPUCommandBuffer;
 #endif

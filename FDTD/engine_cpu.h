@@ -14,7 +14,7 @@
 #include "engine.h"
 
 //! CPU simulation backend wrapping openEMS's existing multithreaded / SSE / basic FDTD engines.
-class EngineCPU : public EngineBackend
+class OPENEMS_EXPORT EngineCPU : public EngineBackend
 {
 public:
 	explicit EngineCPU(Engine* existingEngine, bool ownsEngine = true);

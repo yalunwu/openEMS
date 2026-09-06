@@ -14,13 +14,15 @@
 #include <memory>
 #include <vector>
 #include "tools/global.h"
+#include "tools/constants.h"
+#include "openems_global.h"
 
 class Operator;
 class ContinuousStructure;
 class Engine;
 
 //! Abstract base class for all pluggable simulation backends (CPU, WebGPU, etc.)
-class EngineBackend
+class OPENEMS_EXPORT EngineBackend
 {
 public:
 	virtual ~EngineBackend() = default;
