@@ -26,6 +26,7 @@
 #endif
 #include <ctime>
 #include <vector>
+#include <memory>
 
 #include "openems_global.h"
 
@@ -34,6 +35,7 @@
 
 class Operator;
 class Engine;
+class EngineBackend;
 class Engine_Interface_FDTD;
 class ProcessingArray;
 class TiXmlElement;
@@ -162,12 +164,13 @@ protected:
 	bool m_Abort;
 
 #ifdef MPI_SUPPORT
-	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_MPI};
+	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_MPI, EngineType_WebGPU};
 #else
-	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded};
+	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_WebGPU};
 #endif
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;
+	std::unique_ptr<EngineBackend> m_EngineBackend;
 
 	//! Setup an operator matching the requested engine
 	virtual bool SetupOperator();

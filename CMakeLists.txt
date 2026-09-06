@@ -73,6 +73,12 @@ if (WITH_MPI)
 	message(STATUS "Found MPI. INCLUDE " ${MPI_INCLUDE_PATH})
 endif()
 
+# WebGPU acceleration backend option
+option(ENABLE_WEBGPU "Enable WebGPU acceleration backend (Metal/Vulkan/DX12)" OFF)
+if(ENABLE_WEBGPU)
+  include(${PROJECT_SOURCE_DIR}/cmake/FetchWgpuNative.cmake)
+endif()
+
 # Set locations of extra CMake modules
 SET(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${openEMS_SOURCE_DIR}/cmake/Modules/")
 
@@ -192,6 +198,7 @@ TARGET_LINK_LIBRARIES( openEMS
   ${Boost_LIBRARIES}
   ${vtk_LIBS}
   ${MPI_LIBRARIES}
+  ${WEBGPU_LIBRARIES}
 )
 
 if (WIN32)

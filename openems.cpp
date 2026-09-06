@@ -37,6 +37,9 @@
 #include "FDTD/extensions/engine_ext_steadystate.h"
 #include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/engine_interface_cylindrical_fdtd.h"
+#include "FDTD/engine_backend.h"
+#include "FDTD/engine_cpu.h"
+#include "FDTD/webgpu/engine_webgpu.h"
 #include "Common/processvoltage.h"
 #include "Common/processcurrent.h"
 #include "Common/processfieldprobe.h"
@@ -103,6 +106,7 @@ void openEMS::Reset()
 	PA=0;
 	delete FDTD_Eng;
 	FDTD_Eng=0;
+	m_EngineBackend.reset();
 	delete FDTD_Op;
 	FDTD_Op=0;
 	delete m_CSX;
@@ -247,6 +251,11 @@ void openEMS::collectCommandLineArguments()
 						cout << "openEMS - enabled multithreading" << endl;
 						m_engine = EngineType_Multithreaded;
 					}
+					else if (val == "webgpu" || val == "gpu")
+					{
+						cout << "openEMS - enabled WebGPU acceleration engine" << endl;
+						m_engine = EngineType_WebGPU;
+					}
 				}
 			),
 		    "Choose engine type \n\n"
@@ -256,6 +265,8 @@ void openEMS::collectCommandLineArguments()
 			"  sse-compressed: \tengine using compressed "
 			"operator + sse vector extensions\n"
 			"  multithreaded: \tengine using compressed "
+			"operator + sse vector extensions + multithreading\n"
+			"  webgpu/gpu: \tGPU-accelerated engine (Metal/Vulkan/DX12) with CPU fallback\n"
 #ifdef MPI_SUPPORT
 			"operator + sse vector extensions + MPI + multithreading\n"
 #else
@@ -749,7 +760,7 @@ bool openEMS::SetupOperator()
 	{
 		FDTD_Op = Operator_SSE_Compressed::New();
 	}
-	else if (m_engine == EngineType_Multithreaded)
+	else if (m_engine == EngineType_Multithreaded || m_engine == EngineType_WebGPU)
 	{
 		FDTD_Op = Operator_Multithread::New(m_engine_numThreads);
 	}
@@ -1319,6 +1330,34 @@ int openEMS::SetupFDTD()
 	//create FDTD engine
 	FDTD_Eng = FDTD_Op->CreateEngine();
 
+	if (m_engine == EngineType_WebGPU)
+	{
+		std::string unsupportedReason;
+		if (EngineWebGPU::CheckModelSupport(FDTD_Op, m_CSX, unsupportedReason))
+		{
+			auto webgpuBackend = std::make_unique<EngineWebGPU>(FDTD_Op);
+			if (webgpuBackend->Initialize())
+			{
+				m_EngineBackend = std::move(webgpuBackend);
+				cout << "[openEMS] Activated " << m_EngineBackend->GetBackendName() << " acceleration backend." << endl;
+			}
+			else
+			{
+				cout << "[openEMS GPU] Warning: WebGPU initialization failed -> falling back to multithreaded CPU engine." << endl;
+				m_EngineBackend = std::make_unique<EngineCPU>(FDTD_Eng, false);
+			}
+		}
+		else
+		{
+			cout << "[openEMS GPU] Notice: " << unsupportedReason << " Falling back gracefully to multithreaded CPU engine." << endl;
+			m_EngineBackend = std::make_unique<EngineCPU>(FDTD_Eng, false);
+		}
+	}
+	else
+	{
+		m_EngineBackend = std::make_unique<EngineCPU>(FDTD_Eng, false);
+	}
+
 	if (Op_Ext_SSD)
 	{
 		Eng_Ext_SSD = dynamic_cast<Engine_Ext_SteadyState*>(Op_Ext_SSD->GetEngineExtention());
@@ -1426,9 +1465,19 @@ void openEMS::RunFDTD()
 	PA->PreProcess();
 	int step=PA->Process();
 	if ((step<0) || (step>(int)NrTS)) step=NrTS;
-	while ((FDTD_Eng->GetNumberOfTimesteps()<NrTS) && (change>endCrit) && !CheckAbortCond())
+	while (((m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps()) < NrTS) && (change>endCrit) && !CheckAbortCond())
 	{
-		FDTD_Eng->IterateTS(step);
+		if (m_EngineBackend)
+			m_EngineBackend->IterateTS(step);
+		else
+			FDTD_Eng->IterateTS(step);
+
+		if (m_EngineBackend)
+		{
+			m_EngineBackend->SyncFieldsToHost();
+			m_EngineBackend->SyncProbesToHost();
+		}
+
 		step=PA->Process();
 
 		if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
@@ -1438,7 +1487,7 @@ void openEMS::RunFDTD()
 				maxE=currE;
 		}
 
-		currTS = FDTD_Eng->GetNumberOfTimesteps();
+		currTS = m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps();
 		if ((step<0) || (step>(int)(NrTS - currTS))) step=NrTS - currTS;
 
 		gettimeofday(&currTime,NULL);
@@ -1472,6 +1521,8 @@ void openEMS::RunFDTD()
 
 			if (m_DumpStats)
 				DumpRunStatistics(OPENEMS_RUN_STAT_FILE, t_run, currTS, speed, currE);
+			if (m_EngineBackend)
+				m_EngineBackend->NextInterval(speed);
 			FDTD_Eng->NextInterval(speed);
 		}
 	}
@@ -1482,8 +1533,9 @@ void openEMS::RunFDTD()
 	gettimeofday(&currTime,NULL);
 	t_diff = CalcDiffTime(currTime,startTime);
 
-	cout << "Time for " << FDTD_Eng->GetNumberOfTimesteps() << " iterations with " << FDTD_Op->GetNumberCells() << " cells : " << t_diff << " sec" << endl;
-	cout << "Speed: " << numCells*(double)FDTD_Eng->GetNumberOfTimesteps()/t_diff*1e-6 << " MCells/s " << endl;
+	unsigned int finalTS = m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps();
+	cout << "Time for " << finalTS << " iterations with " << FDTD_Op->GetNumberCells() << " cells : " << t_diff << " sec" << endl;
+	cout << "Speed: " << numCells*(double)finalTS/t_diff*1e-6 << " MCells/s " << endl;
 
 	if (m_DumpStats)
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);

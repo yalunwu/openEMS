@@ -11,6 +11,9 @@ set(SOURCES
   ${SOURCES}
   ${MPI_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/engine.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine_backend.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine_cpu.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/webgpu/engine_webgpu.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_multithread.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_cylinder.cpp
