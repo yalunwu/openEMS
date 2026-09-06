@@ -48,6 +48,7 @@ public:
 	virtual bool IterateTS(unsigned int iterTS);
 
 	virtual unsigned int GetNumberOfTimesteps() {return numTS;}
+	inline void SetNumberOfTimesteps(unsigned int ts) {numTS = ts;}
 
 	virtual void NextInterval(float curr_speed) {UNUSED(curr_speed);};
 

@@ -32,6 +32,7 @@ public:
 
 	//! Set the field type (0 electric field, 1 magnetic field)
 	void SetFieldType(int type);
+	int GetFieldType() const { return m_ModeFieldType; }
 
 	virtual int GetNumberOfIntegrals() const {return 3;}
 	virtual double* CalcMultipleIntegrals();

@@ -16,6 +16,7 @@
 
 #ifdef ENABLE_WEBGPU
 #include <webgpu/webgpu.h>
+#include <webgpu/wgpu.h>
 #else
 // Lightweight fallback types when WebGPU is disabled at compile-time
 typedef struct WGPUInstanceImpl* WGPUInstance;

@@ -34,11 +34,11 @@ fn get_index(n: u32, x: u32, y: u32, z: u32) -> u32 {
     return n * stride_n + x * stride_x + y * grid.dimZ + z;
 }
 
-@compute @workgroup_size(8, 8, 4)
+@compute @workgroup_size(32, 4, 2)
 fn update_voltages(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let x = global_id.x;
+    let z = global_id.x;
     let y = global_id.y;
-    let z = global_id.z;
+    let x = global_id.z;
 
     if (x >= grid.dimX || y >= grid.dimY || z >= grid.dimZ) {
         return;
@@ -67,11 +67,11 @@ fn update_voltages(@builtin(global_invocation_id) global_id: vec3<u32>) {
     volt[idx_ez] = volt[idx_ez] * vv[idx_ez] + vi[idx_ez] * curl_h_z;
 }
 
-@compute @workgroup_size(8, 8, 4)
+@compute @workgroup_size(32, 4, 2)
 fn update_currents(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let x = global_id.x;
+    let z = global_id.x;
     let y = global_id.y;
-    let z = global_id.z;
+    let x = global_id.z;
 
     // Currents are evaluated on the dual grid (dim - 1)
     if (x >= (grid.dimX - 1u) || y >= (grid.dimY - 1u) || z >= (grid.dimZ - 1u)) {
@@ -129,11 +129,11 @@ fn get_pml_idx(n: u32, x: u32, y: u32, z: u32) -> u32 {
     return n * stride_n + x * stride_x + y * upml.numZ + z;
 }
 
-@compute @workgroup_size(8, 8, 4)
+@compute @workgroup_size(32, 4, 2)
 fn upml_pre_update(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let lx = global_id.x;
+    let lz = global_id.x;
     let ly = global_id.y;
-    let lz = global_id.z;
+    let lx = global_id.z;
 
     if (lx >= upml.numX || ly >= upml.numY || lz >= upml.numZ) {
         return;
@@ -218,6 +218,9 @@ struct ExcitationPoint {
 
 struct ExcitationParams {
     count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> excParams: ExcitationParams;
@@ -232,6 +235,40 @@ fn inject_excitation(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     let p = points[i];
     field[p.index] = field[p.index] + p.value;
+}
+)";
+
+	static const char* kShaderProbeGather = R"(
+struct ProbePoint {
+    isCurr: u32,
+    linIdx: u32,
+};
+
+struct ProbeGatherParams {
+    numPoints: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: ProbeGatherParams;
+@group(0) @binding(1) var<storage, read> points: array<ProbePoint>;
+@group(0) @binding(2) var<storage, read> volt: array<f32>;
+@group(0) @binding(3) var<storage, read> curr: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gatheredValues: array<f32>;
+
+@compute @workgroup_size(64, 1, 1)
+fn gather_probe_points(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let idx = global_id.x;
+    if (idx >= params.numPoints) {
+        return;
+    }
+    let pt = points[idx];
+    if (pt.isCurr == 1u) {
+        gatheredValues[idx] = curr[pt.linIdx];
+    } else {
+        gatheredValues[idx] = volt[pt.linIdx];
+    }
 }
 )";
 }

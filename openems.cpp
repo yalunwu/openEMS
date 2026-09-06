@@ -760,7 +760,7 @@ bool openEMS::SetupOperator()
 	{
 		FDTD_Op = Operator_SSE_Compressed::New();
 	}
-	else if (m_engine == EngineType_Multithreaded || m_engine == EngineType_WebGPU)
+	else if (m_engine == EngineType_Multithreaded)
 	{
 		FDTD_Op = Operator_Multithread::New(m_engine_numThreads);
 	}
@@ -1340,6 +1340,8 @@ int openEMS::SetupFDTD()
 			{
 				m_EngineBackend = std::move(webgpuBackend);
 				cout << "[openEMS] Activated " << m_EngineBackend->GetBackendName() << " acceleration backend." << endl;
+				if (PA)
+					m_EngineBackend->RegisterProbes(PA);
 			}
 			else
 			{
@@ -1370,6 +1372,9 @@ int openEMS::SetupFDTD()
 		Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
 		return 2;
 	}
+
+	if (m_EngineBackend && PA)
+		m_EngineBackend->RegisterProbes(PA);
 
 	// Cleanup all unused material storages...
 	FDTD_Op->CleanupMaterialStorage();
@@ -1468,13 +1473,37 @@ void openEMS::RunFDTD()
 	while (((m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps()) < NrTS) && (change>endCrit) && !CheckAbortCond())
 	{
 		if (m_EngineBackend)
+		{
 			m_EngineBackend->IterateTS(step);
+			FDTD_Eng->SetNumberOfTimesteps(m_EngineBackend->GetNumberOfTimesteps());
+		}
 		else
 			FDTD_Eng->IterateTS(step);
 
 		if (m_EngineBackend)
 		{
-			m_EngineBackend->SyncFieldsToHost();
+			gettimeofday(&currTime, NULL);
+			double timeSincePrev = CalcDiffTime(currTime, prevTime);
+
+			bool needFullField = false;
+			if ((Eng_Ext_SSD == NULL) && (ProcField->CheckTimestep() || timeSincePrev > 4.0))
+				needFullField = true;
+			else if (PA)
+			{
+				for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
+				{
+					Processing* p = PA->GetProcessing(i);
+					if ((dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->CheckTimestep())
+					{
+						needFullField = true;
+						break;
+					}
+				}
+			}
+
+			if (needFullField)
+				m_EngineBackend->SyncFieldsToHost();
+
 			m_EngineBackend->SyncProbesToHost();
 		}
 
@@ -1541,6 +1570,9 @@ void openEMS::RunFDTD()
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
 
 	//*************** postproc ************//
+	if (m_EngineBackend)
+		m_EngineBackend->SyncFieldsToHost();
+
 	PA->PostProcess();
 
 	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);

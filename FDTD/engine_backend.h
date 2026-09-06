@@ -20,6 +20,7 @@
 class Operator;
 class ContinuousStructure;
 class Engine;
+class ProcessingArray;
 
 //! Abstract base class for all pluggable simulation backends (CPU, WebGPU, etc.)
 class OPENEMS_EXPORT EngineBackend
@@ -59,6 +60,9 @@ public:
 
 	//! Synchronize point probe and line integral values from device to host
 	virtual bool SyncProbesToHost() = 0;
+
+	//! Register probe points/integrals for efficient on-device extraction
+	virtual void RegisterProbes(const ProcessingArray* pa) { UNUSED(pa); }
 
 	//! Human-readable backend name (e.g. "CPU-Multithreaded", "WebGPU-Metal", "WebGPU-Vulkan")
 	virtual std::string GetBackendName() const = 0;

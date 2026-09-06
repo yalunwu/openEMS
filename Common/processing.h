@@ -61,6 +61,11 @@ public:
 
 	virtual void ShowSnappedCoords();
 
+	const unsigned int* GetStartCoord() const { return start; }
+	const unsigned int* GetStopCoord() const { return stop; }
+	const bool* GetStartInside() const { return m_start_inside; }
+	const bool* GetStopInside() const { return m_stop_inside; }
+
 	void SetProcessInterval(unsigned int interval);
 	void SetProcessStartStopTime(double start, double stop);
 

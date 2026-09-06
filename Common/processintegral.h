@@ -34,6 +34,7 @@ public:
 	virtual std::string GetProcessingName() const = 0;
 
 	virtual void GetNormalDir(int nd) {m_normDir=nd;}
+	int GetNormalDir() const { return m_normDir; }
 
 	//! Flush FD data to disk
 	virtual void FlushData();

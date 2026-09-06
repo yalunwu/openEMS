@@ -17,6 +17,7 @@
 
 class Operator;
 class ContinuousStructure;
+class Excitation;
 
 //! High-performance GPU acceleration engine powered by WebGPU (Metal, Vulkan, DX12).
 class OPENEMS_EXPORT EngineWebGPU : public EngineBackend
@@ -38,6 +39,7 @@ public:
 
 	bool SyncFieldsToHost() override;
 	bool SyncProbesToHost() override;
+	void RegisterProbes(const ProcessingArray* pa) override;
 
 	std::string GetBackendName() const override;
 
@@ -46,6 +48,11 @@ public:
 
 	//! Query detected device capabilities
 	OpenEMS_WebGPU::DeviceCaps GetDeviceCaps() const { return m_caps; }
+
+	struct ProbePoint {
+		uint32_t isCurr; // 0 = Volt, 1 = Curr
+		uint32_t linIdx; // linear element index
+	};
 
 private:
 	const Operator* m_op;
@@ -92,11 +99,58 @@ private:
 	mutable std::vector<float> m_hostCurr;
 	mutable bool m_hostFieldsValid;
 
+	// Probe gather resources
+	std::vector<ProbePoint> m_probePoints;
+	WGPUBuffer m_bufProbePoints;
+	WGPUBuffer m_bufProbeParams;
+	WGPUBuffer m_bufProbeValues;
+	WGPUBuffer m_bufStagingProbes;
+	WGPUBindGroupLayout m_bindGroupLayoutProbeGather;
+	WGPUPipelineLayout m_pipelineLayoutProbeGather;
+	WGPUComputePipeline m_pipelineProbeGather;
+	WGPUBindGroup m_bindGroupProbeGather;
+
+	// Excitation acceleration resources
+	struct GpuExcPoint {
+		uint32_t index;
+		float value;
+	};
+	struct GpuExcParams {
+		uint32_t count;
+		uint32_t pad[3];
+	};
+	struct ExcitationSourceInfo {
+		Excitation* exc = nullptr;
+		unsigned int voltCount = 0;
+		std::vector<uint32_t> voltIndices;
+		std::vector<uint32_t> voltDelays;
+		std::vector<float> voltAmps;
+		unsigned int currCount = 0;
+		std::vector<uint32_t> currIndices;
+		std::vector<uint32_t> currDelays;
+		std::vector<float> currAmps;
+	};
+	std::vector<ExcitationSourceInfo> m_excSources;
+	std::vector<GpuExcPoint> m_voltExcPoints;
+	std::vector<GpuExcPoint> m_currExcPoints;
+	WGPUBuffer m_bufVoltExcPoints;
+	WGPUBuffer m_bufCurrExcPoints;
+	WGPUBuffer m_bufVoltExcParams;
+	WGPUBuffer m_bufCurrExcParams;
+	WGPUBindGroupLayout m_bindGroupLayoutExc;
+	WGPUPipelineLayout m_pipelineLayoutExc;
+	WGPUComputePipeline m_pipelineExc;
+	WGPUBindGroup m_bindGroupVoltExc;
+	WGPUBindGroup m_bindGroupCurrExc;
+
 	bool InitDevice();
 	bool AllocateBuffers();
+	bool AllocateProbeBuffers();
+	bool AllocateExcitationBuffers();
 	bool CompileShaders();
 	void DispatchWorkgroups(WGPUComputePipeline pipeline, uint32_t gx, uint32_t gy, uint32_t gz);
-	void ApplyExcitation(unsigned int step);
+	bool PrepareVoltExcitation(unsigned int step);
+	bool PrepareCurrExcitation(unsigned int step);
 	size_t GetLinearIndex(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const;
 };
 
