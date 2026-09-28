@@ -125,6 +125,14 @@ private:
 	VulkanBuffer m_bufProbePoints;
 	VulkanBuffer m_bufProbeValues; // Host visible
 
+	// UPML Buffers
+	uint32_t m_numUpmlCells = 0;
+	VulkanBuffer m_bufUpmlIndices;
+	VulkanBuffer m_bufUpmlVoltCoeffs;
+	VulkanBuffer m_bufUpmlCurrCoeffs;
+	VulkanBuffer m_bufUpmlVoltFlux;
+	VulkanBuffer m_bufUpmlCurrFlux;
+
 	// Descriptors and Pipelines
 	VkDescriptorPool m_descPool = VK_NULL_HANDLE;
 
@@ -145,10 +153,18 @@ private:
 	VkDescriptorSet m_descSetProbe = VK_NULL_HANDLE;
 	VkPipeline m_pipelineProbe = VK_NULL_HANDLE;
 
+	VkDescriptorSetLayout m_descLayoutUpml = VK_NULL_HANDLE;
+	VkPipelineLayout m_pipelineLayoutUpml = VK_NULL_HANDLE;
+	VkDescriptorSet m_descSetUpmlVolt = VK_NULL_HANDLE;
+	VkDescriptorSet m_descSetUpmlCurr = VK_NULL_HANDLE;
+	VkPipeline m_pipelineUpmlPre = VK_NULL_HANDLE;
+	VkPipeline m_pipelineUpmlPost = VK_NULL_HANDLE;
+
 	bool InitVulkan();
 	bool AllocateBuffers();
 	bool AllocateExcitationBuffers();
 	bool AllocateProbeBuffers();
+	bool AllocateUpmlBuffers();
 	bool CreatePipelines();
 	bool SyncFieldsToDevice();
 

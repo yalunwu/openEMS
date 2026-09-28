@@ -10,6 +10,7 @@
 #include "FDTD/engine.h"
 #include "FDTD/excitation.h"
 #include "FDTD/extensions/operator_ext_excitation.h"
+#include "FDTD/extensions/operator_ext_upml.h"
 #include "Common/processvoltage.h"
 #include "Common/processcurrent.h"
 #include "Common/processfieldprobe.h"
@@ -96,6 +97,12 @@ bool EngineVulkan::Initialize()
 	if (!AllocateExcitationBuffers())
 	{
 		std::cerr << "[openEMS Vulkan] Failed to allocate excitation buffers." << std::endl;
+		return false;
+	}
+
+	if (!AllocateUpmlBuffers())
+	{
+		std::cerr << "[openEMS Vulkan] Failed to allocate UPML buffers." << std::endl;
 		return false;
 	}
 
@@ -462,13 +469,34 @@ bool EngineVulkan::SyncFieldsToDevice()
 
 bool EngineVulkan::CreatePipelines()
 {
+	bool hasUpml = false;
+	if (m_op)
+	{
+		for (size_t i = 0; i < m_op->GetNumberOfExtentions(); ++i)
+		{
+			if (dynamic_cast<Operator_Ext_UPML*>(m_op->GetExtension(i)))
+			{
+				hasUpml = true;
+				break;
+			}
+		}
+	}
+
 	// Compile GLSL compute shaders to SPIR-V bytecode at runtime
 	auto spvVolt = CompileGLSLToSpirv(VulkanShaders::kShaderVoltageUpdate, shaderc_glsl_compute_shader, "yee_voltage.comp");
 	auto spvCurr = CompileGLSLToSpirv(VulkanShaders::kShaderCurrentUpdate, shaderc_glsl_compute_shader, "yee_current.comp");
 	auto spvExc  = CompileGLSLToSpirv(VulkanShaders::kShaderExcitation, shaderc_glsl_compute_shader, "excitation.comp");
 	auto spvPrb  = CompileGLSLToSpirv(VulkanShaders::kShaderProbeGather, shaderc_glsl_compute_shader, "probe_gather.comp");
+	std::vector<uint32_t> spvUpmlPre;
+	std::vector<uint32_t> spvUpmlPost;
+	if (hasUpml)
+	{
+		spvUpmlPre = CompileGLSLToSpirv(VulkanShaders::kShaderUpmlPre, shaderc_glsl_compute_shader, "upml_pre.comp");
+		spvUpmlPost = CompileGLSLToSpirv(VulkanShaders::kShaderUpmlPost, shaderc_glsl_compute_shader, "upml_post.comp");
+	}
 
-	if (spvVolt.empty() || spvCurr.empty() || spvExc.empty() || spvPrb.empty())
+	if (spvVolt.empty() || spvCurr.empty() || spvExc.empty() || spvPrb.empty() ||
+	    (hasUpml && (spvUpmlPre.empty() || spvUpmlPost.empty())))
 	{
 		return false;
 	}
@@ -477,16 +505,23 @@ bool EngineVulkan::CreatePipelines()
 	VkShaderModule modCurr = CreateShaderModule(spvCurr);
 	VkShaderModule modExc  = CreateShaderModule(spvExc);
 	VkShaderModule modPrb  = CreateShaderModule(spvPrb);
+	VkShaderModule modUpmlPre = VK_NULL_HANDLE;
+	VkShaderModule modUpmlPost = VK_NULL_HANDLE;
+	if (hasUpml)
+	{
+		modUpmlPre = CreateShaderModule(spvUpmlPre);
+		modUpmlPost = CreateShaderModule(spvUpmlPost);
+	}
 
 	// Create descriptor pool
 	std::vector<VkDescriptorPoolSize> poolSizes = {
-		{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 }
+		{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, hasUpml ? 64u : 32u }
 	};
 	VkDescriptorPoolCreateInfo poolInfo = {};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
 	poolInfo.pPoolSizes = poolSizes.data();
-	poolInfo.maxSets = 16;
+	poolInfo.maxSets = hasUpml ? 32u : 16u;
 	if (vkCreateDescriptorPool(m_device, &poolInfo, nullptr, &m_descPool) != VK_SUCCESS)
 	{
 		return false;
@@ -622,11 +657,42 @@ bool EngineVulkan::CreatePipelines()
 	}
 	if (!createComputePipe(modPrb, m_pipelineLayoutProbe, m_pipelineProbe)) return false;
 
+	// 4. UPML Pipeline Layout & Compute Pipelines
+	if (hasUpml)
+	{
+		std::vector<VkDescriptorSetLayoutBinding> upmlBindings(4);
+		for (uint32_t i = 0; i < 4; ++i)
+		{
+			upmlBindings[i].binding = i;
+			upmlBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			upmlBindings[i].descriptorCount = 1;
+			upmlBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+		}
+		layoutInfo.bindingCount = 4;
+		layoutInfo.pBindings = upmlBindings.data();
+		if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descLayoutUpml) != VK_SUCCESS)
+		{
+			return false;
+		}
+
+		VkPushConstantRange upmlPcRange = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) };
+		pipeLayoutInfo.pSetLayouts = &m_descLayoutUpml;
+		pipeLayoutInfo.pPushConstantRanges = &upmlPcRange;
+		if (vkCreatePipelineLayout(m_device, &pipeLayoutInfo, nullptr, &m_pipelineLayoutUpml) != VK_SUCCESS)
+		{
+			return false;
+		}
+		if (!createComputePipe(modUpmlPre, m_pipelineLayoutUpml, m_pipelineUpmlPre)) return false;
+		if (!createComputePipe(modUpmlPost, m_pipelineLayoutUpml, m_pipelineUpmlPost)) return false;
+	}
+
 	// Release shader modules after pipeline creation
 	vkDestroyShaderModule(m_device, modVolt, nullptr);
 	vkDestroyShaderModule(m_device, modCurr, nullptr);
 	vkDestroyShaderModule(m_device, modExc, nullptr);
 	vkDestroyShaderModule(m_device, modPrb, nullptr);
+	if (modUpmlPre != VK_NULL_HANDLE) vkDestroyShaderModule(m_device, modUpmlPre, nullptr);
+	if (modUpmlPost != VK_NULL_HANDLE) vkDestroyShaderModule(m_device, modUpmlPost, nullptr);
 
 	return true;
 }
@@ -833,6 +899,175 @@ bool EngineVulkan::AllocateProbeBuffers()
 		writes[i].pBufferInfo = &bInfos[i];
 	}
 	vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+
+	return true;
+}
+
+bool EngineVulkan::AllocateUpmlBuffers()
+{
+	m_numUpmlCells = 0;
+	if (!m_op) return true;
+
+	std::vector<Operator_Ext_UPML*> upmlExts;
+	for (size_t i = 0; i < m_op->GetNumberOfExtentions(); ++i)
+	{
+		Operator_Ext_UPML* upml = dynamic_cast<Operator_Ext_UPML*>(m_op->GetExtension(i));
+		if (upml)
+			upmlExts.push_back(upml);
+	}
+
+	if (upmlExts.empty())
+		return true;
+
+	std::vector<uint32_t> hostIndices;
+	std::vector<float> hostVoltCoeffs; // 4 floats per cell: vv, vvfo, vvfn, 0
+	std::vector<float> hostCurrCoeffs; // 4 floats per cell: ii, iifo, iifn, 0
+
+	for (Operator_Ext_UPML* upml : upmlExts)
+	{
+		for (unsigned int comp = 0; comp < 3; ++comp)
+		{
+			for (unsigned int loc_x = 0; loc_x < upml->m_numLines[0]; ++loc_x)
+			{
+				unsigned int posX = loc_x + upml->m_StartPos[0];
+				for (unsigned int loc_y = 0; loc_y < upml->m_numLines[1]; ++loc_y)
+				{
+					unsigned int posY = loc_y + upml->m_StartPos[1];
+					for (unsigned int loc_z = 0; loc_z < upml->m_numLines[2]; ++loc_z)
+					{
+						unsigned int posZ = loc_z + upml->m_StartPos[2];
+						uint32_t linFieldIdx = static_cast<uint32_t>(GetLinearIndex(comp, posX, posY, posZ));
+
+						hostIndices.push_back(linFieldIdx);
+
+						hostVoltCoeffs.push_back(static_cast<float>(upml->vv(comp, loc_x, loc_y, loc_z)));
+						hostVoltCoeffs.push_back(static_cast<float>(upml->vvfo(comp, loc_x, loc_y, loc_z)));
+						hostVoltCoeffs.push_back(static_cast<float>(upml->vvfn(comp, loc_x, loc_y, loc_z)));
+						hostVoltCoeffs.push_back(0.0f);
+
+						hostCurrCoeffs.push_back(static_cast<float>(upml->ii(comp, loc_x, loc_y, loc_z)));
+						hostCurrCoeffs.push_back(static_cast<float>(upml->iifo(comp, loc_x, loc_y, loc_z)));
+						hostCurrCoeffs.push_back(static_cast<float>(upml->iifn(comp, loc_x, loc_y, loc_z)));
+						hostCurrCoeffs.push_back(0.0f);
+					}
+				}
+			}
+		}
+	}
+
+	m_numUpmlCells = static_cast<uint32_t>(hostIndices.size());
+	if (m_numUpmlCells == 0)
+		return true;
+
+	std::cout << "[openEMS Vulkan] Initialized on-device UPML: "
+	          << m_numUpmlCells << " cell components across "
+	          << upmlExts.size() << " boundary layer(s)." << std::endl;
+
+	VkDeviceSize idxBytes   = m_numUpmlCells * sizeof(uint32_t);
+	VkDeviceSize coeffBytes = m_numUpmlCells * 4 * sizeof(float);
+	VkDeviceSize fluxBytes  = m_numUpmlCells * sizeof(float);
+
+	VkBufferUsageFlags storageUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VkMemoryPropertyFlags devLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+	if (!CreateBuffer(idxBytes, storageUsage, devLocal, m_bufUpmlIndices)) return false;
+	if (!CreateBuffer(coeffBytes, storageUsage, devLocal, m_bufUpmlVoltCoeffs)) return false;
+	if (!CreateBuffer(coeffBytes, storageUsage, devLocal, m_bufUpmlCurrCoeffs)) return false;
+	if (!CreateBuffer(fluxBytes, storageUsage, devLocal, m_bufUpmlVoltFlux)) return false;
+	if (!CreateBuffer(fluxBytes, storageUsage, devLocal, m_bufUpmlCurrFlux)) return false;
+
+	// Staging buffers to upload indices and coefficients
+	VulkanBuffer stageIndices, stageVoltCoeffs, stageCurrCoeffs;
+	VkBufferUsageFlags stageUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	VkMemoryPropertyFlags stageProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+	if (!CreateBuffer(idxBytes, stageUsage, stageProps, stageIndices)) return false;
+	if (!CreateBuffer(coeffBytes, stageUsage, stageProps, stageVoltCoeffs)) return false;
+	if (!CreateBuffer(coeffBytes, stageUsage, stageProps, stageCurrCoeffs)) return false;
+
+	std::memcpy(stageIndices.mapped, hostIndices.data(), idxBytes);
+	std::memcpy(stageVoltCoeffs.mapped, hostVoltCoeffs.data(), coeffBytes);
+	std::memcpy(stageCurrCoeffs.mapped, hostCurrCoeffs.data(), coeffBytes);
+
+	vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX);
+	vkResetFences(m_device, 1, &m_fence);
+
+	VkCommandBufferBeginInfo beginInfo = {};
+	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(m_cmdBuffer, &beginInfo);
+
+	VkBufferCopy copyIdx = { 0, 0, idxBytes };
+	vkCmdCopyBuffer(m_cmdBuffer, stageIndices.buffer, m_bufUpmlIndices.buffer, 1, &copyIdx);
+
+	VkBufferCopy copyCoeff = { 0, 0, coeffBytes };
+	vkCmdCopyBuffer(m_cmdBuffer, stageVoltCoeffs.buffer, m_bufUpmlVoltCoeffs.buffer, 1, &copyCoeff);
+	vkCmdCopyBuffer(m_cmdBuffer, stageCurrCoeffs.buffer, m_bufUpmlCurrCoeffs.buffer, 1, &copyCoeff);
+
+	// Zero flux buffers
+	vkCmdFillBuffer(m_cmdBuffer, m_bufUpmlVoltFlux.buffer, 0, VK_WHOLE_SIZE, 0);
+	vkCmdFillBuffer(m_cmdBuffer, m_bufUpmlCurrFlux.buffer, 0, VK_WHOLE_SIZE, 0);
+
+	vkEndCommandBuffer(m_cmdBuffer);
+
+	VkSubmitInfo submitInfo = {};
+	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submitInfo.commandBufferCount = 1;
+	submitInfo.pCommandBuffers = &m_cmdBuffer;
+	vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_fence);
+	vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX);
+
+	DestroyBuffer(stageIndices);
+	DestroyBuffer(stageVoltCoeffs);
+	DestroyBuffer(stageCurrCoeffs);
+
+	// Allocate and configure descriptor sets for UPML
+	VkDescriptorSetAllocateInfo dsAlloc = {};
+	dsAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	dsAlloc.descriptorPool = m_descPool;
+	dsAlloc.descriptorSetCount = 1;
+	dsAlloc.pSetLayouts = &m_descLayoutUpml;
+
+	if (vkAllocateDescriptorSets(m_device, &dsAlloc, &m_descSetUpmlVolt) != VK_SUCCESS) return false;
+	if (vkAllocateDescriptorSets(m_device, &dsAlloc, &m_descSetUpmlCurr) != VK_SUCCESS) return false;
+
+	// Update m_descSetUpmlVolt
+	VkDescriptorBufferInfo voltBufInfos[4] = {
+		{ m_bufUpmlIndices.buffer, 0, idxBytes },
+		{ m_bufUpmlVoltCoeffs.buffer, 0, coeffBytes },
+		{ m_bufUpmlVoltFlux.buffer, 0, fluxBytes },
+		{ m_bufVolt.buffer, 0, m_bufVolt.size }
+	};
+	VkWriteDescriptorSet voltWrites[4] = {};
+	for (uint32_t i = 0; i < 4; ++i)
+	{
+		voltWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		voltWrites[i].dstSet = m_descSetUpmlVolt;
+		voltWrites[i].dstBinding = i;
+		voltWrites[i].descriptorCount = 1;
+		voltWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		voltWrites[i].pBufferInfo = &voltBufInfos[i];
+	}
+	vkUpdateDescriptorSets(m_device, 4, voltWrites, 0, nullptr);
+
+	// Update m_descSetUpmlCurr
+	VkDescriptorBufferInfo currBufInfos[4] = {
+		{ m_bufUpmlIndices.buffer, 0, idxBytes },
+		{ m_bufUpmlCurrCoeffs.buffer, 0, coeffBytes },
+		{ m_bufUpmlCurrFlux.buffer, 0, fluxBytes },
+		{ m_bufCurr.buffer, 0, m_bufCurr.size }
+	};
+	VkWriteDescriptorSet currWrites[4] = {};
+	for (uint32_t i = 0; i < 4; ++i)
+	{
+		currWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		currWrites[i].dstSet = m_descSetUpmlCurr;
+		currWrites[i].dstBinding = i;
+		currWrites[i].descriptorCount = 1;
+		currWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		currWrites[i].pBufferInfo = &currBufInfos[i];
+	}
+	vkUpdateDescriptorSets(m_device, 4, currWrites, 0, nullptr);
 
 	return true;
 }
@@ -1080,13 +1315,37 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 			vkBeginCommandBuffer(m_cmdBuffer, &beginInfo);
 
-			// 1. Voltage update
+			// 1. UPML Pre-Voltage Pass
+			if (m_numUpmlCells > 0 && m_pipelineUpmlPre && m_descSetUpmlVolt)
+			{
+				vkCmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPre);
+				vkCmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_descSetUpmlVolt, 0, nullptr);
+				vkCmdPushConstants(m_cmdBuffer, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_numUpmlCells), &m_numUpmlCells);
+				vkCmdDispatch(m_cmdBuffer, (m_numUpmlCells + 255) / 256, 1, 1);
+
+				vkCmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+			}
+
+			// 2. Voltage update
 			vkCmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineVolt);
 			vkCmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutFields, 0, 1, &m_descSetFields, 0, nullptr);
 			vkCmdPushConstants(m_cmdBuffer, m_pipelineLayoutFields, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 			vkCmdDispatch(m_cmdBuffer, wgZ, wgY, wgX);
 
-			// 2. Voltage excitation pass
+			// 3. UPML Post-Voltage Pass
+			if (m_numUpmlCells > 0 && m_pipelineUpmlPost && m_descSetUpmlVolt)
+			{
+				vkCmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+
+				vkCmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPost);
+				vkCmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_descSetUpmlVolt, 0, nullptr);
+				vkCmdPushConstants(m_cmdBuffer, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_numUpmlCells), &m_numUpmlCells);
+				vkCmdDispatch(m_cmdBuffer, (m_numUpmlCells + 255) / 256, 1, 1);
+			}
+
+			// 4. Voltage excitation pass
 			if (hasVoltExc && m_pipelineExc && m_descSetVoltExc)
 			{
 				vkCmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1103,13 +1362,37 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 			vkCmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
 
-			// 3. Current update
+			// 5. UPML Pre-Current Pass
+			if (m_numUpmlCells > 0 && m_pipelineUpmlPre && m_descSetUpmlCurr)
+			{
+				vkCmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPre);
+				vkCmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_descSetUpmlCurr, 0, nullptr);
+				vkCmdPushConstants(m_cmdBuffer, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_numUpmlCells), &m_numUpmlCells);
+				vkCmdDispatch(m_cmdBuffer, (m_numUpmlCells + 255) / 256, 1, 1);
+
+				vkCmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+			}
+
+			// 6. Current update
 			vkCmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineCurr);
 			vkCmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutFields, 0, 1, &m_descSetFields, 0, nullptr);
 			vkCmdPushConstants(m_cmdBuffer, m_pipelineLayoutFields, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 			vkCmdDispatch(m_cmdBuffer, wgZ, wgY, wgX);
 
-			// 4. Current excitation pass
+			// 7. UPML Post-Current Pass
+			if (m_numUpmlCells > 0 && m_pipelineUpmlPost && m_descSetUpmlCurr)
+			{
+				vkCmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+
+				vkCmdBindPipeline(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPost);
+				vkCmdBindDescriptorSets(m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_descSetUpmlCurr, 0, nullptr);
+				vkCmdPushConstants(m_cmdBuffer, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_numUpmlCells), &m_numUpmlCells);
+				vkCmdDispatch(m_cmdBuffer, (m_numUpmlCells + 255) / 256, 1, 1);
+			}
+
+			// 8. Current excitation pass
 			if (hasCurrExc && m_pipelineExc && m_descSetCurrExc)
 			{
 				vkCmdPipelineBarrier(m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1390,18 +1673,28 @@ void EngineVulkan::Reset()
 		DestroyBuffer(m_bufProbePoints);
 		DestroyBuffer(m_bufProbeValues);
 
+		DestroyBuffer(m_bufUpmlIndices);
+		DestroyBuffer(m_bufUpmlVoltCoeffs);
+		DestroyBuffer(m_bufUpmlCurrCoeffs);
+		DestroyBuffer(m_bufUpmlVoltFlux);
+		DestroyBuffer(m_bufUpmlCurrFlux);
+
 		if (m_pipelineVolt != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pipelineVolt, nullptr); m_pipelineVolt = VK_NULL_HANDLE; }
 		if (m_pipelineCurr != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pipelineCurr, nullptr); m_pipelineCurr = VK_NULL_HANDLE; }
 		if (m_pipelineExc  != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pipelineExc, nullptr);  m_pipelineExc  = VK_NULL_HANDLE; }
 		if (m_pipelineProbe!= VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pipelineProbe, nullptr);m_pipelineProbe= VK_NULL_HANDLE; }
+		if (m_pipelineUpmlPre != VK_NULL_HANDLE)  { vkDestroyPipeline(m_device, m_pipelineUpmlPre, nullptr);  m_pipelineUpmlPre  = VK_NULL_HANDLE; }
+		if (m_pipelineUpmlPost != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pipelineUpmlPost, nullptr); m_pipelineUpmlPost = VK_NULL_HANDLE; }
 
 		if (m_pipelineLayoutFields != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_pipelineLayoutFields, nullptr); m_pipelineLayoutFields = VK_NULL_HANDLE; }
 		if (m_pipelineLayoutExc    != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_pipelineLayoutExc, nullptr);    m_pipelineLayoutExc    = VK_NULL_HANDLE; }
 		if (m_pipelineLayoutProbe  != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_pipelineLayoutProbe, nullptr);  m_pipelineLayoutProbe  = VK_NULL_HANDLE; }
+		if (m_pipelineLayoutUpml   != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_pipelineLayoutUpml, nullptr);   m_pipelineLayoutUpml   = VK_NULL_HANDLE; }
 
 		if (m_descLayoutFields != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_descLayoutFields, nullptr); m_descLayoutFields = VK_NULL_HANDLE; }
 		if (m_descLayoutExc    != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_descLayoutExc, nullptr);    m_descLayoutExc    = VK_NULL_HANDLE; }
 		if (m_descLayoutProbe  != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_descLayoutProbe, nullptr);  m_descLayoutProbe  = VK_NULL_HANDLE; }
+		if (m_descLayoutUpml   != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_descLayoutUpml, nullptr);   m_descLayoutUpml   = VK_NULL_HANDLE; }
 
 		if (m_descPool != VK_NULL_HANDLE) { vkDestroyDescriptorPool(m_device, m_descPool, nullptr); m_descPool = VK_NULL_HANDLE; }
 		if (m_fence != VK_NULL_HANDLE)    { vkDestroyFence(m_device, m_fence, nullptr);              m_fence = VK_NULL_HANDLE; }
@@ -1419,6 +1712,7 @@ void EngineVulkan::Reset()
 #endif
 
 	m_numTS = 0;
+	m_numUpmlCells = 0;
 	m_hostFieldsValid = true;
 	m_hostFieldsDirty = true;
 	std::fill(m_hostVolt.begin(), m_hostVolt.end(), 0.0f);

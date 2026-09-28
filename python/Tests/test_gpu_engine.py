@@ -223,6 +223,51 @@ class Test_GPUEngine(unittest.TestCase):
         rel_diff = diff / peak
         self.assertLess(rel_diff, 0.0005, f"Lumped port relative diff {rel_diff:.4%} exceeded 0.05%")
 
+    def test_upml_boundary_fidelity(self):
+        """Verify that 6-sided UPML boundaries on Vulkan match CPU within 0.05%."""
+        def run_sim(eng, sdir):
+            csx = ContinuousStructure()
+            grid = csx.GetGrid()
+            grid.SetDeltaUnit(1e-3)
+            grid.SetLines('x', np.linspace(-30, 30, 31))
+            grid.SetLines('y', np.linspace(-30, 30, 31))
+            grid.SetLines('z', np.linspace(-30, 30, 31))
+
+            exc = csx.AddExcitation('excite_z', exc_type=0, exc_val=[0, 0, 1])
+            exc.AddBox([-3, -3, -5], [3, 3, 5])
+
+            p_center = csx.AddProbe('probe_center', p_type=0)
+            p_center.AddBox([0, 0, -2], [0, 0, 2])
+
+            p_edge = csx.AddProbe('probe_edge', p_type=0)
+            p_edge.AddBox([0, 15, -2], [0, 15, 2])
+
+            fdtd = openEMS(NrTS=100, EndCriteria=0.0)
+            fdtd.SetCSX(csx)
+            fdtd.SetGaussExcite(1e9, 0.5e9)
+            fdtd.SetBoundaryCond(['PML_8'] * 6)
+            return fdtd.Run(sdir, engine=eng, cleanup=False)
+
+        sim_cpu = os.path.join(tempfile.gettempdir(), 'test_upml_cpu')
+        sim_gpu = os.path.join(tempfile.gettempdir(), 'test_upml_gpu')
+
+        ret_cpu = run_sim('multithreaded', sim_cpu)
+        ret_gpu = run_sim('vulkan', sim_gpu)
+        self.assertIn(ret_cpu, [0, None])
+        self.assertIn(ret_gpu, [0, None])
+
+        for pname in ['probe_center', 'probe_edge']:
+            f_cpu = os.path.join(sim_cpu, pname)
+            f_gpu = os.path.join(sim_gpu, pname)
+            self.assertTrue(os.path.exists(f_cpu), f"CPU {pname} missing")
+            self.assertTrue(os.path.exists(f_gpu), f"GPU {pname} missing")
+            data_cpu = np.loadtxt(f_cpu, comments='%')
+            data_gpu = np.loadtxt(f_gpu, comments='%')
+            diff = np.max(np.abs(data_cpu[:, 1] - data_gpu[:, 1]))
+            peak = np.max(np.abs(data_cpu[:, 1])) + 1e-12
+            rel_diff = diff / peak
+            self.assertLess(rel_diff, 0.0005, f"{pname} relative error {rel_diff:.4%} exceeded 0.05%")
+
 
 if __name__ == '__main__':
     unittest.main()

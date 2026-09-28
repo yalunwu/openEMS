@@ -16,6 +16,7 @@
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
+#include "FDTD/extensions/operator_ext_upml.h"
 #include "FDTD/vulkan/engine_vulkan.h"
 #include "Common/processing.h"
 #include "ContinuousStructure.h"
@@ -134,6 +135,26 @@ bool Test_CapabilityScanner_EngineExtensionFallback()
 	TEST_ASSERT(!supported, "Engine extensions without a Vulkan implementation must be rejected");
 	TEST_ASSERT(reason.find("Mur") != std::string::npos, "Reason should name the unsupported extension");
 
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_UPML_Supported()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::unique_ptr<Operator> op(Operator::New());
+	TEST_ASSERT(op->SetGeometryCSX(csx), "Failed to initialize operator geometry");
+	int bc[6] = {3, 3, 3, 3, 3, 3};
+	unsigned int size[6] = {2, 2, 2, 2, 2, 2};
+	Operator_Ext_UPML::Create_UPML(op.get(), bc, size, "");
+	TEST_ASSERT(op->GetNumberOfExtentions() == 6, "Expected one UPML extension per boundary");
+
+	std::string reason;
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(supported, "UPML extensions should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
+
+	op.reset();
 	delete csx;
 	return true;
 }
@@ -436,6 +457,7 @@ bool Test_Vulkan_NumericalEquivalence_Asymmetric()
 	EngineBackend* gpuEng = fdtd.GetBackend();
 	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
 	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
 
 	// Set initial impulse at center (Ez component)
 	int cx = nx / 2, cy = ny / 2, cz = nz / 2;
@@ -477,6 +499,73 @@ bool Test_Vulkan_NumericalEquivalence_Asymmetric()
 #endif
 }
 
+bool Test_Vulkan_UPML_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 25, ny = 25, nz = 25;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_PML(n, 4);
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with UPML");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	// Initial impulse at center (Ez component)
+	int cx = nx / 2, cy = ny / 2, cz = nz / 2;
+	cpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+	gpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with UPML exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
 int main(int argc, char* argv[])
 {
 	std::cout << "========================================" << std::endl;
@@ -487,6 +576,7 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_ProcessingTimestepPeekDoesNotConsume);
 	RUN_TEST(Test_CapabilityScanner_StandardModel);
 	RUN_TEST(Test_CapabilityScanner_EngineExtensionFallback);
+	RUN_TEST(Test_CapabilityScanner_UPML_Supported);
 	RUN_TEST(Test_CapabilityScanner_LorentzMaterialFallback);
 	RUN_TEST(Test_CapabilityScanner_DebyeMaterialFallback);
 	RUN_TEST(Test_CapabilityScanner_ConductingSheetFallback);
@@ -512,6 +602,7 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_ZeroExcitationGeometry);
 	RUN_TEST(Test_Vulkan_ResetLifecycleMultiRun);
 	RUN_TEST(Test_Vulkan_NumericalEquivalence_Asymmetric);
+	RUN_TEST(Test_Vulkan_UPML_Equivalence);
 
 	std::cout << "========================================" << std::endl;
 	std::cout << "Tests completed: " << tests_passed << " passed, " << tests_failed << " failed." << std::endl;

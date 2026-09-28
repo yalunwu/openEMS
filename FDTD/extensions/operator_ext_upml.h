@@ -24,6 +24,7 @@
 #include "tools/arraylib/array_nijk.h"
 
 class FunctionParser;
+class EngineVulkan;
 
 //! Operator extension implementation an uniaxial perfectly matched layer (upml)
 /*
@@ -31,9 +32,10 @@ class FunctionParser;
   Therefore the voltages and currents as well as the operator are replaced during these update process.
   This extension is probably incompatible with the most other extensions operating in the same regions.
   */
-class Operator_Ext_UPML : public Operator_Extension
+class OPENEMS_EXPORT Operator_Ext_UPML : public Operator_Extension
 {
 	friend class Engine_Ext_UPML;
+	friend class EngineVulkan;
 public:
 	virtual ~Operator_Ext_UPML();
 

@@ -175,6 +175,85 @@ void main() {
 }
 )";
 
+static const char* kShaderUpmlPre = R"(#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform UpmlParams {
+    uint count;
+} pc;
+
+layout(std430, binding = 0) readonly buffer IndicesBuffer {
+    uint fieldIndices[];
+};
+
+layout(std430, binding = 1) readonly buffer CoeffsBuffer {
+    vec4 coeffs[];
+};
+
+layout(std430, binding = 2) buffer FluxBuffer {
+    float fluxData[];
+};
+
+layout(std430, binding = 3) buffer FieldBuffer {
+    float fieldData[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.count) {
+        return;
+    }
+    uint f_idx = fieldIndices[idx];
+    vec4 c = coeffs[idx];
+
+    float f_val = fieldData[f_idx];
+    float fl_val = fluxData[idx];
+
+    float f_help = c.x * f_val - c.y * fl_val;
+    fieldData[f_idx] = fl_val;
+    fluxData[idx] = f_help;
+}
+)";
+
+static const char* kShaderUpmlPost = R"(#version 450
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform UpmlParams {
+    uint count;
+} pc;
+
+layout(std430, binding = 0) readonly buffer IndicesBuffer {
+    uint fieldIndices[];
+};
+
+layout(std430, binding = 1) readonly buffer CoeffsBuffer {
+    vec4 coeffs[];
+};
+
+layout(std430, binding = 2) buffer FluxBuffer {
+    float fluxData[];
+};
+
+layout(std430, binding = 3) buffer FieldBuffer {
+    float fieldData[];
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.count) {
+        return;
+    }
+    uint f_idx = fieldIndices[idx];
+    vec4 c = coeffs[idx];
+
+    float fl_val = fluxData[idx];
+    float f_val = fieldData[f_idx];
+
+    fluxData[idx] = f_val;
+    fieldData[f_idx] = fl_val + c.z * f_val;
+}
+)";
+
 } // namespace VulkanShaders
 
 #endif // SHADERS_GLSL_H
