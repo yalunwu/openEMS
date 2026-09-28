@@ -26,20 +26,20 @@ bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStruct
 		// Check for dispersive media
 		if (nonConstCSX->GetQtyPropertyType(CSProperties::LORENTZMATERIAL) > 0)
 		{
-			unsupportedReason = "Dispersive material (Lorentz) is not supported on WebGPU.";
+			unsupportedReason = "Dispersive material (Lorentz) is not supported on Vulkan.";
 			return false;
 		}
 
 		if (nonConstCSX->GetQtyPropertyType(CSProperties::DEBYEMATERIAL) > 0)
 		{
-			unsupportedReason = "Dispersive material (Debye) is not supported on WebGPU.";
+			unsupportedReason = "Dispersive material (Debye) is not supported on Vulkan.";
 			return false;
 		}
 
 		// Check for conducting sheets
 		if (nonConstCSX->GetQtyPropertyType(CSProperties::CONDUCTINGSHEET) > 0)
 		{
-			unsupportedReason = "Conducting sheets are not supported on WebGPU.";
+			unsupportedReason = "Conducting sheets are not supported on Vulkan.";
 			return false;
 		}
 	}

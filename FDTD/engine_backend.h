@@ -22,7 +22,7 @@ class ContinuousStructure;
 class Engine;
 class ProcessingArray;
 
-//! Abstract base class for all pluggable simulation backends (CPU, WebGPU, etc.)
+//! Abstract base class for all pluggable simulation backends (CPU, Vulkan, etc.)
 class OPENEMS_EXPORT EngineBackend
 {
 public:
@@ -64,7 +64,7 @@ public:
 	//! Register probe points/integrals for efficient on-device extraction
 	virtual void RegisterProbes(const ProcessingArray* pa) { UNUSED(pa); }
 
-	//! Human-readable backend name (e.g. "CPU-Multithreaded", "WebGPU-Metal", "WebGPU-Vulkan")
+	//! Human-readable backend name (e.g. "CPU-Multithreaded", "Vulkan (NVIDIA GeForce RTX 3070)")
 	virtual std::string GetBackendName() const = 0;
 
 	//! Capability scanner: returns true if the model features are supported on this backend type

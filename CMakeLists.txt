@@ -73,10 +73,20 @@ if (WITH_MPI)
 	message(STATUS "Found MPI. INCLUDE " ${MPI_INCLUDE_PATH})
 endif()
 
-# WebGPU acceleration backend option
-option(ENABLE_WEBGPU "Enable WebGPU acceleration backend (Metal/Vulkan/DX12)" OFF)
-if(ENABLE_WEBGPU)
-  include(${PROJECT_SOURCE_DIR}/cmake/FetchWgpuNative.cmake)
+# Vulkan 1.2 compute backend option
+option(ENABLE_VULKAN "Enable Vulkan 1.2 compute backend" OFF)
+if(ENABLE_VULKAN)
+  find_package(Vulkan REQUIRED)
+  find_path(SHADERC_INCLUDE_DIR NAMES shaderc/shaderc.hpp HINTS ${Vulkan_INCLUDE_DIRS}/../include /mingw64/include)
+  find_library(SHADERC_LIB NAMES shaderc_shared shaderc HINTS ${Vulkan_INCLUDE_DIRS}/../lib /mingw64/lib)
+  if(NOT SHADERC_LIB)
+    message(FATAL_ERROR "shaderc library (shaderc_shared) not found for ENABLE_VULKAN!")
+  endif()
+  message(STATUS "Vulkan found: ${Vulkan_LIBRARIES}")
+  message(STATUS "shaderc found: ${SHADERC_LIB}")
+  include_directories(${Vulkan_INCLUDE_DIRS} ${SHADERC_INCLUDE_DIR})
+  set(VULKAN_LIBRARIES Vulkan::Vulkan ${SHADERC_LIB})
+  add_definitions(-DENABLE_VULKAN)
 endif()
 
 # Set locations of extra CMake modules
@@ -198,7 +208,7 @@ TARGET_LINK_LIBRARIES( openEMS
   ${Boost_LIBRARIES}
   ${vtk_LIBS}
   ${MPI_LIBRARIES}
-  ${WEBGPU_LIBRARIES}
+  ${VULKAN_LIBRARIES}
 )
 
 if (WIN32)
@@ -213,7 +223,7 @@ TARGET_LINK_LIBRARIES(openEMS_bin openEMS)
 
 # backend unit test suite
 ADD_EXECUTABLE( test_backend test_backend.cpp )
-TARGET_LINK_LIBRARIES( test_backend openEMS ${CSXCAD_LIBRARIES} ${WEBGPU_LIBRARIES} )
+TARGET_LINK_LIBRARIES( test_backend openEMS ${CSXCAD_LIBRARIES} ${VULKAN_LIBRARIES} )
  
 if (WIN32)
     INSTALL(TARGETS openEMS RUNTIME DESTINATION bin ARCHIVE DESTINATION lib${LIB_SUFFIX})

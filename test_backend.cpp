@@ -1,7 +1,7 @@
 /*
  *  Copyright (C) 2026 openEMS Project
  *
- *  Unit tests for pluggable EngineBackend and EngineWebGPU
+ *  Unit tests for pluggable EngineBackend and EngineVulkan
  */
 
 #include <iostream>
@@ -14,7 +14,7 @@
 #include "FDTD/engine_cpu.h"
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
-#include "FDTD/webgpu/engine_webgpu.h"
+#include "FDTD/vulkan/engine_vulkan.h"
 #include "ContinuousStructure.h"
 #include "CSProperties.h"
 #include "CSPropLorentzMaterial.h"
@@ -131,14 +131,14 @@ bool Test_CapabilityScanner_ConductingSheetFallback()
 	return true;
 }
 
-bool Test_EngineWebGPU_Lifecycle()
+bool Test_EngineVulkan_Lifecycle()
 {
-	EngineWebGPU engine(nullptr);
-	TEST_ASSERT(engine.GetBackendName().find("WebGPU") != std::string::npos, "Backend name should contain WebGPU");
+	EngineVulkan engine(nullptr);
+	TEST_ASSERT(engine.GetBackendName().find("Vulkan") != std::string::npos, "Backend name should contain Vulkan");
 	TEST_ASSERT(engine.GetNumberOfTimesteps() == 0, "Initial timesteps should be 0");
 
 	bool init = engine.Initialize();
-	TEST_ASSERT(init, "EngineWebGPU initialization should succeed");
+	TEST_ASSERT(init, "EngineVulkan initialization should succeed");
 
 	engine.SetVolt(0, 5, 5, 2, 42.0f);
 	engine.SetCurr(1, 3, 3, 1, 10.5f);
@@ -161,10 +161,10 @@ bool Test_EngineWebGPU_Lifecycle()
 	return true;
 }
 
-bool Test_OpenEMS_CLIArgument_EngineWebGPU()
+bool Test_OpenEMS_CLIArgument_EngineVulkan()
 {
 	openEMS fdtd;
-	std::vector<std::string> args = {"--engine=webgpu"};
+	std::vector<std::string> args = {"--engine=vulkan"};
 	fdtd.SetLibraryArguments(args);
 
 	std::vector<std::string> argsGpu = {"--engine=gpu"};
@@ -212,9 +212,9 @@ bool Test_EndToEnd_MultithreadedEngine()
 	return RunSimulationWithEngine("multithreaded");
 }
 
-bool Test_EndToEnd_WebGPUEngine()
+bool Test_EndToEnd_VulkanEngine()
 {
-	return RunSimulationWithEngine("webgpu");
+	return RunSimulationWithEngine("vulkan");
 }
 
 class TestFDTDAccess : public openEMS {
@@ -236,10 +236,10 @@ static ContinuousStructure* CreateCustomGrid(int nx, int ny, int nz)
 	return csx;
 }
 
-static bool RunWebGPUSimulation(int nx, int ny, int nz, int timesteps = 15)
+static bool RunVulkanSimulation(int nx, int ny, int nz, int timesteps = 15)
 {
 	openEMS fdtd;
-	std::vector<std::string> args = {"--engine=webgpu"};
+	std::vector<std::string> args = {"--engine=vulkan"};
 	fdtd.SetLibraryArguments(args);
 	fdtd.SetNumberOfTimeSteps(timesteps);
 	fdtd.SetEnableDumps(false);
@@ -255,28 +255,28 @@ static bool RunWebGPUSimulation(int nx, int ny, int nz, int timesteps = 15)
 	return true;
 }
 
-bool Test_WebGPU_SubWarpGrid()
+bool Test_Vulkan_SubWarpGrid()
 {
 	// 7 x 9 x 11 grid: dimZ = 11 < 32 (sub-warp in fast dimension)
-	return RunWebGPUSimulation(7, 9, 11, 15);
+	return RunVulkanSimulation(7, 9, 11, 15);
 }
 
-bool Test_WebGPU_AsymmetricDimensions()
+bool Test_Vulkan_AsymmetricDimensions()
 {
 	// 15 x 5 x 47 grid: odd and prime non-multiple dimensions
-	return RunWebGPUSimulation(15, 5, 47, 15);
+	return RunVulkanSimulation(15, 5, 47, 15);
 }
 
-bool Test_WebGPU_ThinPlanarGrid()
+bool Test_Vulkan_ThinPlanarGrid()
 {
 	// 35 x 35 x 3 grid: extremely thin in Z (3 cells)
-	return RunWebGPUSimulation(35, 35, 3, 15);
+	return RunVulkanSimulation(35, 35, 3, 15);
 }
 
-bool Test_WebGPU_BoundaryConditions()
+bool Test_Vulkan_BoundaryConditions()
 {
 	openEMS fdtd;
-	std::vector<std::string> args = {"--engine=webgpu"};
+	std::vector<std::string> args = {"--engine=vulkan"};
 	fdtd.SetLibraryArguments(args);
 	fdtd.SetNumberOfTimeSteps(15);
 	fdtd.SetEnableDumps(false);
@@ -300,10 +300,10 @@ bool Test_WebGPU_BoundaryConditions()
 	return true;
 }
 
-bool Test_WebGPU_ZeroExcitationGeometry()
+bool Test_Vulkan_ZeroExcitationGeometry()
 {
 	openEMS fdtd;
-	std::vector<std::string> args = {"--engine=webgpu"};
+	std::vector<std::string> args = {"--engine=vulkan"};
 	fdtd.SetLibraryArguments(args);
 	fdtd.SetNumberOfTimeSteps(10);
 	fdtd.SetEnableDumps(false);
@@ -320,9 +320,9 @@ bool Test_WebGPU_ZeroExcitationGeometry()
 	return true;
 }
 
-bool Test_WebGPU_ResetLifecycleMultiRun()
+bool Test_Vulkan_ResetLifecycleMultiRun()
 {
-	EngineWebGPU engine(nullptr);
+	EngineVulkan engine(nullptr);
 	bool init1 = engine.Initialize();
 	TEST_ASSERT(init1, "Initial Initialize() failed");
 
@@ -347,13 +347,13 @@ bool Test_WebGPU_ResetLifecycleMultiRun()
 	return true;
 }
 
-bool Test_WebGPU_NumericalEquivalence_Asymmetric()
+bool Test_Vulkan_NumericalEquivalence_Asymmetric()
 {
 	int nx = 13, ny = 11, nz = 23;
 	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
 
 	TestFDTDAccess fdtd;
-	fdtd.SetLibraryArguments({"--engine=webgpu"});
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
 	fdtd.SetNumberOfTimeSteps(25);
 	fdtd.SetGaussExcite(1e9, 500e6);
 	fdtd.SetCSX(csx);
@@ -399,7 +399,7 @@ bool Test_WebGPU_NumericalEquivalence_Asymmetric()
 int main(int argc, char* argv[])
 {
 	std::cout << "========================================" << std::endl;
-	std::cout << " openEMS EngineBackend & WebGPU Test Suite" << std::endl;
+	std::cout << " openEMS EngineBackend & Vulkan Test Suite" << std::endl;
 	std::cout << "========================================" << std::endl;
 
 	RUN_TEST(Test_BackendInterface_NullOp);
@@ -407,8 +407,8 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_CapabilityScanner_LorentzMaterialFallback);
 	RUN_TEST(Test_CapabilityScanner_DebyeMaterialFallback);
 	RUN_TEST(Test_CapabilityScanner_ConductingSheetFallback);
-	RUN_TEST(Test_EngineWebGPU_Lifecycle);
-	RUN_TEST(Test_OpenEMS_CLIArgument_EngineWebGPU);
+	RUN_TEST(Test_EngineVulkan_Lifecycle);
+	RUN_TEST(Test_OpenEMS_CLIArgument_EngineVulkan);
 
 	std::cout << "----------------------------------------" << std::endl;
 	std::cout << " Baseline End-to-End Simulation Tests" << std::endl;
@@ -417,18 +417,18 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_EndToEnd_SSEEngine);
 	RUN_TEST(Test_EndToEnd_SSECompressedEngine);
 	RUN_TEST(Test_EndToEnd_MultithreadedEngine);
-	RUN_TEST(Test_EndToEnd_WebGPUEngine);
+	RUN_TEST(Test_EndToEnd_VulkanEngine);
 
 	std::cout << "----------------------------------------" << std::endl;
 	std::cout << " Grid Sizes & Corner Cases Tests" << std::endl;
 	std::cout << "----------------------------------------" << std::endl;
-	RUN_TEST(Test_WebGPU_SubWarpGrid);
-	RUN_TEST(Test_WebGPU_AsymmetricDimensions);
-	RUN_TEST(Test_WebGPU_ThinPlanarGrid);
-	RUN_TEST(Test_WebGPU_BoundaryConditions);
-	RUN_TEST(Test_WebGPU_ZeroExcitationGeometry);
-	RUN_TEST(Test_WebGPU_ResetLifecycleMultiRun);
-	RUN_TEST(Test_WebGPU_NumericalEquivalence_Asymmetric);
+	RUN_TEST(Test_Vulkan_SubWarpGrid);
+	RUN_TEST(Test_Vulkan_AsymmetricDimensions);
+	RUN_TEST(Test_Vulkan_ThinPlanarGrid);
+	RUN_TEST(Test_Vulkan_BoundaryConditions);
+	RUN_TEST(Test_Vulkan_ZeroExcitationGeometry);
+	RUN_TEST(Test_Vulkan_ResetLifecycleMultiRun);
+	RUN_TEST(Test_Vulkan_NumericalEquivalence_Asymmetric);
 
 	std::cout << "========================================" << std::endl;
 	std::cout << "Tests completed: " << tests_passed << " passed, " << tests_failed << " failed." << std::endl;

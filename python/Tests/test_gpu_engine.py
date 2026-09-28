@@ -37,14 +37,14 @@ class Test_GPUEngine(unittest.TestCase):
         os.chdir(self._orig_cwd)
 
     def test_gpu_command_line_option(self):
-        """Verify that openEMS accepts engine='webgpu' and engine='gpu' keyword arguments."""
+        """Verify that openEMS accepts engine='vulkan' and engine='gpu' keyword arguments."""
         csx = _make_grid()
         fdtd = openEMS(NrTS=15)
         fdtd.SetCSX(csx)
         fdtd.SetGaussExcite(1e9, 0.5e9)
         fdtd.SetBoundaryCond(['PML_8'] * 6)
-        ret_webgpu = fdtd.Run(self.sim_dir, setup_only=True, engine='webgpu')
-        self.assertEqual(ret_webgpu, 0)
+        ret_vulkan = fdtd.Run(self.sim_dir, setup_only=True, engine='vulkan')
+        self.assertEqual(ret_vulkan, 0)
 
         fdtd2 = openEMS(NrTS=15)
         fdtd2.SetCSX(_make_grid())
@@ -81,11 +81,11 @@ class Test_GPUEngine(unittest.TestCase):
         fdtd.SetGaussExcite(1e9, 0.5e9)
         fdtd.SetBoundaryCond(['PML_8'] * 6)
 
-        ret = fdtd.Run(self.sim_dir, setup_only=True, engine='webgpu')
+        ret = fdtd.Run(self.sim_dir, setup_only=True, engine='vulkan')
         self.assertEqual(ret, 0)
 
     def test_different_grid_sizes(self):
-        """Verify WebGPU engine on a range of grid sizes (sub-warp, asymmetric, thin slab)."""
+        """Verify Vulkan engine on a range of grid sizes (sub-warp, asymmetric, thin slab)."""
         sizes = [
             (7, 9, 11),   # Sub-warp: dimZ < 32
             (17, 7, 33),  # Asymmetric non-multiples
@@ -106,11 +106,11 @@ class Test_GPUEngine(unittest.TestCase):
                 fdtd.SetBoundaryCond(['PEC'] * 6)
 
                 sim_dir = os.path.join(tempfile.gettempdir(), f'test_size_{nx}_{ny}_{nz}')
-                ret = fdtd.Run(sim_dir, engine='webgpu', cleanup=True)
+                ret = fdtd.Run(sim_dir, engine='vulkan', cleanup=True)
                 self.assertIn(ret, [0, None])
 
     def test_multisource_excitation(self):
-        """Verify WebGPU engine with multiple independent excitation sources."""
+        """Verify Vulkan engine with multiple independent excitation sources."""
         csx = ContinuousStructure()
         grid = csx.GetGrid()
         grid.SetDeltaUnit(1e-3)
@@ -130,7 +130,7 @@ class Test_GPUEngine(unittest.TestCase):
         fdtd.SetBoundaryCond(['PEC'] * 6)
 
         sim_dir = os.path.join(tempfile.gettempdir(), 'test_multisource_gpu')
-        ret = fdtd.Run(sim_dir, engine='webgpu', cleanup=True)
+        ret = fdtd.Run(sim_dir, engine='vulkan', cleanup=True)
         self.assertIn(ret, [0, None])
 
     def test_multi_axis_probes_fidelity(self):
@@ -168,7 +168,7 @@ class Test_GPUEngine(unittest.TestCase):
         fdtd_cpu.Run(sim_cpu, engine='multithreaded', cleanup=False)
 
         fdtd_gpu = build_setup()
-        fdtd_gpu.Run(sim_gpu, engine='webgpu', cleanup=False)
+        fdtd_gpu.Run(sim_gpu, engine='vulkan', cleanup=False)
 
         for p_name in ['probe_x', 'probe_y', 'probe_z']:
             cpu_file = os.path.join(sim_cpu, p_name)
@@ -183,17 +183,17 @@ class Test_GPUEngine(unittest.TestCase):
             self.assertLess(rel_diff, 0.0005, f"{p_name} relative difference {rel_diff:.4%} exceeded 0.05%")
 
     def test_mixed_boundary_conditions(self):
-        """Verify WebGPU engine with mixed boundary conditions (PEC, PMC, Mur)."""
+        """Verify Vulkan engine with mixed boundary conditions (PEC, PMC, Mur)."""
         csx = _make_grid()
         fdtd = openEMS(NrTS=20)
         fdtd.SetCSX(csx)
         fdtd.SetGaussExcite(1e9, 0.5e9)
         fdtd.SetBoundaryCond(['PEC', 'PEC', 'PMC', 'PMC', 'MUR', 'MUR'])
-        ret = fdtd.Run(self.sim_dir, engine='webgpu', cleanup=True)
+        ret = fdtd.Run(self.sim_dir, engine='vulkan', cleanup=True)
         self.assertIn(ret, [0, None])
 
     def test_lumped_port(self):
-        """Verify lumped port simulation on WebGPU matches multithreaded CPU."""
+        """Verify lumped port simulation on Vulkan matches multithreaded CPU."""
         def run_port(engine_name, sdir):
             csx = ContinuousStructure()
             grid = csx.GetGrid()
@@ -214,7 +214,7 @@ class Test_GPUEngine(unittest.TestCase):
         sim_gpu = os.path.join(tempfile.gettempdir(), 'test_lumped_gpu')
 
         run_port('multithreaded', sim_cpu)
-        run_port('webgpu', sim_gpu)
+        run_port('vulkan', sim_gpu)
 
         cpu_port = np.loadtxt(os.path.join(sim_cpu, 'port_ut_1'), comments='%')
         gpu_port = np.loadtxt(os.path.join(sim_gpu, 'port_ut_1'), comments='%')

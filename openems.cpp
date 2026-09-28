@@ -39,7 +39,7 @@
 #include "FDTD/engine_interface_cylindrical_fdtd.h"
 #include "FDTD/engine_backend.h"
 #include "FDTD/engine_cpu.h"
-#include "FDTD/webgpu/engine_webgpu.h"
+#include "FDTD/vulkan/engine_vulkan.h"
 #include "Common/processvoltage.h"
 #include "Common/processcurrent.h"
 #include "Common/processfieldprobe.h"
@@ -251,10 +251,10 @@ void openEMS::collectCommandLineArguments()
 						cout << "openEMS - enabled multithreading" << endl;
 						m_engine = EngineType_Multithreaded;
 					}
-					else if (val == "webgpu" || val == "gpu")
+					else if (val == "vulkan" || val == "gpu")
 					{
-						cout << "openEMS - enabled WebGPU acceleration engine" << endl;
-						m_engine = EngineType_WebGPU;
+						cout << "openEMS - enabled Vulkan acceleration engine" << endl;
+						m_engine = EngineType_Vulkan;
 					}
 				}
 			),
@@ -266,7 +266,7 @@ void openEMS::collectCommandLineArguments()
 			"operator + sse vector extensions\n"
 			"  multithreaded: \tengine using compressed "
 			"operator + sse vector extensions + multithreading\n"
-			"  webgpu/gpu: \tGPU-accelerated engine (Metal/Vulkan/DX12) with CPU fallback\n"
+			"  vulkan/gpu: \tGPU-accelerated engine (Vulkan 1.2 compute) with CPU fallback\n"
 #ifdef MPI_SUPPORT
 			"operator + sse vector extensions + MPI + multithreading\n"
 #else
@@ -1330,22 +1330,22 @@ int openEMS::SetupFDTD()
 	//create FDTD engine
 	FDTD_Eng = FDTD_Op->CreateEngine();
 
-	if (m_engine == EngineType_WebGPU)
+	if (m_engine == EngineType_Vulkan)
 	{
 		std::string unsupportedReason;
-		if (EngineWebGPU::CheckModelSupport(FDTD_Op, m_CSX, unsupportedReason))
+		if (EngineVulkan::CheckModelSupport(FDTD_Op, m_CSX, unsupportedReason))
 		{
-			auto webgpuBackend = std::make_unique<EngineWebGPU>(FDTD_Op);
-			if (webgpuBackend->Initialize())
+			auto vulkanBackend = std::make_unique<EngineVulkan>(FDTD_Op);
+			if (vulkanBackend->Initialize())
 			{
-				m_EngineBackend = std::move(webgpuBackend);
+				m_EngineBackend = std::move(vulkanBackend);
 				cout << "[openEMS] Activated " << m_EngineBackend->GetBackendName() << " acceleration backend." << endl;
 				if (PA)
 					m_EngineBackend->RegisterProbes(PA);
 			}
 			else
 			{
-				cout << "[openEMS GPU] Warning: WebGPU initialization failed -> falling back to multithreaded CPU engine." << endl;
+				cout << "[openEMS GPU] Warning: Vulkan initialization failed -> falling back to multithreaded CPU engine." << endl;
 				m_EngineBackend = std::make_unique<EngineCPU>(FDTD_Eng, false);
 			}
 		}
