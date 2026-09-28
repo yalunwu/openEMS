@@ -34,10 +34,11 @@ constexpr double_complex I_UNIT(0.0, 1.0);
 
 #include "tools/constants.h"
 #include "Common/engine_interface_base.h"
+#include "openems_global.h"
 
 class Operator_Base;
 
-class Processing
+class OPENEMS_EXPORT Processing
 {
 public:
 	virtual ~Processing();
@@ -76,6 +77,7 @@ public:
 	void AddFrequency(std::vector<double> *freqs);
 
 	bool CheckTimestep();
+	bool IsTimestep() const;
 
 	//! Process data prior to the simulation run.
 	virtual void PreProcess() {};

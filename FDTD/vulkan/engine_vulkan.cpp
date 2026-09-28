@@ -39,7 +39,7 @@ static std::vector<uint32_t> CompileGLSLToSpirv(const std::string& source, shade
 #endif // ENABLE_VULKAN
 
 EngineVulkan::EngineVulkan(const Operator* op)
-	: m_op(op), m_pa(nullptr), m_numTS(0), m_hostFieldsValid(true)
+	: m_op(op), m_pa(nullptr), m_numTS(0), m_hostFieldsValid(true), m_hostFieldsDirty(true)
 {
 	if (m_op)
 	{
@@ -67,35 +67,7 @@ EngineVulkan::~EngineVulkan()
 
 bool EngineVulkan::CheckModelSupport(const Operator* op, const ContinuousStructure* csx, std::string& unsupportedReason)
 {
-	if (!op)
-	{
-		unsupportedReason = "Invalid operator.";
-		return false;
-	}
-
-	if (csx)
-	{
-		ContinuousStructure* nonConstCSX = const_cast<ContinuousStructure*>(csx);
-		if (nonConstCSX->GetQtyPropertyType(CSProperties::LORENTZMATERIAL) > 0)
-		{
-			unsupportedReason = "Lorentz dispersive material is not supported on Vulkan.";
-			return false;
-		}
-
-		if (nonConstCSX->GetQtyPropertyType(CSProperties::DEBYEMATERIAL) > 0)
-		{
-			unsupportedReason = "Debye dispersive material is not supported on Vulkan.";
-			return false;
-		}
-
-		if (nonConstCSX->GetQtyPropertyType(CSProperties::CONDUCTINGSHEET) > 0)
-		{
-			unsupportedReason = "Conducting sheets are not supported on Vulkan.";
-			return false;
-		}
-	}
-
-	return true;
+	return EngineBackend::CheckModelSupport(op, csx, unsupportedReason);
 }
 
 bool EngineVulkan::Initialize()
@@ -390,7 +362,7 @@ bool EngineVulkan::AllocateBuffers()
 		std::cout << "[openEMS Vulkan] Uploading operator material matrices (vv, vi, ii, iv) to GPU..." << std::endl;
 		std::vector<float> hostCoeff(3 * m_grid.numCells, 0.0f);
 
-		auto uploadMatrix = [&](const std::string& name, VulkanBuffer& targetBuf, auto getterFunc) {
+		auto uploadMatrix = [&](VulkanBuffer& targetBuf, int matrix) {
 			size_t idx = 0;
 			for (unsigned int n = 0; n < 3; ++n)
 			{
@@ -400,7 +372,13 @@ bool EngineVulkan::AllocateBuffers()
 					{
 						for (unsigned int z = 0; z < m_grid.dimZ; ++z)
 						{
-							hostCoeff[idx++] = getterFunc(n, x, y, z);
+							switch (matrix)
+							{
+							case 0: hostCoeff[idx++] = m_op->GetVV(n, x, y, z); break;
+							case 1: hostCoeff[idx++] = m_op->GetVI(n, x, y, z); break;
+							case 2: hostCoeff[idx++] = m_op->GetII(n, x, y, z); break;
+							default: hostCoeff[idx++] = m_op->GetIV(n, x, y, z); break;
+							}
 						}
 					}
 				}
@@ -430,12 +408,55 @@ bool EngineVulkan::AllocateBuffers()
 			vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX);
 		};
 
-		uploadMatrix("vv", m_bufVv, [&](unsigned int n, unsigned int x, unsigned int y, unsigned int z) { return m_op->GetVV(n, x, y, z); });
-		uploadMatrix("vi", m_bufVi, [&](unsigned int n, unsigned int x, unsigned int y, unsigned int z) { return m_op->GetVI(n, x, y, z); });
-		uploadMatrix("ii", m_bufIi, [&](unsigned int n, unsigned int x, unsigned int y, unsigned int z) { return m_op->GetII(n, x, y, z); });
-		uploadMatrix("iv", m_bufIv, [&](unsigned int n, unsigned int x, unsigned int y, unsigned int z) { return m_op->GetIV(n, x, y, z); });
+		uploadMatrix(m_bufVv, 0);
+		uploadMatrix(m_bufVi, 1);
+		uploadMatrix(m_bufIi, 2);
+		uploadMatrix(m_bufIv, 3);
 	}
 
+	return SyncFieldsToDevice();
+}
+
+bool EngineVulkan::SyncFieldsToDevice()
+{
+	if (!m_hostFieldsDirty)
+		return true;
+	if (!m_device || !m_bufFieldStaging.mapped)
+		return false;
+
+	size_t fieldBytes = 3 * static_cast<size_t>(m_grid.numCells) * sizeof(float);
+	auto uploadBuffer = [&](const std::vector<float>& source, VulkanBuffer& target) {
+		std::memcpy(m_bufFieldStaging.mapped, source.data(), fieldBytes);
+		if (vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+			return false;
+		if (vkResetFences(m_device, 1, &m_fence) != VK_SUCCESS)
+			return false;
+
+		VkCommandBufferBeginInfo beginInfo = {};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		if (vkBeginCommandBuffer(m_cmdBuffer, &beginInfo) != VK_SUCCESS)
+			return false;
+
+		VkBufferCopy copyRegion = { 0, 0, fieldBytes };
+		vkCmdCopyBuffer(m_cmdBuffer, m_bufFieldStaging.buffer, target.buffer, 1, &copyRegion);
+		if (vkEndCommandBuffer(m_cmdBuffer) != VK_SUCCESS)
+			return false;
+
+		VkSubmitInfo submitInfo = {};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &m_cmdBuffer;
+		if (vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_fence) != VK_SUCCESS)
+			return false;
+		return vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+	};
+
+	if (!uploadBuffer(m_hostVolt, m_bufVolt) || !uploadBuffer(m_hostCurr, m_bufCurr))
+		return false;
+
+	m_hostFieldsDirty = false;
+	m_hostFieldsValid = true;
 	return true;
 }
 
@@ -1027,6 +1048,9 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 #ifdef ENABLE_VULKAN
 	if (m_device && m_computeQueue && m_pipelineVolt && m_pipelineCurr)
 	{
+		if (!SyncFieldsToDevice())
+			return false;
+
 		uint32_t wgZ = (m_grid.dimZ + 31) / 32;
 		uint32_t wgY = (m_grid.dimY + 3) / 4;
 		uint32_t wgX = (m_grid.dimX + 1) / 2;
@@ -1253,6 +1277,7 @@ bool EngineVulkan::SyncFieldsToHost()
 
 		downloadBuffer(m_bufVolt, m_hostVolt);
 		downloadBuffer(m_bufCurr, m_hostCurr);
+		m_hostFieldsDirty = false;
 
 		Engine* cpuEng = (m_op ? m_op->GetEngine() : nullptr);
 		if (cpuEng)
@@ -1317,6 +1342,8 @@ FDTD_FLOAT EngineVulkan::GetCurr(unsigned int n, unsigned int x, unsigned int y,
 
 void EngineVulkan::SetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT val)
 {
+	if (!m_hostFieldsValid && !SyncFieldsToHost())
+		return;
 	size_t idx = n * static_cast<size_t>(m_grid.numCells) +
 	             x * (m_grid.dimY * m_grid.dimZ) +
 	             y * m_grid.dimZ +
@@ -1324,11 +1351,14 @@ void EngineVulkan::SetVolt(unsigned int n, unsigned int x, unsigned int y, unsig
 	if (idx < m_hostVolt.size())
 	{
 		m_hostVolt[idx] = val;
+		m_hostFieldsDirty = true;
 	}
 }
 
 void EngineVulkan::SetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT val)
 {
+	if (!m_hostFieldsValid && !SyncFieldsToHost())
+		return;
 	size_t idx = n * static_cast<size_t>(m_grid.numCells) +
 	             x * (m_grid.dimY * m_grid.dimZ) +
 	             y * m_grid.dimZ +
@@ -1336,6 +1366,7 @@ void EngineVulkan::SetCurr(unsigned int n, unsigned int x, unsigned int y, unsig
 	if (idx < m_hostCurr.size())
 	{
 		m_hostCurr[idx] = val;
+		m_hostFieldsDirty = true;
 	}
 }
 
@@ -1389,6 +1420,7 @@ void EngineVulkan::Reset()
 
 	m_numTS = 0;
 	m_hostFieldsValid = true;
+	m_hostFieldsDirty = true;
 	std::fill(m_hostVolt.begin(), m_hostVolt.end(), 0.0f);
 	std::fill(m_hostCurr.begin(), m_hostCurr.end(), 0.0f);
 	m_excSources.clear();

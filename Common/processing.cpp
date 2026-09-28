@@ -81,16 +81,24 @@ void Processing::SetName(string val, int number)
 
 bool Processing::CheckTimestep()
 {
+	if (!IsTimestep())
+		return false;
+
+	unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
+	if ((m_ProcessSteps.size()>m_PS_pos) && (m_ProcessSteps.at(m_PS_pos)==ts))
+		++m_PS_pos;
+	return true;
+}
+
+bool Processing::IsTimestep() const
+{
 	unsigned int ts = m_Eng_Interface->GetNumberOfTimesteps();
 	if (ts<startTS || ts>stopTS)
 		return false;
 	if (m_ProcessSteps.size()>m_PS_pos)
 	{
 		if (m_ProcessSteps.at(m_PS_pos)==ts)
-		{
-			++m_PS_pos;
 			return true;
-		}
 	}
 	if (ProcessInterval)
 	{

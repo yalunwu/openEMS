@@ -9,6 +9,8 @@
 
 #include "engine_backend.h"
 #include "operator.h"
+#include "extensions/operator_extension.h"
+#include "extensions/operator_ext_excitation.h"
 #include "ContinuousStructure.h"
 #include "CSProperties.h"
 
@@ -44,6 +46,16 @@ bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStruct
 		}
 	}
 
-	// Model is compatible with standard Cartesian Yee + UPML + excitation GPU pipeline
+	for (size_t i = 0; i < op->GetNumberOfExtentions(); ++i)
+	{
+		Operator_Extension* extension = op->GetExtension(i);
+		if (dynamic_cast<Operator_Ext_Excitation*>(extension))
+			continue;
+
+		unsupportedReason = extension->GetExtensionName() + " is not supported on Vulkan.";
+		return false;
+	}
+
+	// Model is compatible with the standard Cartesian Yee + excitation GPU pipeline.
 	return true;
 }

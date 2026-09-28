@@ -79,6 +79,7 @@ private:
 	GridDimensions m_grid;
 	unsigned int m_numTS = 0;
 	bool m_hostFieldsValid = true;
+	bool m_hostFieldsDirty = true;
 
 	std::vector<float> m_hostVolt;
 	std::vector<float> m_hostCurr;
@@ -149,6 +150,7 @@ private:
 	bool AllocateExcitationBuffers();
 	bool AllocateProbeBuffers();
 	bool CreatePipelines();
+	bool SyncFieldsToDevice();
 
 	bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VulkanBuffer& outBuf);
 	void DestroyBuffer(VulkanBuffer& buf);

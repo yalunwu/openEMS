@@ -222,8 +222,12 @@ SET_TARGET_PROPERTIES(openEMS_bin PROPERTIES OUTPUT_NAME openEMS)
 TARGET_LINK_LIBRARIES(openEMS_bin openEMS)
 
 # backend unit test suite
-ADD_EXECUTABLE( test_backend test_backend.cpp )
-TARGET_LINK_LIBRARIES( test_backend openEMS ${CSXCAD_LIBRARIES} ${VULKAN_LIBRARIES} )
+include(CTest)
+if(BUILD_TESTING)
+  ADD_EXECUTABLE( test_backend test_backend.cpp )
+  TARGET_LINK_LIBRARIES( test_backend openEMS ${CSXCAD_LIBRARIES} ${VULKAN_LIBRARIES} )
+  ADD_TEST(NAME backend COMMAND test_backend)
+endif()
  
 if (WIN32)
     INSTALL(TARGETS openEMS RUNTIME DESTINATION bin ARCHIVE DESTINATION lib${LIB_SUFFIX})

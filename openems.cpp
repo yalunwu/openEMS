@@ -1335,7 +1335,7 @@ int openEMS::SetupFDTD()
 		std::string unsupportedReason;
 		if (EngineVulkan::CheckModelSupport(FDTD_Op, m_CSX, unsupportedReason))
 		{
-			auto vulkanBackend = std::make_unique<EngineVulkan>(FDTD_Op);
+			std::unique_ptr<EngineVulkan> vulkanBackend(new EngineVulkan(FDTD_Op));
 			if (vulkanBackend->Initialize())
 			{
 				m_EngineBackend = std::move(vulkanBackend);
@@ -1346,18 +1346,18 @@ int openEMS::SetupFDTD()
 			else
 			{
 				cout << "[openEMS GPU] Warning: Vulkan initialization failed -> falling back to multithreaded CPU engine." << endl;
-				m_EngineBackend = std::make_unique<EngineCPU>(FDTD_Eng, false);
+				m_EngineBackend.reset(new EngineCPU(FDTD_Eng, false));
 			}
 		}
 		else
 		{
 			cout << "[openEMS GPU] Notice: " << unsupportedReason << " Falling back gracefully to multithreaded CPU engine." << endl;
-			m_EngineBackend = std::make_unique<EngineCPU>(FDTD_Eng, false);
+			m_EngineBackend.reset(new EngineCPU(FDTD_Eng, false));
 		}
 	}
 	else
 	{
-		m_EngineBackend = std::make_unique<EngineCPU>(FDTD_Eng, false);
+		m_EngineBackend.reset(new EngineCPU(FDTD_Eng, false));
 	}
 
 	if (Op_Ext_SSD)
@@ -1470,9 +1470,10 @@ void openEMS::RunFDTD()
 	PA->PreProcess();
 	int step=PA->Process();
 	if ((step<0) || (step>(int)NrTS)) step=NrTS;
+	EngineVulkan* vulkanBackend = dynamic_cast<EngineVulkan*>(m_EngineBackend.get());
 	while (((m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps()) < NrTS) && (change>endCrit) && !CheckAbortCond())
 	{
-		if (m_EngineBackend)
+		if (vulkanBackend)
 		{
 			m_EngineBackend->IterateTS(step);
 			FDTD_Eng->SetNumberOfTimesteps(m_EngineBackend->GetNumberOfTimesteps());
@@ -1480,20 +1481,20 @@ void openEMS::RunFDTD()
 		else
 			FDTD_Eng->IterateTS(step);
 
-		if (m_EngineBackend)
+		if (vulkanBackend)
 		{
 			gettimeofday(&currTime, NULL);
 			double timeSincePrev = CalcDiffTime(currTime, prevTime);
 
 			bool needFullField = false;
-			if ((Eng_Ext_SSD == NULL) && (ProcField->CheckTimestep() || timeSincePrev > 4.0))
+			if ((Eng_Ext_SSD == NULL) && (ProcField->IsTimestep() || timeSincePrev > 4.0))
 				needFullField = true;
 			else if (PA)
 			{
 				for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
 				{
 					Processing* p = PA->GetProcessing(i);
-					if ((dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->CheckTimestep())
+					if ((dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->IsTimestep())
 					{
 						needFullField = true;
 						break;
@@ -1502,9 +1503,9 @@ void openEMS::RunFDTD()
 			}
 
 			if (needFullField)
-				m_EngineBackend->SyncFieldsToHost();
+				vulkanBackend->SyncFieldsToHost();
 
-			m_EngineBackend->SyncProbesToHost();
+			vulkanBackend->SyncProbesToHost();
 		}
 
 		step=PA->Process();
@@ -1552,7 +1553,8 @@ void openEMS::RunFDTD()
 				DumpRunStatistics(OPENEMS_RUN_STAT_FILE, t_run, currTS, speed, currE);
 			if (m_EngineBackend)
 				m_EngineBackend->NextInterval(speed);
-			FDTD_Eng->NextInterval(speed);
+			else
+				FDTD_Eng->NextInterval(speed);
 		}
 	}
 	if ((change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
@@ -1570,8 +1572,8 @@ void openEMS::RunFDTD()
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
 
 	//*************** postproc ************//
-	if (m_EngineBackend)
-		m_EngineBackend->SyncFieldsToHost();
+	if (vulkanBackend)
+		vulkanBackend->SyncFieldsToHost();
 
 	PA->PostProcess();
 

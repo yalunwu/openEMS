@@ -32,7 +32,7 @@
 #include "operator_extension.h"
 #include "tools/arraylib/array_ij.h"
 
-class Operator_Ext_Mur_ABC : public Operator_Extension
+class OPENEMS_EXPORT Operator_Ext_Mur_ABC : public Operator_Extension
 {
 	friend class Engine_Ext_Mur_ABC;
 public:

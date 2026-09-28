@@ -22,6 +22,7 @@
 #include "tools/constants.h"
 #include "excitation.h"
 #include "Common/operator_base.h"
+#include "openems_global.h"
 
 #include "tools/arraylib/array_nijk.h"
 
@@ -31,7 +32,7 @@ class Engine;
 class TiXmlElement;
 
 //! Basic FDTD-operator
-class Operator : public Operator_Base
+class OPENEMS_EXPORT Operator : public Operator_Base
 {
 	friend class Engine;
 	friend class Engine_Interface_FDTD;

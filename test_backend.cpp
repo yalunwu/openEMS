@@ -8,13 +8,16 @@
 #include <cassert>
 #include <vector>
 #include <string>
+#include <memory>
 
 #include "openems.h"
 #include "FDTD/engine_backend.h"
 #include "FDTD/engine_cpu.h"
 #include "FDTD/engine.h"
 #include "FDTD/operator.h"
+#include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/vulkan/engine_vulkan.h"
+#include "Common/processing.h"
 #include "ContinuousStructure.h"
 #include "CSProperties.h"
 #include "CSPropLorentzMaterial.h"
@@ -45,6 +48,32 @@ int tests_failed = 0;
 		} \
 	} while (0)
 
+class TestEngineInterface : public Engine_Interface_Base
+{
+public:
+	TestEngineInterface() : Engine_Interface_Base(nullptr), timestep(0) {}
+
+	double* GetEField(const unsigned int*, double* out) const override { return out; }
+	double* GetHField(const unsigned int*, double* out) const override { return out; }
+	double* GetJField(const unsigned int*, double* out) const override { return out; }
+	double* GetRotHField(const unsigned int*, double* out) const override { return out; }
+	double* GetDField(const unsigned int*, double* out) const override { return out; }
+	double* GetBField(const unsigned int*, double* out) const override { return out; }
+	double CalcVoltageIntegral(const unsigned int*, const unsigned int*) const override { return 0.0; }
+	double GetTime(bool = false) const override { return 0.0; }
+	unsigned int GetNumberOfTimesteps() const override { return timestep; }
+	double CalcFastEnergy() const override { return 0.0; }
+
+	unsigned int timestep;
+};
+
+class TestProcessing : public Processing
+{
+public:
+	explicit TestProcessing(Engine_Interface_Base* engine) : Processing(engine) {}
+	std::string GetProcessingName() const override { return "test processing"; }
+};
+
 static ContinuousStructure* CreateSimpleGrid()
 {
 	ContinuousStructure* csx = new ContinuousStructure();
@@ -66,15 +95,44 @@ bool Test_BackendInterface_NullOp()
 	return true;
 }
 
+bool Test_ProcessingTimestepPeekDoesNotConsume()
+{
+	TestEngineInterface* engine = new TestEngineInterface();
+	TestProcessing processing(engine);
+	processing.AddStep(5);
+	engine->timestep = 5;
+
+	TEST_ASSERT(processing.IsTimestep(), "Scheduled timestep should be due");
+	TEST_ASSERT(processing.IsTimestep(), "Peeking must not consume a scheduled timestep");
+	TEST_ASSERT(processing.CheckTimestep(), "Processing should consume the scheduled timestep");
+	TEST_ASSERT(!processing.IsTimestep(), "Consumed timestep must no longer be due");
+	return true;
+}
+
 bool Test_CapabilityScanner_StandardModel()
 {
 	ContinuousStructure* csx = CreateSimpleGrid();
 	std::string reason;
-	Operator* dummyOp = reinterpret_cast<Operator*>(0x1234);
+	std::unique_ptr<Operator> op(Operator::New());
 
-	bool supported = EngineBackend::CheckModelSupport(dummyOp, csx, reason);
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
 	TEST_ASSERT(supported, "Standard grid model should be supported on GPU backend");
 	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_EngineExtensionFallback()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new Operator_Ext_Mur_ABC(op.get()));
+
+	std::string reason;
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(!supported, "Engine extensions without a Vulkan implementation must be rejected");
+	TEST_ASSERT(reason.find("Mur") != std::string::npos, "Reason should name the unsupported extension");
 
 	delete csx;
 	return true;
@@ -87,9 +145,9 @@ bool Test_CapabilityScanner_LorentzMaterialFallback()
 	csx->AddProperty(lorentz);
 
 	std::string reason;
-	Operator* dummyOp = reinterpret_cast<Operator*>(0x1234);
+	std::unique_ptr<Operator> op(Operator::New());
 
-	bool supported = EngineBackend::CheckModelSupport(dummyOp, csx, reason);
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
 	TEST_ASSERT(!supported, "Lorentz material must be rejected by GPU capability scanner");
 	TEST_ASSERT(reason.find("Lorentz") != std::string::npos, "Reason should mention Lorentz");
 
@@ -101,12 +159,13 @@ bool Test_CapabilityScanner_DebyeMaterialFallback()
 {
 	ContinuousStructure* csx = CreateSimpleGrid();
 	CSPropDebyeMaterial* debye = new CSPropDebyeMaterial(csx->GetParameterSet());
+	debye->SetDispersionOrder(1);
 	csx->AddProperty(debye);
 
 	std::string reason;
-	Operator* dummyOp = reinterpret_cast<Operator*>(0x1234);
+	std::unique_ptr<Operator> op(Operator::New());
 
-	bool supported = EngineBackend::CheckModelSupport(dummyOp, csx, reason);
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
 	TEST_ASSERT(!supported, "Debye material must be rejected by GPU capability scanner");
 	TEST_ASSERT(reason.find("Debye") != std::string::npos, "Reason should mention Debye");
 
@@ -121,9 +180,9 @@ bool Test_CapabilityScanner_ConductingSheetFallback()
 	csx->AddProperty(sheet);
 
 	std::string reason;
-	Operator* dummyOp = reinterpret_cast<Operator*>(0x1234);
+	std::unique_ptr<Operator> op(Operator::New());
 
-	bool supported = EngineBackend::CheckModelSupport(dummyOp, csx, reason);
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
 	TEST_ASSERT(!supported, "Conducting sheet must be rejected by GPU capability scanner");
 	TEST_ASSERT(reason.find("Conducting sheet") != std::string::npos, "Reason should mention Conducting sheets");
 
@@ -133,6 +192,9 @@ bool Test_CapabilityScanner_ConductingSheetFallback()
 
 bool Test_EngineVulkan_Lifecycle()
 {
+#ifndef ENABLE_VULKAN
+	return true;
+#else
 	EngineVulkan engine(nullptr);
 	TEST_ASSERT(engine.GetBackendName().find("Vulkan") != std::string::npos, "Backend name should contain Vulkan");
 	TEST_ASSERT(engine.GetNumberOfTimesteps() == 0, "Initial timesteps should be 0");
@@ -159,6 +221,7 @@ bool Test_EngineVulkan_Lifecycle()
 	engine.Reset();
 	TEST_ASSERT(engine.GetNumberOfTimesteps() == 0, "Timestep counter should be reset to 0");
 	return true;
+#endif
 }
 
 bool Test_OpenEMS_CLIArgument_EngineVulkan()
@@ -322,6 +385,9 @@ bool Test_Vulkan_ZeroExcitationGeometry()
 
 bool Test_Vulkan_ResetLifecycleMultiRun()
 {
+#ifndef ENABLE_VULKAN
+	return true;
+#else
 	EngineVulkan engine(nullptr);
 	bool init1 = engine.Initialize();
 	TEST_ASSERT(init1, "Initial Initialize() failed");
@@ -345,10 +411,14 @@ bool Test_Vulkan_ResetLifecycleMultiRun()
 	TEST_ASSERT(engine.GetNumberOfTimesteps() == 15, "Timesteps should be 15");
 
 	return true;
+#endif
 }
 
 bool Test_Vulkan_NumericalEquivalence_Asymmetric()
 {
+#ifndef ENABLE_VULKAN
+	return true;
+#else
 	int nx = 13, ny = 11, nz = 23;
 	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
 
@@ -378,22 +448,33 @@ bool Test_Vulkan_NumericalEquivalence_Asymmetric()
 		gpuEng->IterateTS(1);
 	}
 
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
 	gpuEng->SyncFieldsToHost();
 
 	float maxDiff = 0.0f;
+	cpuIdx = 0;
 	for (int n = 0; n < 3; ++n)
 	for (int x = 0; x < nx; ++x)
 	for (int y = 0; y < ny; ++y)
 	for (int z = 0; z < nz; ++z)
 	{
-		float vCpu = cpuEng->GetVolt(n, x, y, z);
+		float vCpu = cpuVolt[cpuIdx++];
 		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
 		float d = std::abs(vCpu - vGpu);
 		if (d > maxDiff) maxDiff = d;
 	}
 
 	TEST_ASSERT(maxDiff < 1e-5f, ("GPU vs CPU field difference exceeded tolerance: " + std::to_string(maxDiff)).c_str());
 	return true;
+#endif
 }
 
 int main(int argc, char* argv[])
@@ -403,7 +484,9 @@ int main(int argc, char* argv[])
 	std::cout << "========================================" << std::endl;
 
 	RUN_TEST(Test_BackendInterface_NullOp);
+	RUN_TEST(Test_ProcessingTimestepPeekDoesNotConsume);
 	RUN_TEST(Test_CapabilityScanner_StandardModel);
+	RUN_TEST(Test_CapabilityScanner_EngineExtensionFallback);
 	RUN_TEST(Test_CapabilityScanner_LorentzMaterialFallback);
 	RUN_TEST(Test_CapabilityScanner_DebyeMaterialFallback);
 	RUN_TEST(Test_CapabilityScanner_ConductingSheetFallback);

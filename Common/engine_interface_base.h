@@ -19,6 +19,7 @@
 #define ENGINE_INTERFACE_BASE_H
 
 #include "tools/global.h"
+#include "openems_global.h"
 
 class Operator_Base;
 
@@ -27,7 +28,7 @@ class Operator_Base;
 	 This is the abstract base for all Engine Interface classes. It will provide unified access to the field information of the corresponding engine.
 	 All processing methods should only access this base class.
 */
-class Engine_Interface_Base
+class OPENEMS_EXPORT Engine_Interface_Base
 {
 public:
 	enum InterpolationType { NO_INTERPOLATION, NODE_INTERPOLATE, CELL_INTERPOLATE };
