@@ -25,7 +25,7 @@
 class Operator_Ext_SteadyState;
 class Engine_Interface_FDTD;
 
-class Engine_Ext_SteadyState : public Engine_Extension
+class OPENEMS_EXPORT Engine_Ext_SteadyState : public Engine_Extension
 {
 public:
 	Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext);
@@ -36,6 +36,7 @@ public:
 
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
 	double GetLastDiff() {return m_last_max_diff;}
+	unsigned int GetTSPeriod() const;
 
 protected:
 	Operator_Ext_SteadyState* m_Op_SS;

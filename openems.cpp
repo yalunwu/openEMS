@@ -1340,8 +1340,6 @@ int openEMS::SetupFDTD()
 			{
 				m_EngineBackend = std::move(vulkanBackend);
 				cout << "[openEMS] Activated " << m_EngineBackend->GetBackendName() << " acceleration backend." << endl;
-				if (PA)
-					m_EngineBackend->RegisterProbes(PA);
 			}
 			else
 			{
@@ -1469,6 +1467,8 @@ void openEMS::RunFDTD()
 
 	PA->PreProcess();
 	int step=PA->Process();
+	if (Eng_Ext_SSD != NULL && step > 1)
+		step = 1;
 	if ((step<0) || (step>(int)NrTS)) step=NrTS;
 	EngineVulkan* vulkanBackend = dynamic_cast<EngineVulkan*>(m_EngineBackend.get());
 	while (((m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps()) < NrTS) && (change>endCrit) && !CheckAbortCond())
@@ -1486,10 +1486,26 @@ void openEMS::RunFDTD()
 			gettimeofday(&currTime, NULL);
 			double timeSincePrev = CalcDiffTime(currTime, prevTime);
 
+			currTS = m_EngineBackend->GetNumberOfTimesteps();
+			unsigned int detectorTS = currTS > 0 ? static_cast<unsigned int>(currTS - 1) : 0;
+
 			bool needFullField = false;
-			if ((Eng_Ext_SSD == NULL) && (ProcField->IsTimestep() || timeSincePrev > 4.0))
-				needFullField = true;
-			else if (PA)
+			if (Eng_Ext_SSD == NULL)
+			{
+				if (ProcField->IsTimestep() || timeSincePrev > 4.0)
+					needFullField = true;
+			}
+			else
+			{
+				// Steady-state detection only requires full fields when evaluating
+				// the completed period's energy via CalcFastEnergy(). On intermediate
+				// timesteps, probe voltages are synced efficiently via SyncProbesToHost().
+				unsigned int p = Eng_Ext_SSD->GetTSPeriod();
+				if (p > 0 && (detectorTS % p == 0) && (detectorTS >= 2 * p))
+					needFullField = true;
+			}
+
+			if (!needFullField && PA)
 			{
 				for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
 				{
@@ -1506,9 +1522,21 @@ void openEMS::RunFDTD()
 				vulkanBackend->SyncFieldsToHost();
 
 			vulkanBackend->SyncProbesToHost();
+
+			if (Eng_Ext_SSD)
+			{
+				// The CPU engine invokes steady-state sampling after the voltage
+				// update and before incrementing its timestep counter. The Vulkan
+				// backend returns after completing and counting the full step.
+				FDTD_Eng->SetNumberOfTimesteps(detectorTS);
+				Eng_Ext_SSD->Apply2Voltages();
+				FDTD_Eng->SetNumberOfTimesteps(static_cast<unsigned int>(currTS));
+			}
 		}
 
 		step=PA->Process();
+		if (Eng_Ext_SSD != NULL && step > 1)
+			step = 1;
 
 		if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
 		{
@@ -1519,6 +1547,8 @@ void openEMS::RunFDTD()
 
 		currTS = m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps();
 		if ((step<0) || (step>(int)(NrTS - currTS))) step=NrTS - currTS;
+		if (Eng_Ext_SSD != NULL && step > 1)
+			step = 1;
 
 		gettimeofday(&currTime,NULL);
 

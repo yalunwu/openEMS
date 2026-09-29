@@ -29,11 +29,12 @@ class Operator_Ext_Cylinder;
 This class creates an operator for a cylindrical FDTD. No special engine is necessary,
 all special cases e.g. a closed alpha mesh or an included r=0 case is treated by an operator/engine extension \sa operator_ext_cylinder.
 */
-class Operator_Cylinder : public Operator_Multithread
+class OPENEMS_EXPORT Operator_Cylinder : public Operator_Multithread
 {
 	friend class Operator_CylinderMultiGrid;
 	friend class Operator_Ext_Cylinder;
 	friend class Operator_Ext_LorentzMaterial;
+	friend class EngineVulkan;
 public:
 	static Operator_Cylinder* New(unsigned int numThreads = 0);
 	virtual ~Operator_Cylinder();

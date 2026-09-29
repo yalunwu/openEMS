@@ -22,10 +22,12 @@
 #include "FDTD/operator.h"
 
 class Engine_Ext_SteadyState;
+class EngineVulkan;
 
-class Operator_Ext_SteadyState : public Operator_Extension
+class OPENEMS_EXPORT Operator_Ext_SteadyState : public Operator_Extension
 {
 	friend class Engine_Ext_SteadyState;
+	friend class EngineVulkan;
 public:
 	Operator_Ext_SteadyState(Operator* op, double period);
 	virtual ~Operator_Ext_SteadyState();
@@ -50,6 +52,24 @@ public:
 
 	bool Add_E_Probe(unsigned int pos[3], int dir);
 	bool Add_H_Probe(unsigned int pos[3], int dir);
+
+	unsigned int GetTSPeriod() const { return m_TS_period; }
+	size_t GetNumberOfEProbes() const { return m_E_probe_dir.size(); }
+	unsigned int GetEProbeDir(size_t idx) const { return m_E_probe_dir.at(idx); }
+	void GetEProbePos(size_t idx, unsigned int pos[3]) const
+	{
+		pos[0] = m_E_probe_pos[0].at(idx);
+		pos[1] = m_E_probe_pos[1].at(idx);
+		pos[2] = m_E_probe_pos[2].at(idx);
+	}
+	size_t GetNumberOfHProbes() const { return m_H_probe_dir.size(); }
+	unsigned int GetHProbeDir(size_t idx) const { return m_H_probe_dir.at(idx); }
+	void GetHProbePos(size_t idx, unsigned int pos[3]) const
+	{
+		pos[0] = m_H_probe_pos[0].at(idx);
+		pos[1] = m_H_probe_pos[1].at(idx);
+		pos[2] = m_H_probe_pos[2].at(idx);
+	}
 
 protected:
 	Operator_Ext_SteadyState(Operator* op, Operator_Ext_SteadyState* op_ext);

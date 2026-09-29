@@ -12,10 +12,17 @@
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_excitation.h"
 #include "extensions/operator_ext_upml.h"
-#include "ContinuousStructure.h"
-#include "CSProperties.h"
+#include "extensions/operator_ext_mur_abc.h"
+#include "extensions/operator_ext_steadystate.h"
+#include "extensions/operator_ext_tfsf.h"
+#include "extensions/operator_ext_lumpedRLC.h"
+#include "extensions/operator_ext_absorbing_bc.h"
+#include "extensions/operator_ext_lorentzmaterial.h"
+#include "extensions/operator_ext_conductingsheet.h"
+#include "extensions/operator_ext_cylinder.h"
+#include "operator_cylindermultigrid.h"
 
-bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStructure* csx, std::string& unsupportedReason)
+bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStructure*, std::string& unsupportedReason)
 {
 	if (!op)
 	{
@@ -23,28 +30,10 @@ bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStruct
 		return false;
 	}
 
-	if (csx)
+	if (dynamic_cast<const Operator_CylinderMultiGrid*>(op))
 	{
-		ContinuousStructure* nonConstCSX = const_cast<ContinuousStructure*>(csx);
-		// Check for dispersive media
-		if (nonConstCSX->GetQtyPropertyType(CSProperties::LORENTZMATERIAL) > 0)
-		{
-			unsupportedReason = "Dispersive material (Lorentz) is not supported on Vulkan.";
-			return false;
-		}
-
-		if (nonConstCSX->GetQtyPropertyType(CSProperties::DEBYEMATERIAL) > 0)
-		{
-			unsupportedReason = "Dispersive material (Debye) is not supported on Vulkan.";
-			return false;
-		}
-
-		// Check for conducting sheets
-		if (nonConstCSX->GetQtyPropertyType(CSProperties::CONDUCTINGSHEET) > 0)
-		{
-			unsupportedReason = "Conducting sheets are not supported on Vulkan.";
-			return false;
-		}
+		unsupportedReason = "Cylindrical multi-grid is not supported on Vulkan.";
+		return false;
 	}
 
 	for (size_t i = 0; i < op->GetNumberOfExtentions(); ++i)
@@ -54,11 +43,27 @@ bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStruct
 			continue;
 		if (dynamic_cast<Operator_Ext_UPML*>(extension))
 			continue;
+		if (dynamic_cast<Operator_Ext_Mur_ABC*>(extension))
+			continue;
+		if (dynamic_cast<Operator_Ext_SteadyState*>(extension))
+			continue;
+		if (dynamic_cast<Operator_Ext_TFSF*>(extension))
+			continue;
+		if (dynamic_cast<Operator_Ext_LumpedRLC*>(extension))
+			continue;
+		if (dynamic_cast<Operator_Ext_Absorbing_BC*>(extension))
+			continue;
+		if (dynamic_cast<Operator_Ext_LorentzMaterial*>(extension))
+			continue;
+		if (dynamic_cast<Operator_Ext_ConductingSheet*>(extension))
+			continue;
+		if (dynamic_cast<Operator_Ext_Cylinder*>(extension))
+			continue;
 
 		unsupportedReason = extension->GetExtensionName() + " is not supported on Vulkan.";
 		return false;
 	}
 
-	// Model is compatible with the standard Cartesian Yee + UPML + excitation GPU pipeline.
+	// Every operator extension attached to the model has a Vulkan implementation.
 	return true;
 }

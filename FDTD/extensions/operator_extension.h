@@ -29,7 +29,7 @@ class Operator_Cylinder;
 class Engine_Extension;
 
 //! Abstract base-class for all operator extensions
-class Operator_Extension
+class OPENEMS_EXPORT Operator_Extension
 {
 	friend class Engine_Extension;
 public:

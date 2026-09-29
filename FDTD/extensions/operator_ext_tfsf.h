@@ -23,10 +23,12 @@
 #include "tools/constants.h"
 
 class Excitation;
+class EngineVulkan;
 
-class Operator_Ext_TFSF : public Operator_Extension
+class OPENEMS_EXPORT Operator_Ext_TFSF : public Operator_Extension
 {
 	friend class Engine_Ext_TFSF;
+	friend class EngineVulkan;
 public:
 	Operator_Ext_TFSF(Operator* op);
 	~Operator_Ext_TFSF();

@@ -21,9 +21,10 @@
 #include "FDTD/operator.h"
 #include "operator_ext_dispersive.h"
 
-class Operator_Ext_LorentzMaterial : public Operator_Ext_Dispersive
+class OPENEMS_EXPORT Operator_Ext_LorentzMaterial : public Operator_Ext_Dispersive
 {
 	friend class Engine_Ext_LorentzMaterial;
+	friend class EngineVulkan;
 public:
 	Operator_Ext_LorentzMaterial(Operator* op);
 	virtual ~Operator_Ext_LorentzMaterial();

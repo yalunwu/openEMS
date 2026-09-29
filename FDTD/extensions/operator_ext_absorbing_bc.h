@@ -39,9 +39,10 @@
 
 #include "CSPropAbsorbingBC.h"
 
-class Operator_Ext_Absorbing_BC : public Operator_Extension
+class OPENEMS_EXPORT Operator_Ext_Absorbing_BC : public Operator_Extension
 {
 	friend class Engine_Ext_Absorbing_BC;
+	friend class EngineVulkan;
 public:
 
 	// This should be a replica of the CSXCAD property, but can also be something

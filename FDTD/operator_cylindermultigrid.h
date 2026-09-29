@@ -28,7 +28,7 @@
   This operator class (or the corresponding engine) will perform the interpolation and connection between these two child-operator/engines.
   One of the child operators itself may be another multi-grid operator to allow for a cascaded multi-grid approach.
   */
-class Operator_CylinderMultiGrid : public Operator_Cylinder
+class OPENEMS_EXPORT Operator_CylinderMultiGrid : public Operator_Cylinder
 {
 	friend class Engine_CylinderMultiGrid;
 public:

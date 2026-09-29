@@ -27,8 +27,9 @@
   doi: 10.1109/MWSYM.1999.780262
   URL: http://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=780262&isnumber=16934
   */
-class Operator_Ext_ConductingSheet : public Operator_Ext_LorentzMaterial
+class OPENEMS_EXPORT Operator_Ext_ConductingSheet : public Operator_Ext_LorentzMaterial
 {
+	friend class EngineVulkan;
 public:
 	Operator_Ext_ConductingSheet(Operator* op, double f_max);
 

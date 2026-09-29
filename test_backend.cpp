@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <cstdio>
 
 #include "openems.h"
 #include "FDTD/engine_backend.h"
@@ -17,10 +18,25 @@
 #include "FDTD/operator.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/extensions/operator_ext_upml.h"
+#include "FDTD/extensions/operator_ext_steadystate.h"
+#include "FDTD/extensions/engine_ext_steadystate.h"
+#include "FDTD/extensions/operator_ext_tfsf.h"
+#include "FDTD/extensions/operator_ext_lumpedRLC.h"
+#include "FDTD/extensions/operator_ext_absorbing_bc.h"
+#include "FDTD/extensions/operator_ext_dispersive.h"
+#include "FDTD/extensions/operator_ext_lorentzmaterial.h"
+#include "FDTD/extensions/operator_ext_conductingsheet.h"
+#include "FDTD/extensions/operator_ext_cylinder.h"
+#include "FDTD/operator_cylinder.h"
+#include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/vulkan/engine_vulkan.h"
 #include "Common/processing.h"
 #include "ContinuousStructure.h"
 #include "CSProperties.h"
+#include "CSPropExcitation.h"
+#include "CSPropLumpedElement.h"
+#include "CSPropAbsorbingBC.h"
+#include "CSPrimBox.h"
 #include "CSPropLorentzMaterial.h"
 #include "CSPropDebyeMaterial.h"
 #include "CSPropConductingSheet.h"
@@ -124,7 +140,56 @@ bool Test_CapabilityScanner_StandardModel()
 	return true;
 }
 
+class DummyUnsupportedExtension : public Operator_Extension
+{
+public:
+	DummyUnsupportedExtension(Operator* op) : Operator_Extension(op) {}
+	virtual Operator_Extension* Clone(Operator* op) { return new DummyUnsupportedExtension(op); }
+	virtual bool BuildExtension() { return true; }
+	virtual Engine_Extension* CreateEngineExtention() { return nullptr; }
+	virtual std::string GetExtensionName() const { return "Unsupported Custom Extension"; }
+};
+
+class DummyDispersiveExtension : public Operator_Ext_Dispersive
+{
+public:
+	explicit DummyDispersiveExtension(Operator* op) : Operator_Ext_Dispersive(op) {}
+	Operator_Extension* Clone(Operator* op) override { return new DummyDispersiveExtension(op); }
+	std::string GetExtensionName() const override { return "Unsupported Dispersive Extension"; }
+};
+
 bool Test_CapabilityScanner_EngineExtensionFallback()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new DummyUnsupportedExtension(op.get()));
+
+	std::string reason;
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(!supported, "Engine extensions without a Vulkan implementation must be rejected");
+	TEST_ASSERT(reason.find("Unsupported Custom Extension") != std::string::npos, "Reason should name the unsupported extension");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_UnknownDispersiveFallback()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new DummyDispersiveExtension(op.get()));
+
+	std::string reason;
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(!supported, "Unknown dispersive extensions must not be silently accepted");
+	TEST_ASSERT(reason.find("Unsupported Dispersive Extension") != std::string::npos,
+	            "Reason should name the unsupported dispersive extension");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_MurABC_Supported()
 {
 	ContinuousStructure* csx = CreateSimpleGrid();
 	std::unique_ptr<Operator> op(Operator::New());
@@ -132,8 +197,68 @@ bool Test_CapabilityScanner_EngineExtensionFallback()
 
 	std::string reason;
 	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
-	TEST_ASSERT(!supported, "Engine extensions without a Vulkan implementation must be rejected");
-	TEST_ASSERT(reason.find("Mur") != std::string::npos, "Reason should name the unsupported extension");
+	TEST_ASSERT(supported, "Mur ABC should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_SteadyState_Supported()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new Operator_Ext_SteadyState(op.get(), 1e-9));
+
+	std::string reason;
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(supported, "SteadyState should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_TFSF_Supported()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new Operator_Ext_TFSF(op.get()));
+
+	std::string reason;
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(supported, "TFSF should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_LumpedRLC_Supported()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new Operator_Ext_LumpedRLC(op.get()));
+
+	std::string reason;
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(supported, "Lumped RLC should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_AbsorbingBC_Supported()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new Operator_Ext_Absorbing_BC(op.get()));
+
+	std::string reason;
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(supported, "Local absorbing BC sheets should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
 
 	delete csx;
 	return true;
@@ -159,53 +284,94 @@ bool Test_CapabilityScanner_UPML_Supported()
 	return true;
 }
 
-bool Test_CapabilityScanner_LorentzMaterialFallback()
+bool Test_CapabilityScanner_LorentzMaterial_Supported()
 {
 	ContinuousStructure* csx = CreateSimpleGrid();
 	CSPropLorentzMaterial* lorentz = new CSPropLorentzMaterial(csx->GetParameterSet());
+	lorentz->SetDispersionOrder(1);
+	lorentz->SetEpsPlasmaFreq(0, 1e10);
 	csx->AddProperty(lorentz);
 
 	std::string reason;
 	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new Operator_Ext_LorentzMaterial(op.get()));
 
 	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
-	TEST_ASSERT(!supported, "Lorentz material must be rejected by GPU capability scanner");
-	TEST_ASSERT(reason.find("Lorentz") != std::string::npos, "Reason should mention Lorentz");
+	TEST_ASSERT(supported, "Lorentz material should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
 
 	delete csx;
 	return true;
 }
 
-bool Test_CapabilityScanner_DebyeMaterialFallback()
+bool Test_CapabilityScanner_DebyeMaterial_Supported()
 {
 	ContinuousStructure* csx = CreateSimpleGrid();
 	CSPropDebyeMaterial* debye = new CSPropDebyeMaterial(csx->GetParameterSet());
 	debye->SetDispersionOrder(1);
+	debye->SetEpsDelta(0, 1.0);
+	debye->SetEpsRelaxTime(0, 1e-9);
 	csx->AddProperty(debye);
 
 	std::string reason;
 	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new Operator_Ext_LorentzMaterial(op.get()));
 
 	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
-	TEST_ASSERT(!supported, "Debye material must be rejected by GPU capability scanner");
-	TEST_ASSERT(reason.find("Debye") != std::string::npos, "Reason should mention Debye");
+	TEST_ASSERT(supported, "Debye material should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
 
 	delete csx;
 	return true;
 }
 
-bool Test_CapabilityScanner_ConductingSheetFallback()
+bool Test_CapabilityScanner_ConductingSheet_Supported()
 {
 	ContinuousStructure* csx = CreateSimpleGrid();
 	CSPropConductingSheet* sheet = new CSPropConductingSheet(csx->GetParameterSet());
+	sheet->SetConductivity(5.8e7);
+	sheet->SetThickness(35e-6);
 	csx->AddProperty(sheet);
 
 	std::string reason;
 	std::unique_ptr<Operator> op(Operator::New());
+	op->AddExtension(new Operator_Ext_ConductingSheet(op.get(), 1e9));
 
 	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
-	TEST_ASSERT(!supported, "Conducting sheet must be rejected by GPU capability scanner");
-	TEST_ASSERT(reason.find("Conducting sheet") != std::string::npos, "Reason should mention Conducting sheets");
+	TEST_ASSERT(supported, "Conducting sheet should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_Cylinder_Supported()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::string reason;
+	std::unique_ptr<Operator_Cylinder> op(Operator_Cylinder::New());
+	op->AddExtension(new Operator_Ext_Cylinder(op.get()));
+
+	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+	TEST_ASSERT(supported, "Cylindrical coordinates should be supported on Vulkan backend");
+	TEST_ASSERT(reason.empty(), "Reason should be empty on success");
+
+	delete csx;
+	return true;
+}
+
+bool Test_CapabilityScanner_CylinderMultiGrid_Fallback()
+{
+	ContinuousStructure* csx = CreateSimpleGrid();
+	std::string reason;
+	std::vector<double> mg = { 10.0, 20.0 };
+	std::unique_ptr<Operator_CylinderMultiGrid> op(Operator_CylinderMultiGrid::New(mg));
+	if (op)
+	{
+		bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
+		TEST_ASSERT(!supported, "Cylindrical multi-grid should trigger graceful fallback");
+		TEST_ASSERT(reason.find("Cylindrical multi-grid") != std::string::npos, "Reason should mention cylindrical multi-grid");
+	}
 
 	delete csx;
 	return true;
@@ -306,6 +472,7 @@ public:
 	Operator* GetOp() { return FDTD_Op; }
 	Engine* GetEng() { return FDTD_Eng; }
 	EngineBackend* GetBackend() { return m_EngineBackend.get(); }
+	Engine_Ext_SteadyState* GetSteadyStateDetector() { return Eng_Ext_SSD; }
 };
 
 static ContinuousStructure* CreateCustomGrid(int nx, int ny, int nz)
@@ -566,6 +733,716 @@ bool Test_Vulkan_UPML_Equivalence()
 #endif
 }
 
+bool Test_Vulkan_MurABC_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 21, ny = 21, nz = 21;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	// Set Mur ABC on all 6 boundaries
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 2);
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with Mur ABC");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	// Initial impulse at center (Ez component)
+	int cx = nx / 2, cy = ny / 2, cz = nz / 2;
+	cpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+	gpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with Mur ABC exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
+bool Test_Vulkan_SteadyState_Execution()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 15, ny = 15, nz = 15;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+	CSPropExcitation* exc = new CSPropExcitation(csx->GetParameterSet());
+	exc->SetExcitType(0);
+	exc->SetExcitation(1.0, 2);
+	CSPrimBox* excBox = new CSPrimBox(csx->GetParameterSet(), exc);
+	excBox->SetCoord(0, -4.0);
+	excBox->SetCoord(1,  4.0);
+	excBox->SetCoord(2, -4.0);
+	excBox->SetCoord(3,  4.0);
+	excBox->SetCoord(4, -4.0);
+	excBox->SetCoord(5,  4.0);
+	csx->AddProperty(exc);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(160);
+	fdtd.SetSinusExcite(10e9);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	// Set Mur ABC boundaries
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 2);
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with SinusExcite / SteadyState");
+
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+	Engine_Ext_SteadyState* detector = fdtd.GetSteadyStateDetector();
+	TEST_ASSERT(detector != nullptr, "Steady-state detector was not created");
+	TEST_ASSERT(detector->GetTSPeriod() > 0, "Steady-state detector period is zero");
+
+	fdtd.RunFDTD();
+	TEST_ASSERT(gpuEng->GetNumberOfTimesteps() >= 2 * detector->GetTSPeriod(),
+	            "Simulation did not execute enough timesteps to compare periods");
+	TEST_ASSERT(std::isfinite(detector->GetLastDiff()), "Steady-state detector produced a non-finite result");
+	TEST_ASSERT(detector->GetLastDiff() < 1.0, "Steady-state detector did not consume live Vulkan probe data");
+	return true;
+#endif
+}
+
+bool Test_Vulkan_TFSF_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 21, ny = 21, nz = 21;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+
+	CSPropExcitation* exc = new CSPropExcitation(csx->GetParameterSet());
+	exc->SetExcitType(10); // plane wave
+	exc->SetPropagationDir(1.0, 0); // x-direction
+	exc->SetExcitation(1.0, 2); // Ez polarization
+	CSPrimBox* box = new CSPrimBox(csx->GetParameterSet(), exc);
+	box->SetCoord(0, -12.0);
+	box->SetCoord(1,  12.0);
+	box->SetCoord(2, -12.0);
+	box->SetCoord(3,  12.0);
+	box->SetCoord(4, -12.0);
+	box->SetCoord(5,  12.0);
+	csx->AddProperty(exc);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	// Mur ABC on outer boundaries so the wave propagates cleanly
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 2);
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with TFSF plane wave");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	float maxVal = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		if (std::abs(vCpu) > maxVal) maxVal = std::abs(vCpu);
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	TEST_ASSERT(maxVal > 0.0f, "Incident plane wave produced zero field in CPU simulation");
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with TFSF exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
+bool Test_Vulkan_LumpedRLC_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 21, ny = 21, nz = 21;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+
+	CSPropLumpedElement* rlc = new CSPropLumpedElement(csx->GetParameterSet());
+	rlc->SetDirection(2); // z
+	rlc->SetLEtype(CSPropLumpedElement::PARALLEL);
+	rlc->SetResistance(50.0);
+	rlc->SetInductance(1e-9);
+	rlc->SetCapacity(1e-12);
+	rlc->SetCaps(false);
+
+	CSPrimBox* box = new CSPrimBox(csx->GetParameterSet(), rlc);
+	box->SetCoord(0, -0.5);
+	box->SetCoord(1,  0.5);
+	box->SetCoord(2, -0.5);
+	box->SetCoord(3,  0.5);
+	box->SetCoord(4, -0.5);
+	box->SetCoord(5,  2.5);
+	csx->AddProperty(rlc);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 2);
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with Lumped RLC");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	int cx = nx / 2, cy = ny / 2, cz = nz / 2;
+	cpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+	gpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	float maxVal = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		if (std::abs(vCpu) > maxVal) maxVal = std::abs(vCpu);
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	std::cout << "LumpedRLC maxDiff: " << maxDiff << ", maxVal: " << maxVal << std::endl;
+	TEST_ASSERT(maxVal > 0.0f, "Simulation produced zero field");
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with Lumped RLC exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
+bool Test_Vulkan_AbsorbingBC_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 21, ny = 21, nz = 21;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+
+	CSPropAbsorbingBC* abc = new CSPropAbsorbingBC(csx->GetParameterSet());
+	abc->SetAbsorbingBoundaryType(CSPropAbsorbingBC::MUR_1ST_SA);
+	abc->SetNormalSignPositive(true);
+	abc->SetPhaseVelocity(3e8);
+
+	CSPrimBox* box = new CSPrimBox(csx->GetParameterSet(), abc);
+	box->SetCoord(0, -20.0);
+	box->SetCoord(1,  20.0);
+	box->SetCoord(2, -20.0);
+	box->SetCoord(3,  20.0);
+	box->SetCoord(4,  10.0);
+	box->SetCoord(5,  10.0);
+	csx->AddProperty(abc);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 2);
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with Absorbing BC sheet");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	int cx = nx / 2, cy = ny / 2, cz = nz / 2;
+	cpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+	gpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	float maxVal = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		if (std::abs(vCpu) > maxVal) maxVal = std::abs(vCpu);
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	std::cout << "AbsorbingBC maxDiff: " << maxDiff << ", maxVal: " << maxVal << std::endl;
+	TEST_ASSERT(maxVal > 0.0f, "Simulation produced zero field");
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with Absorbing BC sheet exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
+bool Test_Vulkan_LorentzMaterial_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 21, ny = 21, nz = 21;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+
+	CSPropLorentzMaterial* lorentz = new CSPropLorentzMaterial(csx->GetParameterSet());
+	lorentz->SetEpsilon(2.0);
+	lorentz->SetDispersionOrder(1);
+	lorentz->SetEpsPlasmaFreq(0, 2e9);
+	lorentz->SetEpsLorPoleFreq(0, 1e9);
+	lorentz->SetEpsRelaxTime(0, 1e-9);
+
+	CSPrimBox* box = new CSPrimBox(csx->GetParameterSet(), lorentz);
+	box->SetCoord(0, -5.0);
+	box->SetCoord(1,  5.0);
+	box->SetCoord(2, -5.0);
+	box->SetCoord(3,  5.0);
+	box->SetCoord(4, -5.0);
+	box->SetCoord(5,  5.0);
+	csx->AddProperty(lorentz);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 0); // PEC
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with Lorentz material");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	int cx = nx / 2, cy = ny / 2, cz = nz / 2;
+	cpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+	gpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	float maxVal = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		if (std::abs(vCpu) > maxVal) maxVal = std::abs(vCpu);
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	std::cout << "LorentzMaterial maxDiff: " << maxDiff << ", maxVal: " << maxVal << std::endl;
+	TEST_ASSERT(maxVal > 0.0f, "Simulation produced zero field");
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with Lorentz material exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
+bool Test_Vulkan_DebyeMaterial_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 21, ny = 21, nz = 21;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+
+	CSPropDebyeMaterial* debye = new CSPropDebyeMaterial(csx->GetParameterSet());
+	debye->SetEpsilon(2.0);
+	debye->SetDispersionOrder(1);
+	debye->SetEpsDelta(0, 3.0);
+	debye->SetEpsRelaxTime(0, 1e-9);
+
+	CSPrimBox* box = new CSPrimBox(csx->GetParameterSet(), debye);
+	box->SetCoord(0, -5.0);
+	box->SetCoord(1,  5.0);
+	box->SetCoord(2, -5.0);
+	box->SetCoord(3,  5.0);
+	box->SetCoord(4, -5.0);
+	box->SetCoord(5,  5.0);
+	csx->AddProperty(debye);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 0); // PEC
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with Debye material");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	int cx = nx / 2, cy = ny / 2, cz = nz / 2;
+	cpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+	gpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	float maxVal = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		if (std::abs(vCpu) > maxVal) maxVal = std::abs(vCpu);
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	std::cout << "DebyeMaterial maxDiff: " << maxDiff << ", maxVal: " << maxVal << std::endl;
+	TEST_ASSERT(maxVal > 0.0f, "Simulation produced zero field");
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with Debye material exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
+bool Test_Vulkan_ConductingSheet_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nx = 21, ny = 21, nz = 21;
+	ContinuousStructure* csx = CreateCustomGrid(nx, ny, nz);
+
+	CSPropConductingSheet* sheet = new CSPropConductingSheet(csx->GetParameterSet());
+	sheet->SetConductivity(1e5);
+	sheet->SetThickness(50e-6);
+
+	CSPrimBox* box = new CSPrimBox(csx->GetParameterSet(), sheet);
+	box->SetCoord(0, -10.0);
+	box->SetCoord(1,  10.0);
+	box->SetCoord(2, -10.0);
+	box->SetCoord(3,  10.0);
+	box->SetCoord(4,   0.0);
+	box->SetCoord(5,   0.0);
+	csx->AddProperty(sheet);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 0); // PEC
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with Conducting sheet");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	int cx = nx / 2, cy = ny / 2, cz = nz / 2;
+	cpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+	gpuEng->SetVolt(2, cx, cy, cz, 1.0f);
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * nx * ny * nz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	float maxVal = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (int x = 0; x < nx; ++x)
+	for (int y = 0; y < ny; ++y)
+	for (int z = 0; z < nz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		if (std::abs(vCpu) > maxVal) maxVal = std::abs(vCpu);
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	std::cout << "ConductingSheet maxDiff: " << maxDiff << ", maxVal: " << maxVal << std::endl;
+	TEST_ASSERT(maxVal > 0.0f, "Simulation produced zero field");
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with Conducting sheet exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
+static ContinuousStructure* CreateCylindricalGrid(int nr, int nalpha, int nz)
+{
+	ContinuousStructure* csx = new ContinuousStructure();
+	CSRectGrid* grid = csx->GetGrid();
+	grid->SetDeltaUnit(1e-3);
+
+	for (int i = 0; i < nr; ++i) grid->AddDiscLine(0, i * (20.0 / (nr - 1)));
+	for (int i = 0; i < nalpha; ++i) grid->AddDiscLine(1, -M_PI + i * (2.0 * M_PI / (nalpha - 1)));
+	for (int i = 0; i < nz; ++i) grid->AddDiscLine(2, i * (20.0 / (nz - 1)));
+	return csx;
+}
+
+bool Test_Vulkan_Cylinder_Equivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	int nr = 15, nalpha = 15, nz = 15;
+	ContinuousStructure* csx = CreateCylindricalGrid(nr, nalpha, nz);
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan"});
+	fdtd.SetCylinderCoords(true);
+	fdtd.SetNumberOfTimeSteps(25);
+	fdtd.SetGaussExcite(1e9, 500e6);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+
+	for (int n = 0; n < 6; ++n)
+		fdtd.Set_BC_Type(n, 0); // PEC
+
+	int ec = fdtd.SetupFDTD();
+	TEST_ASSERT(ec == 0, "SetupFDTD failed with Cylindrical coordinates");
+
+	Engine* cpuEng = fdtd.GetEng();
+	EngineBackend* gpuEng = fdtd.GetBackend();
+	TEST_ASSERT(cpuEng != nullptr, "CPU engine is null");
+	TEST_ASSERT(gpuEng != nullptr, "GPU backend is null");
+	TEST_ASSERT(dynamic_cast<EngineVulkan*>(gpuEng) != nullptr, "Vulkan initialization fell back to CPU");
+
+	unsigned int actualNr = fdtd.GetOp()->GetNumberOfLines(0, true);
+	unsigned int actualNa = fdtd.GetOp()->GetNumberOfLines(1, true);
+	unsigned int actualNz = fdtd.GetOp()->GetNumberOfLines(2, true);
+
+	int cr = actualNr / 2, ca = actualNa / 2, cz = actualNz / 2;
+	cpuEng->SetVolt(2, cr, ca, cz, 1.0f);
+	gpuEng->SetVolt(2, cr, ca, cz, 1.0f);
+	cpuEng->SetVolt(2, 0, 0, cz, 1.0f);
+	gpuEng->SetVolt(2, 0, 0, cz, 1.0f);
+
+	for (int step = 1; step <= 25; ++step)
+	{
+		cpuEng->IterateTS(1);
+		gpuEng->IterateTS(1);
+	}
+
+	std::vector<float> cpuVolt(3 * actualNr * actualNa * actualNz);
+	size_t cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (unsigned int x = 0; x < actualNr; ++x)
+	for (unsigned int y = 0; y < actualNa; ++y)
+	for (unsigned int z = 0; z < actualNz; ++z)
+		cpuVolt[cpuIdx++] = cpuEng->GetVolt(n, x, y, z);
+
+	gpuEng->SyncFieldsToHost();
+
+	float maxDiff = 0.0f;
+	float maxVal = 0.0f;
+	cpuIdx = 0;
+	for (int n = 0; n < 3; ++n)
+	for (unsigned int x = 0; x < actualNr; ++x)
+	for (unsigned int y = 0; y < actualNa; ++y)
+	for (unsigned int z = 0; z < actualNz; ++z)
+	{
+		float vCpu = cpuVolt[cpuIdx++];
+		float vGpu = gpuEng->GetVolt(n, x, y, z);
+		TEST_ASSERT(std::isfinite(vGpu), "GPU field contains a non-finite value");
+		if (std::abs(vCpu) > maxVal) maxVal = std::abs(vCpu);
+		float d = std::abs(vCpu - vGpu);
+		if (d > maxDiff) maxDiff = d;
+	}
+
+	std::cout << "Cylinder maxDiff: " << maxDiff << ", maxVal: " << maxVal << std::endl;
+	TEST_ASSERT(maxVal > 0.0f, "Simulation produced zero field");
+	TEST_ASSERT(maxDiff < 1e-4f, ("GPU vs CPU field difference with Cylindrical coordinates exceeded tolerance: " + std::to_string(maxDiff)).c_str());
+	return true;
+#endif
+}
+
 int main(int argc, char* argv[])
 {
 	std::cout << "========================================" << std::endl;
@@ -576,10 +1453,18 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_ProcessingTimestepPeekDoesNotConsume);
 	RUN_TEST(Test_CapabilityScanner_StandardModel);
 	RUN_TEST(Test_CapabilityScanner_EngineExtensionFallback);
+	RUN_TEST(Test_CapabilityScanner_UnknownDispersiveFallback);
 	RUN_TEST(Test_CapabilityScanner_UPML_Supported);
-	RUN_TEST(Test_CapabilityScanner_LorentzMaterialFallback);
-	RUN_TEST(Test_CapabilityScanner_DebyeMaterialFallback);
-	RUN_TEST(Test_CapabilityScanner_ConductingSheetFallback);
+	RUN_TEST(Test_CapabilityScanner_MurABC_Supported);
+	RUN_TEST(Test_CapabilityScanner_SteadyState_Supported);
+	RUN_TEST(Test_CapabilityScanner_TFSF_Supported);
+	RUN_TEST(Test_CapabilityScanner_LumpedRLC_Supported);
+	RUN_TEST(Test_CapabilityScanner_AbsorbingBC_Supported);
+	RUN_TEST(Test_CapabilityScanner_LorentzMaterial_Supported);
+	RUN_TEST(Test_CapabilityScanner_DebyeMaterial_Supported);
+	RUN_TEST(Test_CapabilityScanner_ConductingSheet_Supported);
+	RUN_TEST(Test_CapabilityScanner_Cylinder_Supported);
+	RUN_TEST(Test_CapabilityScanner_CylinderMultiGrid_Fallback);
 	RUN_TEST(Test_EngineVulkan_Lifecycle);
 	RUN_TEST(Test_OpenEMS_CLIArgument_EngineVulkan);
 
@@ -603,10 +1488,22 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_ResetLifecycleMultiRun);
 	RUN_TEST(Test_Vulkan_NumericalEquivalence_Asymmetric);
 	RUN_TEST(Test_Vulkan_UPML_Equivalence);
+	RUN_TEST(Test_Vulkan_MurABC_Equivalence);
+	RUN_TEST(Test_Vulkan_SteadyState_Execution);
+	RUN_TEST(Test_Vulkan_TFSF_Equivalence);
+	RUN_TEST(Test_Vulkan_LumpedRLC_Equivalence);
+	RUN_TEST(Test_Vulkan_AbsorbingBC_Equivalence);
+	RUN_TEST(Test_Vulkan_LorentzMaterial_Equivalence);
+	RUN_TEST(Test_Vulkan_DebyeMaterial_Equivalence);
+	RUN_TEST(Test_Vulkan_ConductingSheet_Equivalence);
+	RUN_TEST(Test_Vulkan_Cylinder_Equivalence);
 
 	std::cout << "========================================" << std::endl;
 	std::cout << "Tests completed: " << tests_passed << " passed, " << tests_failed << " failed." << std::endl;
 	std::cout << "========================================" << std::endl;
+
+	std::remove("et");
+	std::remove("ht");
 
 	return (tests_failed == 0) ? 0 : 1;
 }
