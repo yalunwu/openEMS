@@ -18,6 +18,7 @@
 #include "extensions/operator_ext_lumpedRLC.h"
 #include "extensions/operator_ext_absorbing_bc.h"
 #include "extensions/operator_ext_lorentzmaterial.h"
+#include "extensions/operator_ext_debyematerial.h"
 #include "extensions/operator_ext_conductingsheet.h"
 #include "extensions/operator_ext_cylinder.h"
 #include "operator_cylindermultigrid.h"
@@ -48,6 +49,8 @@ bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStruct
 		if (dynamic_cast<Operator_Ext_Absorbing_BC*>(extension))
 			continue;
 		if (dynamic_cast<Operator_Ext_LorentzMaterial*>(extension))
+			continue;
+		if (dynamic_cast<Operator_Ext_DebyeMaterial*>(extension))
 			continue;
 		if (dynamic_cast<Operator_Ext_ConductingSheet*>(extension))
 			continue;

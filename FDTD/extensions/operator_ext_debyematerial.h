@@ -56,9 +56,10 @@
   S = sum_k d_k, the single stored coefficient is 1/(1+S). See
   Engine_Ext_DebyeMaterial for the resulting update.
   */
-class Operator_Ext_DebyeMaterial : public Operator_Ext_Dispersive
+class OPENEMS_EXPORT Operator_Ext_DebyeMaterial : public Operator_Ext_Dispersive
 {
 	friend class Engine_Ext_DebyeMaterial;
+	friend class EngineVulkan;
 public:
 	Operator_Ext_DebyeMaterial(Operator* op);
 	virtual ~Operator_Ext_DebyeMaterial();

@@ -702,6 +702,55 @@ void main() {
 }
 )";
 
+static const char* kShaderDebye = R"(#version 450
+layout(local_size_x = 256) in;
+
+struct DebyePoint {
+    uint pos_idx;
+    uint pole_offset;
+    uint pole_count;
+    float solve_coeff;
+};
+
+layout(std430, binding = 0) readonly buffer ParamsBuffer { DebyePoint points[]; };
+layout(std430, binding = 1) buffer VoltBuffer { float voltData[]; };
+layout(std430, binding = 2) readonly buffer PoleBuffer { vec2 poles[]; };
+// First count entries hold each cell's pre-update sum / joint correction.
+// The remaining entries hold the independent capacitor states of its poles.
+layout(std430, binding = 3) buffer StateBuffer { float states[]; };
+layout(push_constant) uniform DebyePushConstants {
+    uint count;
+    uint mode; // 0 = pre, 1 = post, 2 = apply
+} pc;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.count) return;
+    DebyePoint pt = points[id];
+    float volt = voltData[pt.pos_idx];
+    if (pc.mode == 0u) {
+        float pre = 0.0;
+        for (uint o = 0u; o < pt.pole_count; ++o) {
+            uint p = pt.pole_offset + o;
+            float old = states[pc.count + p];
+            float w = poles[p].x * old + poles[p].y * volt;
+            pre += w - old;
+            states[pc.count + p] = w;
+        }
+        states[id] = pre;
+    } else if (pc.mode == 1u) {
+        float solved = (volt - states[id]) * pt.solve_coeff;
+        states[id] = volt - solved;
+        for (uint o = 0u; o < pt.pole_count; ++o) {
+            uint p = pt.pole_offset + o;
+            states[pc.count + p] += poles[p].y * solved;
+        }
+    } else {
+        voltData[pt.pos_idx] -= states[id];
+    }
+}
+)";
+
 static const char* kShaderCylinder = R"(#version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 

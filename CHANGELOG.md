@@ -130,6 +130,9 @@ number moved up and patch releases now have somewhere to go.
 
 ### Fixed
 
+- Keep Vulkan Debye material execution compatible with the coupled pole
+  capacitor update, including multi-pole materials and cylindrical multigrid.
+
 - **`DebyeMaterial` diverged** once `sum(eps_delta)` approached `epsilon`, and did
   so silently -- the NaN energy satisfied the end criteria, so the run reported a
   normal finish. Its branch carries no inductance, so integrating it like the

@@ -224,6 +224,20 @@ private:
 	VkPipelineLayout m_pipelineLayoutDisp = VK_NULL_HANDLE;
 	VkPipeline m_pipelineDisp = VK_NULL_HANDLE;
 
+	struct GpuDebyePoint {
+		uint32_t pos_idx;
+		uint32_t pole_offset;
+		uint32_t pole_count;
+		float solve_coeff;
+	};
+	struct GpuDebyePole {
+		float relax_coeff;
+		float drive_coeff;
+	};
+	VkDescriptorSetLayout m_descLayoutDebye = VK_NULL_HANDLE;
+	VkPipelineLayout m_pipelineLayoutDebye = VK_NULL_HANDLE;
+	VkPipeline m_pipelineDebye = VK_NULL_HANDLE;
+
 	// Cylindrical Coordinates Extension
 	VkDescriptorSetLayout m_descLayoutCyl = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutCyl = VK_NULL_HANDLE;
@@ -250,6 +264,8 @@ private:
 	bool AllocateRlcBuffers();
 	bool AllocateAbsorbingBCBuffers();
 	bool AllocateDispersiveBuffers();
+	bool AllocateDebyeBuffers();
+	void RecordDebyePhase(VkCommandBuffer cmd, uint32_t mode);
 	bool AllocateCylinderBuffers();
 	bool AllocateMultigridBuffers();
 	bool CreatePipelines();
@@ -359,6 +375,11 @@ private:
 		VulkanBuffer m_bufDispCurrState;
 		VkDescriptorSet m_descSetDispVolt = VK_NULL_HANDLE;
 		VkDescriptorSet m_descSetDispCurr = VK_NULL_HANDLE;
+		uint32_t m_debyeCount = 0;
+		VulkanBuffer m_bufDebyeParams;
+		VulkanBuffer m_bufDebyePoles;
+		VulkanBuffer m_bufDebyeState;
+		VkDescriptorSet m_descSetDebye = VK_NULL_HANDLE;
 		bool m_hasCylinder = false;
 		bool m_cylClosedAlpha = false;
 		bool m_cylR0Included = false;

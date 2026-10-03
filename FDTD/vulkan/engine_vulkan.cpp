@@ -20,6 +20,7 @@
 #include "FDTD/extensions/operator_ext_lumpedRLC.h"
 #include "FDTD/extensions/operator_ext_absorbing_bc.h"
 #include "FDTD/extensions/operator_ext_lorentzmaterial.h"
+#include "FDTD/extensions/operator_ext_debyematerial.h"
 #include "FDTD/extensions/operator_ext_conductingsheet.h"
 #include "FDTD/extensions/operator_ext_cylinder.h"
 #include "Common/processvoltage.h"
@@ -216,6 +217,8 @@ bool EngineVulkan::InitializeLevel()
 		return false;
 	}
 
+	if (!AllocateDebyeBuffers()) return false;
+
 	if (!AllocateCylinderBuffers())
 	{
 		std::cerr << "[openEMS Vulkan] Failed to allocate Cylindrical Coordinates buffers." << std::endl;
@@ -229,6 +232,7 @@ bool EngineVulkan::InitializeLevel()
 	    !validDispatch(m_level->m_totalMurPoints, 256u) ||
 	    !validDispatch(m_level->m_abcVoltCount, 256u) ||
 	    !validDispatch(m_level->m_abcCurrCount, 256u) ||
+	    !validDispatch(m_level->m_debyeCount, 256u) ||
 	    !validDispatch(m_level->m_rlcCount, 64u) ||
 	    !validDispatch(m_level->m_voltExcPoints.size(), 64u) ||
 	    !validDispatch(m_level->m_currExcPoints.size(), 64u) ||
@@ -711,6 +715,9 @@ bool EngineVulkan::CreatePipelines()
 		m_descLayoutDisp = owner.m_descLayoutDisp;
 		m_pipelineLayoutDisp = owner.m_pipelineLayoutDisp;
 		m_pipelineDisp = owner.m_pipelineDisp;
+		m_descLayoutDebye = owner.m_descLayoutDebye;
+		m_pipelineLayoutDebye = owner.m_pipelineLayoutDebye;
+		m_pipelineDebye = owner.m_pipelineDebye;
 		m_descLayoutCyl = owner.m_descLayoutCyl;
 		m_pipelineLayoutCyl = owner.m_pipelineLayoutCyl;
 		m_pipelineCyl = owner.m_pipelineCyl;
@@ -725,6 +732,7 @@ bool EngineVulkan::CreatePipelines()
 	bool hasRlc = false;
 	bool hasAbc = false;
 	bool hasDispersive = false;
+	bool hasDebye = false;
 	bool hasCylinder = false;
 	bool hasMultigrid = m_level->m_multigridOp != nullptr;
 	for (const Operator* levelOp = m_level->m_op; levelOp;)
@@ -744,6 +752,8 @@ bool EngineVulkan::CreatePipelines()
 				hasAbc = true;
 			if (dynamic_cast<Operator_Ext_LorentzMaterial*>(levelOp->GetExtension(i)))
 				hasDispersive = true;
+			if (dynamic_cast<Operator_Ext_DebyeMaterial*>(levelOp->GetExtension(i)))
+				hasDebye = true;
 			if (dynamic_cast<Operator_Ext_Cylinder*>(levelOp->GetExtension(i)))
 				hasCylinder = true;
 		}
@@ -796,6 +806,9 @@ bool EngineVulkan::CreatePipelines()
 	{
 		spvDisp = CompileGLSLToSpirv(VulkanShaders::kShaderDispersive, shaderc_glsl_compute_shader, "dispersive.comp");
 	}
+	std::vector<uint32_t> spvDebye;
+	if (hasDebye)
+		spvDebye = CompileGLSLToSpirv(VulkanShaders::kShaderDebye, shaderc_glsl_compute_shader, "debye.comp");
 	std::vector<uint32_t> spvCylinder;
 	if (hasCylinder)
 	{
@@ -808,7 +821,7 @@ bool EngineVulkan::CreatePipelines()
 	    (hasTfsf && spvTfsf.empty()) ||
 	    (hasRlc && spvRlc.empty()) ||
 	    (hasAbc && (spvAbcVolt.empty() || spvAbcCurr.empty())) ||
-	    (hasDispersive && spvDisp.empty()) ||
+	    (hasDispersive && spvDisp.empty()) || (hasDebye && spvDebye.empty()) ||
 	    (hasCylinder && spvCylinder.empty()))
 	{
 		return false;
@@ -856,6 +869,7 @@ bool EngineVulkan::CreatePipelines()
 	{
 		modDisp = CreateShaderModule(spvDisp);
 	}
+	VkShaderModule modDebye = hasDebye ? CreateShaderModule(spvDebye) : VK_NULL_HANDLE;
 	VkShaderModule modCyl = VK_NULL_HANDLE;
 	if (hasCylinder)
 	{
@@ -864,7 +878,7 @@ bool EngineVulkan::CreatePipelines()
 	// Release shader modules on success and on every partial pipeline failure.
 	struct ModuleCleanup {
 		VkDevice device;
-		VkShaderModule modules[15];
+		VkShaderModule modules[16];
 		~ModuleCleanup()
 		{
 			for (VkShaderModule module : modules)
@@ -872,13 +886,13 @@ bool EngineVulkan::CreatePipelines()
 		}
 	} moduleCleanup = {m_device, {modVolt, modCurr, modExc, modPrb, modUpmlPre, modUpmlPost,
 	                            modMurPre, modMurPost, modMurApply, modTfsf, modRlc,
-	                            modAbcVolt, modAbcCurr, modDisp, modCyl}};
+	                            modAbcVolt, modAbcCurr, modDisp, modCyl, modDebye}};
 	if (!modVolt || !modCurr || !modExc || !modPrb ||
 	    (hasUpml && (!modUpmlPre || !modUpmlPost)) ||
 	    (hasMur && (!modMurPre || !modMurPost || !modMurApply)) ||
 	    (hasTfsf && !modTfsf) || (hasRlc && !modRlc) ||
 	    (hasAbc && (!modAbcVolt || !modAbcCurr)) ||
-	    (hasDispersive && !modDisp) || (hasCylinder && !modCyl))
+	    (hasDispersive && !modDisp) || (hasDebye && !modDebye) || (hasCylinder && !modCyl))
 		return false;
 
 	// Create descriptor pool
@@ -890,6 +904,7 @@ bool EngineVulkan::CreatePipelines()
 	if (hasRlc)  { maxStorage += 32u; maxSets += 16u; }
 	if (hasAbc)  { maxStorage += 32u; maxSets += 16u; }
 	if (hasDispersive) { maxStorage += 32u; maxSets += 16u; }
+	if (hasDebye)      { maxStorage += 4u; maxSets += 1u; }
 	if (hasCylinder)   { maxStorage += 32u; maxSets += 16u; }
 	if (hasMultigrid)  { maxStorage += 16u; maxSets += 4u; }
 	std::vector<VkDescriptorPoolSize> poolSizes = {
@@ -1179,6 +1194,28 @@ bool EngineVulkan::CreatePipelines()
 			return false;
 		}
 		if (modDisp != VK_NULL_HANDLE && !createComputePipe(modDisp, m_pipelineLayoutDisp, m_pipelineDisp)) return false;
+	}
+
+	if (hasDebye)
+	{
+		VkDescriptorSetLayoutBinding bindings[4] = {};
+		for (uint32_t i = 0; i < 4; ++i)
+		{
+			bindings[i].binding = i;
+			bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+			bindings[i].descriptorCount = 1;
+			bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+		}
+		layoutInfo.bindingCount = 4;
+		layoutInfo.pBindings = bindings;
+		if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descLayoutDebye) != VK_SUCCESS)
+			return false;
+		VkPushConstantRange range = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(uint32_t) };
+		pipeLayoutInfo.pSetLayouts = &m_descLayoutDebye;
+		pipeLayoutInfo.pPushConstantRanges = &range;
+		if (vkCreatePipelineLayout(m_device, &pipeLayoutInfo, nullptr, &m_pipelineLayoutDebye) != VK_SUCCESS)
+			return false;
+		if (!createComputePipe(modDebye, m_pipelineLayoutDebye, m_pipelineDebye)) return false;
 	}
 
 	// 10. Cylindrical Coordinates Pipeline Layout & Compute Pipeline
@@ -2670,6 +2707,65 @@ bool EngineVulkan::AllocateDispersiveBuffers()
 #endif
 }
 
+bool EngineVulkan::AllocateDebyeBuffers()
+{
+#ifdef ENABLE_VULKAN
+	std::vector<GpuDebyePoint> points;
+	std::vector<GpuDebyePole> poles;
+	for (size_t i = 0; m_level->m_op && i < m_level->m_op->GetNumberOfExtentions(); ++i)
+	{
+		auto* debye = dynamic_cast<Operator_Ext_DebyeMaterial*>(m_level->m_op->GetExtension(i));
+		if (!debye || debye->m_PoleCount <= 0 || debye->m_LM_Count.empty()) continue;
+		for (unsigned int j = 0; j < debye->m_LM_Count[0]; ++j)
+			for (unsigned int n = 0; n < 3; ++n)
+			{
+				if (points.size() >= UINT32_MAX || poles.size() > UINT32_MAX - static_cast<uint32_t>(debye->m_PoleCount))
+					return false;
+				GpuDebyePoint point = {
+					static_cast<uint32_t>(GetLinearIndex(n, debye->m_LM_pos[0][0][j],
+					    debye->m_LM_pos[0][1][j], debye->m_LM_pos[0][2][j])),
+					static_cast<uint32_t>(poles.size()), static_cast<uint32_t>(debye->m_PoleCount),
+					debye->v_solve_ADE[n][j]
+				};
+				points.push_back(point);
+				for (int o = 0; o < debye->m_PoleCount; ++o)
+					poles.push_back({debye->v_relax_ADE[o][n][j], debye->v_drive_ADE[o][n][j]});
+			}
+	}
+	if (points.empty()) return true;
+	if (points.size() + poles.size() > UINT32_MAX) return false;
+	m_level->m_debyeCount = static_cast<uint32_t>(points.size());
+	std::vector<float> state(points.size() + poles.size(), 0.0f);
+	if (!UploadStorageBuffer(points.data(), points.size() * sizeof(GpuDebyePoint), m_level->m_bufDebyeParams) ||
+	    !UploadStorageBuffer(poles.data(), poles.size() * sizeof(GpuDebyePole), m_level->m_bufDebyePoles) ||
+	    !UploadStorageBuffer(state.data(), state.size() * sizeof(float), m_level->m_bufDebyeState))
+		return false;
+	VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+	alloc.descriptorPool = m_descPool;
+	alloc.descriptorSetCount = 1;
+	alloc.pSetLayouts = &m_descLayoutDebye;
+	if (vkAllocateDescriptorSets(m_device, &alloc, &m_level->m_descSetDebye) != VK_SUCCESS) return false;
+	VulkanBuffer* buffers[4] = {&m_level->m_bufDebyeParams, &m_level->m_bufVolt,
+	                           &m_level->m_bufDebyePoles, &m_level->m_bufDebyeState};
+	VkDescriptorBufferInfo infos[4] = {};
+	VkWriteDescriptorSet writes[4] = {};
+	for (uint32_t i = 0; i < 4; ++i)
+	{
+		infos[i] = {buffers[i]->buffer, 0, buffers[i]->size};
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = m_level->m_descSetDebye;
+		writes[i].dstBinding = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].pBufferInfo = &infos[i];
+	}
+	vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
+	std::cout << "[openEMS Vulkan] Initialized on-device Debye: " << points.size()
+	          << " voltage components, " << poles.size() << " pole states." << std::endl;
+#endif
+	return true;
+}
+
 bool EngineVulkan::AllocateCylinderBuffers()
 {
 #ifdef ENABLE_VULKAN
@@ -3091,6 +3187,24 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 }
 
 #ifdef ENABLE_VULKAN
+void EngineVulkan::RecordDebyePhase(VkCommandBuffer cmd, uint32_t mode)
+{
+	if (!m_level->m_debyeCount) return;
+	VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineDebye);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutDebye,
+	                       0, 1, &m_level->m_descSetDebye, 0, nullptr);
+	uint32_t pc[2] = {m_level->m_debyeCount, mode};
+	vkCmdPushConstants(cmd, m_pipelineLayoutDebye, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+	vkCmdDispatch(cmd, (m_level->m_debyeCount + 255u) / 256u, 1, 1);
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
 void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 {
 	uint32_t wgZ = (m_level->m_grid.dimZ + 31u) / 32u;
@@ -3169,6 +3283,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
 	}
+
+	RecordDebyePhase(cmd, 0u);
 
 	// Dispersive Media Pre-Voltage Pass
 	if (m_level->m_dispVoltCount > 0 && m_pipelineDisp && m_level->m_descSetDispVolt)
@@ -3266,6 +3382,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		}
 	}
 
+	RecordDebyePhase(cmd, 1u);
+
 	// Equal-priority extensions are reversed by Engine's stable-sort plus
 	// reverse sequence. Local sheets therefore precede Mur boundaries.
 	if (m_level->m_abcVoltCount > 0 && m_pipelineAbcVolt && m_level->m_descSetAbcVolt)
@@ -3341,6 +3459,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		vkCmdPushConstants(cmd, m_pipelineLayoutRlc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rlcPC), &rlcPC);
 		vkCmdDispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
 	}
+
+	RecordDebyePhase(cmd, 2u);
 
 	// Dispersive Media Apply-Voltage Pass
 	if (m_level->m_dispVoltCount > 0 && m_pipelineDisp && m_level->m_descSetDispVolt)
@@ -4078,6 +4198,10 @@ void EngineVulkan::Reset()
 		DestroyBuffer(m_level->m_bufAbcCurrParams);
 		DestroyBuffer(m_level->m_bufAbcCurrStore);
 
+		DestroyBuffer(m_level->m_bufDebyeParams);
+		DestroyBuffer(m_level->m_bufDebyePoles);
+		DestroyBuffer(m_level->m_bufDebyeState);
+
 		DestroyBuffer(m_level->m_bufDispVoltParams);
 		DestroyBuffer(m_level->m_bufDispVoltState);
 		DestroyBuffer(m_level->m_bufDispCurrParams);
@@ -4100,6 +4224,7 @@ void EngineVulkan::Reset()
 		if (m_pipelineAbcVolt != VK_NULL_HANDLE)  { if (m_ownsVulkanDevice) vkDestroyPipeline(m_device, m_pipelineAbcVolt, nullptr);  m_pipelineAbcVolt  = VK_NULL_HANDLE; }
 		if (m_pipelineAbcCurr != VK_NULL_HANDLE)  { if (m_ownsVulkanDevice) vkDestroyPipeline(m_device, m_pipelineAbcCurr, nullptr);  m_pipelineAbcCurr  = VK_NULL_HANDLE; }
 		if (m_pipelineDisp != VK_NULL_HANDLE)     { if (m_ownsVulkanDevice) vkDestroyPipeline(m_device, m_pipelineDisp, nullptr);     m_pipelineDisp     = VK_NULL_HANDLE; }
+		if (m_pipelineDebye != VK_NULL_HANDLE)     { if (m_ownsVulkanDevice) vkDestroyPipeline(m_device, m_pipelineDebye, nullptr);     m_pipelineDebye     = VK_NULL_HANDLE; }
 		if (m_pipelineCyl != VK_NULL_HANDLE)      { if (m_ownsVulkanDevice) vkDestroyPipeline(m_device, m_pipelineCyl, nullptr);      m_pipelineCyl      = VK_NULL_HANDLE; }
 		if (m_level->m_pipelineMultigrid != VK_NULL_HANDLE){ vkDestroyPipeline(m_device, m_level->m_pipelineMultigrid, nullptr);m_level->m_pipelineMultigrid= VK_NULL_HANDLE; }
 
@@ -4112,6 +4237,7 @@ void EngineVulkan::Reset()
 		if (m_pipelineLayoutRlc    != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyPipelineLayout(m_device, m_pipelineLayoutRlc, nullptr);    m_pipelineLayoutRlc    = VK_NULL_HANDLE; }
 		if (m_pipelineLayoutAbc    != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyPipelineLayout(m_device, m_pipelineLayoutAbc, nullptr);    m_pipelineLayoutAbc    = VK_NULL_HANDLE; }
 		if (m_pipelineLayoutDisp   != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyPipelineLayout(m_device, m_pipelineLayoutDisp, nullptr);   m_pipelineLayoutDisp   = VK_NULL_HANDLE; }
+		if (m_pipelineLayoutDebye   != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyPipelineLayout(m_device, m_pipelineLayoutDebye, nullptr);   m_pipelineLayoutDebye   = VK_NULL_HANDLE; }
 		if (m_pipelineLayoutCyl    != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyPipelineLayout(m_device, m_pipelineLayoutCyl, nullptr);    m_pipelineLayoutCyl    = VK_NULL_HANDLE; }
 		if (m_level->m_pipelineLayoutMultigrid != VK_NULL_HANDLE) { vkDestroyPipelineLayout(m_device, m_level->m_pipelineLayoutMultigrid, nullptr); m_level->m_pipelineLayoutMultigrid = VK_NULL_HANDLE; }
 
@@ -4124,6 +4250,7 @@ void EngineVulkan::Reset()
 		if (m_descLayoutRlc    != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyDescriptorSetLayout(m_device, m_descLayoutRlc, nullptr);    m_descLayoutRlc    = VK_NULL_HANDLE; }
 		if (m_descLayoutAbc    != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyDescriptorSetLayout(m_device, m_descLayoutAbc, nullptr);    m_descLayoutAbc    = VK_NULL_HANDLE; }
 		if (m_descLayoutDisp   != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyDescriptorSetLayout(m_device, m_descLayoutDisp, nullptr);   m_descLayoutDisp   = VK_NULL_HANDLE; }
+		if (m_descLayoutDebye   != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyDescriptorSetLayout(m_device, m_descLayoutDebye, nullptr);   m_descLayoutDebye   = VK_NULL_HANDLE; }
 		if (m_descLayoutCyl    != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyDescriptorSetLayout(m_device, m_descLayoutCyl, nullptr);    m_descLayoutCyl    = VK_NULL_HANDLE; }
 		if (m_level->m_descLayoutMultigrid != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_level->m_descLayoutMultigrid, nullptr); m_level->m_descLayoutMultigrid = VK_NULL_HANDLE; }
 
@@ -4160,6 +4287,8 @@ void EngineVulkan::Reset()
 	m_level->m_abcCurrCount = 0;
 	m_level->m_abcVoltSheets.clear();
 	m_level->m_abcCurrSheets.clear();
+	m_level->m_debyeCount = 0;
+	m_level->m_descSetDebye = VK_NULL_HANDLE;
 	m_level->m_dispVoltCount = 0;
 	m_level->m_dispCurrCount = 0;
 	m_level->m_dispVoltPasses.clear();

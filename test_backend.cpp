@@ -28,6 +28,7 @@
 #include "FDTD/extensions/operator_ext_absorbing_bc.h"
 #include "FDTD/extensions/operator_ext_dispersive.h"
 #include "FDTD/extensions/operator_ext_lorentzmaterial.h"
+#include "FDTD/extensions/operator_ext_debyematerial.h"
 #include "FDTD/extensions/operator_ext_conductingsheet.h"
 #include "FDTD/extensions/operator_ext_cylinder.h"
 #include "FDTD/operator_cylinder.h"
@@ -319,7 +320,7 @@ bool Test_CapabilityScanner_DebyeMaterial_Supported()
 
 	std::string reason;
 	std::unique_ptr<Operator> op(Operator::New());
-	op->AddExtension(new Operator_Ext_LorentzMaterial(op.get()));
+	op->AddExtension(new Operator_Ext_DebyeMaterial(op.get()));
 
 	bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
 	TEST_ASSERT(supported, "Debye material should be supported on Vulkan backend");
@@ -1227,7 +1228,7 @@ bool Test_Vulkan_LorentzMaterial_Equivalence()
 #endif
 }
 
-bool Test_Vulkan_DebyeMaterial_Equivalence()
+bool RunDebyeMaterialEquivalence(unsigned int order)
 {
 #ifndef ENABLE_VULKAN
 	return true;
@@ -1237,9 +1238,12 @@ bool Test_Vulkan_DebyeMaterial_Equivalence()
 
 	CSPropDebyeMaterial* debye = new CSPropDebyeMaterial(csx->GetParameterSet());
 	debye->SetEpsilon(2.0);
-	debye->SetDispersionOrder(1);
-	debye->SetEpsDelta(0, 3.0);
-	debye->SetEpsRelaxTime(0, 1e-9);
+	debye->SetDispersionOrder(order);
+	for (unsigned int o = 0; o < order; ++o)
+	{
+		debye->SetEpsDelta(o, o == 0 ? 3.0 : 20.0);
+		debye->SetEpsRelaxTime(o, 1e-9 / (o + 1));
+	}
 
 	CSPrimBox* box = new CSPrimBox(csx->GetParameterSet(), debye);
 	box->SetCoord(0, -5.0);
@@ -1311,6 +1315,9 @@ bool Test_Vulkan_DebyeMaterial_Equivalence()
 	return true;
 #endif
 }
+
+bool Test_Vulkan_DebyeMaterial_Equivalence() { return RunDebyeMaterialEquivalence(1); }
+bool Test_Vulkan_DebyeMaterial_MultiPole() { return RunDebyeMaterialEquivalence(3); }
 
 bool Test_Vulkan_ConductingSheet_Equivalence()
 {
@@ -1764,6 +1771,7 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_AbsorbingBC_Equivalence);
 	RUN_TEST(Test_Vulkan_LorentzMaterial_Equivalence);
 	RUN_TEST(Test_Vulkan_DebyeMaterial_Equivalence);
+	RUN_TEST(Test_Vulkan_DebyeMaterial_MultiPole);
 	RUN_TEST(Test_Vulkan_ConductingSheet_Equivalence);
 	RUN_TEST(Test_Vulkan_Cylinder_Equivalence);
 	RUN_TEST(Test_Vulkan_CheckedDimensionsAndIndices);
