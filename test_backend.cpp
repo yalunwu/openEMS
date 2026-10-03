@@ -10,11 +10,14 @@
 #include <string>
 #include <memory>
 #include <cstdio>
+#include <chrono>
+#include <limits>
 
 #include "openems.h"
 #include "FDTD/engine_backend.h"
 #include "FDTD/engine_cpu.h"
 #include "FDTD/engine.h"
+#include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/operator.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/extensions/operator_ext_upml.h"
@@ -148,6 +151,7 @@ public:
 	virtual bool BuildExtension() { return true; }
 	virtual Engine_Extension* CreateEngineExtention() { return nullptr; }
 	virtual std::string GetExtensionName() const { return "Unsupported Custom Extension"; }
+	bool IsCylinderCoordsSave(bool, bool) const override { return true; }
 };
 
 class DummyDispersiveExtension : public Operator_Ext_Dispersive
@@ -360,7 +364,7 @@ bool Test_CapabilityScanner_Cylinder_Supported()
 	return true;
 }
 
-bool Test_CapabilityScanner_CylinderMultiGrid_Fallback()
+bool Test_CapabilityScanner_CylinderMultiGrid_Supported()
 {
 	ContinuousStructure* csx = CreateSimpleGrid();
 	std::string reason;
@@ -369,8 +373,13 @@ bool Test_CapabilityScanner_CylinderMultiGrid_Fallback()
 	if (op)
 	{
 		bool supported = EngineBackend::CheckModelSupport(op.get(), csx, reason);
-		TEST_ASSERT(!supported, "Cylindrical multi-grid should trigger graceful fallback");
-		TEST_ASSERT(reason.find("Cylindrical multi-grid") != std::string::npos, "Reason should mention cylindrical multi-grid");
+		TEST_ASSERT(supported, "Nested cylindrical multi-grid should be supported");
+		TEST_ASSERT(reason.empty(), "Supported hierarchy should have no rejection reason");
+		auto* child = dynamic_cast<Operator_CylinderMultiGrid*>(op->GetInnerOperator());
+		TEST_ASSERT(child != nullptr, "Expected a nested child operator");
+		child->GetInnerOperator()->AddExtension(new DummyUnsupportedExtension(child->GetInnerOperator()));
+		TEST_ASSERT(!EngineBackend::CheckModelSupport(op.get(), csx, reason), "Unknown innermost extension must reject the hierarchy");
+		TEST_ASSERT(reason.find("Unsupported Custom Extension") != std::string::npos, "Reason should identify the unknown child extension");
 	}
 
 	delete csx;
@@ -409,6 +418,38 @@ bool Test_EngineVulkan_Lifecycle()
 	TEST_ASSERT(engine.GetNumberOfTimesteps() == 0, "Timestep counter should be reset to 0");
 	return true;
 #endif
+}
+
+bool Test_Vulkan_CheckedDimensionsAndIndices()
+{
+	class DimensionOperator : public Operator {
+	public:
+		explicit DimensionOperator(unsigned int size) : dimension(size) { Init(); }
+		unsigned int GetNumberOfLines(int, bool = false) const override { return dimension; }
+		std::string GetDirName(int) const override { return ""; }
+		void SetMaterialStoreFlags(int, bool) override {}
+		void SetBackgroundMaterial(double, double, double, double, double) override {}
+	private:
+		unsigned int dimension;
+	};
+	for (unsigned int size : {0u, 65536u, std::numeric_limits<unsigned int>::max()})
+	{
+		DimensionOperator op(size);
+		EngineVulkan gpu(&op);
+		TEST_ASSERT(!gpu.Initialize(), "Invalid dimensions must fail before GPU allocation");
+		gpu.Reset();
+	}
+	EngineVulkan gpu(nullptr);
+	gpu.SetVolt(0, 0, 0, 0, 2.0f);
+	gpu.SetCurr(1, 0, 0, 0, 3.0f);
+	gpu.SetVolt(0, 0, 0, 16, 9.0f); // must not alias the next y line
+	gpu.SetCurr(0, 0, 16, 0, 9.0f); // must not alias the next x line
+	TEST_ASSERT(gpu.GetVolt(0, 0, 0, 0) == 2.0f, "Pre-initialization voltage was lost");
+	TEST_ASSERT(gpu.GetCurr(1, 0, 0, 0) == 3.0f, "Pre-initialization current was lost");
+	TEST_ASSERT(gpu.GetVolt(0, 0, 1, 0) == 0.0f, "Invalid voltage index aliased another cell");
+	TEST_ASSERT(gpu.GetCurr(0, 1, 0, 0) == 0.0f, "Invalid current index aliased another cell");
+	TEST_ASSERT(gpu.GetVolt(3, 0, 0, 0) == 0.0f, "Invalid field component must return zero");
+	return true;
 }
 
 bool Test_OpenEMS_CLIArgument_EngineVulkan()
@@ -1366,6 +1407,46 @@ static ContinuousStructure* CreateCylindricalGrid(int nr, int nalpha, int nz)
 	return csx;
 }
 
+// Keep malformed-table testing internal, without exposing interpolation tables
+// through the simulation API or deriving from non-exported CPU implementation.
+struct VulkanMultigridTestAccess {
+	static unsigned int& Index(Operator_CylinderMultiGrid& op) { return op.m_interpol_pos_v_2p[0][0]; }
+	static float& Coefficient(Operator_CylinderMultiGrid& op) { return op.f4_interpol_i_2pp[1][0].f[0]; }
+};
+
+bool Test_Vulkan_Multigrid_InvalidMetadata()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1"});
+	fdtd.SetCylinderCoords(true);
+	fdtd.SetupCylinderMultiGrid(std::vector<double>{10.0});
+	fdtd.SetNumberOfTimeSteps(16);
+	fdtd.SetGaussExcite(20e9, 10e9);
+	fdtd.SetCSX(CreateCylindricalGrid(25, 17, 9));
+	fdtd.SetEnableDumps(false);
+	for (int n = 0; n < 6; ++n) fdtd.Set_BC_Type(n, 0);
+	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Metadata fixture setup failed");
+	auto* op = dynamic_cast<Operator_CylinderMultiGrid*>(fdtd.GetOp());
+	TEST_ASSERT(op != nullptr, "Metadata fixture multigrid operator missing");
+	EngineVulkan gpu(op);
+	const unsigned int originalIndex = VulkanMultigridTestAccess::Index(*op);
+	VulkanMultigridTestAccess::Index(*op) = op->GetInnerOperator()->GetNumberOfLines(1, true);
+	TEST_ASSERT(!gpu.Initialize(), "Out-of-range interpolation index must reject Vulkan");
+	gpu.Reset(); // failed initialization and explicit reset must both be safe
+	VulkanMultigridTestAccess::Index(*op) = originalIndex;
+	const float originalCoefficient = VulkanMultigridTestAccess::Coefficient(*op);
+	VulkanMultigridTestAccess::Coefficient(*op) = std::numeric_limits<float>::quiet_NaN();
+	TEST_ASSERT(!gpu.Initialize(), "Non-finite interpolation coefficient must reject Vulkan");
+	VulkanMultigridTestAccess::Coefficient(*op) = originalCoefficient;
+	TEST_ASSERT(gpu.Initialize(), "Valid hierarchy must initialize after failed attempts");
+	TEST_ASSERT(gpu.IterateTS(3) && gpu.SyncFieldsToHost(), "Reinitialized hierarchy did not execute");
+	return true;
+#endif
+}
+
 bool Test_Vulkan_Cylinder_Equivalence()
 {
 #ifndef ENABLE_VULKAN
@@ -1443,8 +1524,196 @@ bool Test_Vulkan_Cylinder_Equivalence()
 #endif
 }
 
+static bool RunMultigridEquivalence(const std::vector<double>& splits, bool openAlpha = false,
+                                    bool boundaries = false, bool debye = false, bool reinitialize = false,
+                                    bool benchmark = false)
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	const int angularLines = benchmark || splits.size() >= 4 ? 129 : 33;
+	ContinuousStructure* csx = CreateCylindricalGrid(41, angularLines, 17);
+	CSRectGrid* grid = csx->GetGrid();
+	grid->ClearLines(0);
+	for (int r = 0; r <= 40; ++r) grid->AddDiscLine(0, r);
+	if (openAlpha)
+	{
+		grid->ClearLines(1);
+		// Nonuniform angular spacing exercises the CPU interpolation coefficients.
+		for (int a = 0; a < angularLines; ++a)
+		{
+			double t = static_cast<double>(a) / (angularLines - 1);
+			grid->AddDiscLine(1, -1.2 + 2.4 * t * t);
+		}
+	}
+	auto* excitation = new CSPropExcitation(csx->GetParameterSet());
+	excitation->SetNumber(0);
+	excitation->SetExcitType(0);
+	excitation->SetExcitation(1.0, 2);
+	auto* excBox = new CSPrimBox(csx->GetParameterSet(), excitation);
+	const double bounds[6] = {0.0, 36.0, -0.4, 0.4, 8.0, 12.0};
+	for (int i = 0; i < 6; ++i) excBox->SetCoord(i, bounds[i]);
+	csx->AddProperty(excitation);
+	if (debye)
+	{
+		auto* material = new CSPropDebyeMaterial(csx->GetParameterSet());
+		material->SetEpsilon(2.0);
+		material->SetDispersionOrder(1);
+		material->SetEpsDelta(0, 3.0);
+		material->SetEpsRelaxTime(0, 1e-10);
+		auto* box = new CSPrimBox(csx->GetParameterSet(), material);
+		const double region[6] = {1.0, 36.0, -0.8, 0.8, 5.0, 15.0};
+		for (int i = 0; i < 6; ++i) box->SetCoord(i, region[i]);
+		csx->AddProperty(material);
+	}
+
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1"});
+	fdtd.SetCylinderCoords(true);
+	fdtd.SetupCylinderMultiGrid(splits);
+	fdtd.SetNumberOfTimeSteps(80);
+	fdtd.SetGaussExcite(20e9, 10e9);
+	fdtd.SetCSX(csx);
+	fdtd.SetEnableDumps(false);
+	for (int i = 0; i < 6; ++i) fdtd.Set_BC_Type(i, 0);
+	if (boundaries)
+	{
+		fdtd.Set_BC_PML(1, 4); // outer radial UPML
+		fdtd.Set_BC_PML(4, 3); // child axial UPML
+		fdtd.Set_BC_Type(5, 2); // child axial Mur
+	}
+	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Cylindrical multigrid setup failed");
+	auto* gpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+	TEST_ASSERT(gpu != nullptr, "Multigrid Vulkan initialization fell back to CPU");
+	std::vector<Operator*> levels;
+	for (Operator* op = fdtd.GetOp(); op;)
+	{
+		levels.push_back(op);
+		auto* mg = dynamic_cast<Operator_CylinderMultiGrid*>(op);
+		op = mg ? mg->GetInnerOperator() : nullptr;
+	}
+	TEST_ASSERT(levels.size() == splits.size() + 1, "Missing multigrid level");
+	std::vector<std::unique_ptr<TestProcessing>> levelDumps;
+	for (size_t level = 0; level < levels.size(); ++level)
+	{
+		levelDumps.emplace_back(new TestProcessing(fdtd.NewEngineInterface(static_cast<int>(level))));
+		levelDumps.back()->AddStep(27);
+	}
+	if (reinitialize)
+	{
+		gpu->Reset();
+		TEST_ASSERT(gpu->Initialize(), "Multigrid reinitialization failed");
+	}
+
+	// Distinct batches check projection and continuation, including every child.
+	const unsigned int batches[3] = {1, 7, 19};
+	unsigned int completed = 0;
+	for (unsigned int batch : batches)
+	{
+		TEST_ASSERT(fdtd.GetEng()->IterateTS(batch), "CPU multigrid iteration failed");
+		std::vector<std::vector<float>> reference(levels.size());
+		for (size_t level = 0; level < levels.size(); ++level)
+		{
+			Operator* op = levels[level];
+			Engine* cpu = op->GetEngine();
+			TEST_ASSERT(cpu != nullptr, "Child CPU engine missing");
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int r = 0; r < op->GetNumberOfLines(0, true); ++r)
+			for (unsigned int a = 0; a < op->GetNumberOfLines(1, true); ++a)
+			for (unsigned int z = 0; z < op->GetNumberOfLines(2, true); ++z)
+			{
+				reference[level].push_back(cpu->GetVolt(n, r, a, z));
+				reference[level].push_back(cpu->GetCurr(n, r, a, z));
+			}
+		}
+		TEST_ASSERT(gpu->IterateTS(batch), "GPU multigrid iteration failed");
+		completed += batch;
+		for (Operator* op : levels)
+			TEST_ASSERT(op->GetEngine()->GetNumberOfTimesteps() == completed, "Child timestep was not propagated");
+		if (completed == 27)
+			for (const auto& dump : levelDumps)
+				TEST_ASSERT(dump->IsTimestep(), "MultiGridLevel processing did not reach its scheduled timestep");
+		TEST_ASSERT(gpu->SyncFieldsToHost(), "Multigrid field synchronization failed");
+		for (size_t level = 0; level < levels.size(); ++level)
+		{
+			Operator* op = levels[level];
+			Engine* cpu = op->GetEngine();
+			size_t index = 0;
+			float maxError = 0.0f, peak = 0.0f;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int r = 0; r < op->GetNumberOfLines(0, true); ++r)
+			for (unsigned int a = 0; a < op->GetNumberOfLines(1, true); ++a)
+			for (unsigned int z = 0; z < op->GetNumberOfLines(2, true); ++z)
+			{
+				const float values[2] = {cpu->GetVolt(n, r, a, z), cpu->GetCurr(n, r, a, z)};
+				for (float value : values)
+				{
+					TEST_ASSERT(std::isfinite(value), "Non-finite multigrid GPU field");
+					float expected = reference[level][index++];
+					peak = std::max(peak, std::abs(expected));
+					maxError = std::max(maxError, std::abs(expected - value));
+				}
+			}
+			std::cout << "Multigrid level " << level << " batch " << batch
+			          << " maxError=" << maxError << " peak=" << peak << std::endl;
+			TEST_ASSERT(completed == 1u || peak > 0.0f, "Multigrid level produced zero fields");
+			TEST_ASSERT(maxError < 1e-4f, "Multigrid absolute field error exceeded 1e-4");
+			TEST_ASSERT(maxError <= peak * 0.001f, "Multigrid relative field error exceeded 0.1%");
+		}
+	}
+	if (benchmark)
+	{
+		const unsigned int steps = 1024;
+		const auto start = std::chrono::steady_clock::now();
+		TEST_ASSERT(gpu->IterateTS(steps) && gpu->SyncFieldsToHost(), "Multigrid benchmark execution failed");
+		const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+		std::cout << "BENCHMARK levels=" << levels.size() << " steps=" << steps
+		          << " seconds=" << seconds << " timesteps/s=" << steps / seconds
+		          << " MCells/s=" << fdtd.GetOp()->GetNumberCells() * steps / seconds / 1e6 << std::endl;
+	}
+	if (reinitialize)
+	{
+		gpu->Reset();
+		TEST_ASSERT(gpu->Initialize() && gpu->SyncFieldsToHost(), "Used hierarchy did not reset and reinitialize");
+		for (Operator* op : levels)
+		{
+			Engine* cpu = op->GetEngine();
+			TEST_ASSERT(cpu->GetNumberOfTimesteps() == 0u, "Child timestep did not reset");
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int r = 0; r < op->GetNumberOfLines(0, true); ++r)
+			for (unsigned int a = 0; a < op->GetNumberOfLines(1, true); ++a)
+			for (unsigned int z = 0; z < op->GetNumberOfLines(2, true); ++z)
+				TEST_ASSERT(cpu->GetVolt(n, r, a, z) == 0.0f && cpu->GetCurr(n, r, a, z) == 0.0f,
+				            "Reinitialized child retained fields from the previous run");
+		}
+		TEST_ASSERT(gpu->IterateTS(8) && gpu->SyncFieldsToHost(), "Reinitialized hierarchy failed to advance");
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_Multigrid_ClosedAlpha() { return RunMultigridEquivalence({24.0}); }
+bool Test_Vulkan_Multigrid_Nested() { return RunMultigridEquivalence({12.0, 24.0}); }
+bool Test_Vulkan_Multigrid_OpenAlpha() { return RunMultigridEquivalence({12.0, 24.0}, true); }
+bool Test_Vulkan_Multigrid_Boundaries() { return RunMultigridEquivalence({12.0, 24.0}, false, true); }
+bool Test_Vulkan_Multigrid_Debye() { return RunMultigridEquivalence({12.0, 24.0}, false, false, true); }
+bool Test_Vulkan_Multigrid_Reset() { return RunMultigridEquivalence({12.0, 24.0}, false, false, false, true); }
+bool Test_Vulkan_Multigrid_FiveLevels() { return RunMultigridEquivalence({8.0, 16.0, 24.0, 32.0}); }
+
+bool Benchmark_Vulkan_Multigrid()
+{
+	return RunMultigridEquivalence({}, false, false, false, false, true) &&
+	       RunMultigridEquivalence({24.0}, false, false, false, false, true) &&
+	       RunMultigridEquivalence({8.0, 16.0, 24.0, 32.0}, false, false, false, false, true);
+}
+
 int main(int argc, char* argv[])
 {
+	if (argc > 1 && std::string(argv[1]) == "--multigrid-benchmark")
+	{
+		RUN_TEST(Benchmark_Vulkan_Multigrid);
+		return tests_failed ? 1 : 0;
+	}
 	std::cout << "========================================" << std::endl;
 	std::cout << " openEMS EngineBackend & Vulkan Test Suite" << std::endl;
 	std::cout << "========================================" << std::endl;
@@ -1464,7 +1733,7 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_CapabilityScanner_DebyeMaterial_Supported);
 	RUN_TEST(Test_CapabilityScanner_ConductingSheet_Supported);
 	RUN_TEST(Test_CapabilityScanner_Cylinder_Supported);
-	RUN_TEST(Test_CapabilityScanner_CylinderMultiGrid_Fallback);
+	RUN_TEST(Test_CapabilityScanner_CylinderMultiGrid_Supported);
 	RUN_TEST(Test_EngineVulkan_Lifecycle);
 	RUN_TEST(Test_OpenEMS_CLIArgument_EngineVulkan);
 
@@ -1497,6 +1766,15 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_DebyeMaterial_Equivalence);
 	RUN_TEST(Test_Vulkan_ConductingSheet_Equivalence);
 	RUN_TEST(Test_Vulkan_Cylinder_Equivalence);
+	RUN_TEST(Test_Vulkan_CheckedDimensionsAndIndices);
+	RUN_TEST(Test_Vulkan_Multigrid_InvalidMetadata);
+	RUN_TEST(Test_Vulkan_Multigrid_ClosedAlpha);
+	RUN_TEST(Test_Vulkan_Multigrid_Nested);
+	RUN_TEST(Test_Vulkan_Multigrid_OpenAlpha);
+	RUN_TEST(Test_Vulkan_Multigrid_Boundaries);
+	RUN_TEST(Test_Vulkan_Multigrid_Debye);
+	RUN_TEST(Test_Vulkan_Multigrid_Reset);
+	RUN_TEST(Test_Vulkan_Multigrid_FiveLevels);
 
 	std::cout << "========================================" << std::endl;
 	std::cout << "Tests completed: " << tests_passed << " passed, " << tests_failed << " failed." << std::endl;

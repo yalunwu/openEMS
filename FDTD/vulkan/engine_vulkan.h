@@ -12,6 +12,7 @@
 
 class Excitation;
 class Operator_Ext_Absorbing_BC;
+class Operator_CylinderMultiGrid;
 
 class OPENEMS_EXPORT EngineVulkan : public EngineBackend
 {
@@ -46,53 +47,49 @@ private:
 
 	inline size_t GetLinearIndex(unsigned int ny, unsigned int x, unsigned int y, unsigned int z) const
 	{
-		return static_cast<size_t>(ny) * m_grid.numCells +
-		       static_cast<size_t>(x) * (m_grid.dimY * m_grid.dimZ) +
-		       static_cast<size_t>(y) * m_grid.dimZ +
+		if (ny >= 3u || x >= m_level->m_grid.dimX || y >= m_level->m_grid.dimY || z >= m_level->m_grid.dimZ)
+			return static_cast<size_t>(-1);
+		return static_cast<size_t>(ny) * m_level->m_grid.numCells +
+		       static_cast<size_t>(x) * m_level->m_grid.dimY * m_level->m_grid.dimZ +
+		       static_cast<size_t>(y) * m_level->m_grid.dimZ +
 		       static_cast<size_t>(z);
 	}
 
 	struct GpuExcPoint {
 		uint32_t index;
-		float value;
-	};
-
-	struct ExcSourceData {
-		const Excitation* exc = nullptr;
-		std::vector<uint32_t> voltIndices;
-		std::vector<float> voltAmps;
-		std::vector<float> voltDelays;
-		uint32_t voltCount = 0;
-
-		std::vector<uint32_t> currIndices;
-		std::vector<float> currAmps;
-		std::vector<float> currDelays;
-		uint32_t currCount = 0;
+		float amplitude;
+		uint32_t delay;
+		uint32_t signalOffset;
+		uint32_t signalLength;
+		uint32_t period;
 	};
 
 	struct ProbePoint {
 		uint32_t linear_index;
 		uint32_t field_type; // 0 = volt, 1 = curr
 	};
-
-	const Operator* m_op = nullptr;
-	const ProcessingArray* m_pa = nullptr;
-	GridDimensions m_grid;
-	unsigned int m_numTS = 0;
-	bool m_hostFieldsValid = true;
-	bool m_hostFieldsDirty = true;
-
-	std::vector<float> m_hostVolt;
-	std::vector<float> m_hostCurr;
 	std::string m_deviceName = "Vulkan GPU";
-
-	std::vector<ExcSourceData> m_excSources;
-	std::vector<GpuExcPoint> m_voltExcPoints;
-	std::vector<GpuExcPoint> m_currExcPoints;
-	std::vector<ProbePoint> m_probePoints;
-
 #ifdef ENABLE_VULKAN
 	struct VulkanBuffer {
+		VulkanBuffer() = default;
+		VulkanBuffer(const VulkanBuffer&) = delete;
+		VulkanBuffer& operator=(const VulkanBuffer&) = delete;
+		~VulkanBuffer() { Release(); }
+		void Release()
+		{
+			if (device)
+			{
+				if (mapped) vkUnmapMemory(device, memory);
+				if (buffer) vkDestroyBuffer(device, buffer, nullptr);
+				if (memory) vkFreeMemory(device, memory, nullptr);
+			}
+			device = VK_NULL_HANDLE;
+			buffer = VK_NULL_HANDLE;
+			memory = VK_NULL_HANDLE;
+			mapped = nullptr;
+			size = 0;
+		}
+		VkDevice device = VK_NULL_HANDLE;
 		VkBuffer buffer = VK_NULL_HANDLE;
 		VkDeviceMemory memory = VK_NULL_HANDLE;
 		VkDeviceSize size = 0;
@@ -104,60 +101,26 @@ private:
 	VkDevice m_device = VK_NULL_HANDLE;
 	VkQueue m_computeQueue = VK_NULL_HANDLE;
 	uint32_t m_computeQueueFamily = 0;
-
-	VkCommandPool m_cmdPool = VK_NULL_HANDLE;
-	VkCommandBuffer m_cmdBuffer = VK_NULL_HANDLE;
-	VkFence m_fence = VK_NULL_HANDLE;
-
-	// Material and Field Buffers
-	VulkanBuffer m_bufVv;
-	VulkanBuffer m_bufVi;
-	VulkanBuffer m_bufIi;
-	VulkanBuffer m_bufIv;
-	VulkanBuffer m_bufVolt;
-	VulkanBuffer m_bufCurr;
-	VulkanBuffer m_bufFieldStaging;
-
-	// Excitation Buffers
-	VulkanBuffer m_bufVoltExcPoints;
-	VulkanBuffer m_bufCurrExcPoints;
-
-	// Probe Gather Buffers
-	VulkanBuffer m_bufProbePoints;
-	VulkanBuffer m_bufProbeValues; // Host visible
-
-	// UPML Buffers
-	uint32_t m_numUpmlCells = 0;
-	VulkanBuffer m_bufUpmlIndices;
-	VulkanBuffer m_bufUpmlVoltCoeffs;
-	VulkanBuffer m_bufUpmlCurrCoeffs;
-	VulkanBuffer m_bufUpmlVoltFlux;
-	VulkanBuffer m_bufUpmlCurrFlux;
-
-	// Descriptors and Pipelines
+	bool m_ownsVulkanDevice = true;
+	EngineVulkan* m_deviceOwner = nullptr;
+	// Shared descriptors and pipelines; level storage is owned by LevelState.
 	VkDescriptorPool m_descPool = VK_NULL_HANDLE;
 
 	VkDescriptorSetLayout m_descLayoutFields = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutFields = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetFields = VK_NULL_HANDLE;
 	VkPipeline m_pipelineVolt = VK_NULL_HANDLE;
 	VkPipeline m_pipelineCurr = VK_NULL_HANDLE;
 
 	VkDescriptorSetLayout m_descLayoutExc = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutExc = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetVoltExc = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetCurrExc = VK_NULL_HANDLE;
 	VkPipeline m_pipelineExc = VK_NULL_HANDLE;
 
 	VkDescriptorSetLayout m_descLayoutProbe = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutProbe = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetProbe = VK_NULL_HANDLE;
 	VkPipeline m_pipelineProbe = VK_NULL_HANDLE;
 
 	VkDescriptorSetLayout m_descLayoutUpml = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutUpml = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetUpmlVolt = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetUpmlCurr = VK_NULL_HANDLE;
 	VkPipeline m_pipelineUpmlPre = VK_NULL_HANDLE;
 	VkPipeline m_pipelineUpmlPost = VK_NULL_HANDLE;
 
@@ -174,15 +137,8 @@ private:
 		float coeff;
 		uint32_t start_TS;
 	};
-
-	uint32_t m_totalMurPoints = 0;
-	std::vector<MurFace> m_murFaces;
-	VulkanBuffer m_bufMurParams;
-	VulkanBuffer m_bufMurStore;
-
 	VkDescriptorSetLayout m_descLayoutMur = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutMur = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetMur = VK_NULL_HANDLE;
 	VkPipeline m_pipelineMurPre = VK_NULL_HANDLE;
 	VkPipeline m_pipelineMurPost = VK_NULL_HANDLE;
 	VkPipeline m_pipelineMurApply = VK_NULL_HANDLE;
@@ -199,24 +155,8 @@ private:
 		float w0;
 		float w1;
 	};
-
-	uint32_t m_tfsfSigLength = 0;
-	int32_t m_tfsfPeriod = 0;
-
-	std::vector<TfsfFace> m_tfsfVoltFaces;
-	std::vector<GpuTfsfPoint> m_tfsfVoltPoints;
-	std::vector<TfsfFace> m_tfsfCurrFaces;
-	std::vector<GpuTfsfPoint> m_tfsfCurrPoints;
-
-	VulkanBuffer m_bufTfsfVoltParams;
-	VulkanBuffer m_bufTfsfCurrParams;
-	VulkanBuffer m_bufTfsfCurrSignal;
-	VulkanBuffer m_bufTfsfVoltSignal;
-
 	VkDescriptorSetLayout m_descLayoutTfsf = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutTfsf = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetTfsfVolt = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetTfsfCurr = VK_NULL_HANDLE;
 	VkPipeline m_pipelineTfsf = VK_NULL_HANDLE;
 
 	// Lumped RLC Buffers & Pipeline
@@ -245,14 +185,8 @@ private:
 		float j2;
 		float pad;
 	};
-
-	uint32_t m_rlcCount = 0;
-	VulkanBuffer m_bufRlcParams;
-	VulkanBuffer m_bufRlcState;
-
 	VkDescriptorSetLayout m_descLayoutRlc = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutRlc = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetRlc = VK_NULL_HANDLE;
 	VkPipeline m_pipelineRlc = VK_NULL_HANDLE;
 
 	// Local Absorbing Boundary Sheets
@@ -269,20 +203,8 @@ private:
 		float k1;
 		float k2;
 	};
-
-	uint32_t m_abcVoltCount = 0;
-	uint32_t m_abcCurrCount = 0;
-	std::vector<TfsfFace> m_abcVoltSheets;
-	std::vector<TfsfFace> m_abcCurrSheets;
-	VulkanBuffer m_bufAbcVoltParams;
-	VulkanBuffer m_bufAbcVoltStore;
-	VulkanBuffer m_bufAbcCurrParams;
-	VulkanBuffer m_bufAbcCurrStore;
-
 	VkDescriptorSetLayout m_descLayoutAbc = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutAbc = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetAbcVolt = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetAbcCurr = VK_NULL_HANDLE;
 	VkPipeline m_pipelineAbcVolt = VK_NULL_HANDLE;
 	VkPipeline m_pipelineAbcCurr = VK_NULL_HANDLE;
 
@@ -298,34 +220,27 @@ private:
 		float ade_val;
 		float lor_val;
 	};
-
-	uint32_t m_dispVoltCount = 0;
-	uint32_t m_dispCurrCount = 0;
-	std::vector<TfsfFace> m_dispVoltPasses;
-	std::vector<TfsfFace> m_dispCurrPasses;
-	VulkanBuffer m_bufDispVoltParams;
-	VulkanBuffer m_bufDispVoltState;
-	VulkanBuffer m_bufDispCurrParams;
-	VulkanBuffer m_bufDispCurrState;
-
 	VkDescriptorSetLayout m_descLayoutDisp = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutDisp = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetDispVolt = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetDispCurr = VK_NULL_HANDLE;
 	VkPipeline m_pipelineDisp = VK_NULL_HANDLE;
 
 	// Cylindrical Coordinates Extension
-	bool m_hasCylinder = false;
-	bool m_cylClosedAlpha = false;
-	bool m_cylR0Included = false;
-	uint32_t m_cylLastALine = 0;
-	VulkanBuffer m_bufCylR0;
 	VkDescriptorSetLayout m_descLayoutCyl = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutCyl = VK_NULL_HANDLE;
-	VkDescriptorSet m_descSetCyl = VK_NULL_HANDLE;
 	VkPipeline m_pipelineCyl = VK_NULL_HANDLE;
 
+	// Cylindrical multigrid interface owned by the parent level.
+	struct alignas(16) GpuMultigridInterpolation {
+		uint32_t posP[4];
+		uint32_t posPP[4];
+		float coeffP[4];
+		float coeffPP[4];
+	};
+
 	bool InitVulkan();
+	bool InitSharedVulkan(EngineVulkan& parent);
+	bool InitCommandResources();
+	bool InitializeLevel();
 	bool AllocateBuffers();
 	bool AllocateExcitationBuffers();
 	bool AllocateProbeBuffers();
@@ -336,17 +251,129 @@ private:
 	bool AllocateAbsorbingBCBuffers();
 	bool AllocateDispersiveBuffers();
 	bool AllocateCylinderBuffers();
+	bool AllocateMultigridBuffers();
 	bool CreatePipelines();
+	bool AllocateFieldDescriptors();
 	bool SyncFieldsToDevice();
+	bool SyncHierarchyToDevice();
 
 	bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VulkanBuffer& outBuf);
+	bool UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf);
 	void DestroyBuffer(VulkanBuffer& buf);
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
 	VkShaderModule CreateShaderModule(const std::vector<uint32_t>& spirv);
 
-	bool PrepareVoltExcitation(unsigned int step);
-	bool PrepareCurrExcitation(unsigned int step);
+	void RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc);
+	void RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc);
+	void RecordVoltageHierarchy(VkCommandBuffer cmd);
+	void RecordCurrentHierarchy(VkCommandBuffer cmd);
+	void RecordProjectionHierarchy(VkCommandBuffer cmd);
+	void RecordMultigridTransfer(VkCommandBuffer cmd, uint32_t mode, uint32_t radialCount);
+	void MarkHierarchyHostInvalid();
+	void SetHierarchyTimestep(unsigned int ts);
+	bool SyncLevelFieldsToHost();
 #endif
+	// Independent fields, operators, extensions, descriptors, and mirrors per grid.
+	struct LevelState {
+		const Operator* m_op = nullptr;
+		const Operator_CylinderMultiGrid* m_multigridOp = nullptr;
+		const ProcessingArray* m_pa = nullptr;
+		GridDimensions m_grid;
+		uint32_t m_activeXStart = 0;
+		bool m_dimensionsValid = true;
+		unsigned int m_numTS = 0;
+		bool m_hostFieldsValid = true;
+		bool m_hostFieldsDirty = true;
+		std::vector<float> m_hostVolt;
+		std::vector<float> m_hostCurr;
+		std::vector<GpuExcPoint> m_voltExcPoints;
+		std::vector<GpuExcPoint> m_currExcPoints;
+		std::vector<ProbePoint> m_probePoints;
+		std::unique_ptr<EngineVulkan> m_innerGrid;
+#ifdef ENABLE_VULKAN
+		VkCommandPool m_cmdPool = VK_NULL_HANDLE;
+		VkCommandBuffer m_cmdBuffer = VK_NULL_HANDLE;
+		VkFence m_fence = VK_NULL_HANDLE;
+		VulkanBuffer m_bufVv;
+		VulkanBuffer m_bufVi;
+		VulkanBuffer m_bufIi;
+		VulkanBuffer m_bufIv;
+		VulkanBuffer m_bufVolt;
+		VulkanBuffer m_bufCurr;
+		VulkanBuffer m_bufFieldStaging;
+		VulkanBuffer m_bufVoltExcPoints;
+		VulkanBuffer m_bufCurrExcPoints;
+		VulkanBuffer m_bufExcSignals;
+		VulkanBuffer m_bufProbePoints;
+		VulkanBuffer m_bufProbeValues; // Host visible
+		uint32_t m_numUpmlCells = 0;
+		VulkanBuffer m_bufUpmlIndices;
+		VulkanBuffer m_bufUpmlVoltCoeffs;
+		VulkanBuffer m_bufUpmlCurrCoeffs;
+		VulkanBuffer m_bufUpmlVoltFlux;
+		VulkanBuffer m_bufUpmlCurrFlux;
+		VkDescriptorSet m_descSetFields = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetVoltExc = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetCurrExc = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetProbe = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetUpmlVolt = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetUpmlCurr = VK_NULL_HANDLE;
+		uint32_t m_totalMurPoints = 0;
+		std::vector<MurFace> m_murFaces;
+		VulkanBuffer m_bufMurParams;
+		VulkanBuffer m_bufMurStore;
+		VkDescriptorSet m_descSetMur = VK_NULL_HANDLE;
+		uint32_t m_tfsfSigLength = 0;
+		int32_t m_tfsfPeriod = 0;
+		std::vector<TfsfFace> m_tfsfVoltFaces;
+		std::vector<GpuTfsfPoint> m_tfsfVoltPoints;
+		std::vector<TfsfFace> m_tfsfCurrFaces;
+		std::vector<GpuTfsfPoint> m_tfsfCurrPoints;
+		VulkanBuffer m_bufTfsfVoltParams;
+		VulkanBuffer m_bufTfsfCurrParams;
+		VulkanBuffer m_bufTfsfCurrSignal;
+		VulkanBuffer m_bufTfsfVoltSignal;
+		VkDescriptorSet m_descSetTfsfVolt = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetTfsfCurr = VK_NULL_HANDLE;
+		uint32_t m_rlcCount = 0;
+		VulkanBuffer m_bufRlcParams;
+		VulkanBuffer m_bufRlcState;
+		VkDescriptorSet m_descSetRlc = VK_NULL_HANDLE;
+		uint32_t m_abcVoltCount = 0;
+		uint32_t m_abcCurrCount = 0;
+		std::vector<TfsfFace> m_abcVoltSheets;
+		std::vector<TfsfFace> m_abcCurrSheets;
+		VulkanBuffer m_bufAbcVoltParams;
+		VulkanBuffer m_bufAbcVoltStore;
+		VulkanBuffer m_bufAbcCurrParams;
+		VulkanBuffer m_bufAbcCurrStore;
+		VkDescriptorSet m_descSetAbcVolt = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetAbcCurr = VK_NULL_HANDLE;
+		uint32_t m_dispVoltCount = 0;
+		uint32_t m_dispCurrCount = 0;
+		std::vector<TfsfFace> m_dispVoltPasses;
+		std::vector<TfsfFace> m_dispCurrPasses;
+		VulkanBuffer m_bufDispVoltParams;
+		VulkanBuffer m_bufDispVoltState;
+		VulkanBuffer m_bufDispCurrParams;
+		VulkanBuffer m_bufDispCurrState;
+		VkDescriptorSet m_descSetDispVolt = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetDispCurr = VK_NULL_HANDLE;
+		bool m_hasCylinder = false;
+		bool m_cylClosedAlpha = false;
+		bool m_cylR0Included = false;
+		uint32_t m_cylLastALine = 0;
+		VulkanBuffer m_bufCylR0;
+		VkDescriptorSet m_descSetCyl = VK_NULL_HANDLE;
+		VulkanBuffer m_bufMultigridInterpolation;
+		VkDescriptorSetLayout m_descLayoutMultigrid = VK_NULL_HANDLE;
+		VkPipelineLayout m_pipelineLayoutMultigrid = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetMultigrid = VK_NULL_HANDLE;
+		VkPipeline m_pipelineMultigrid = VK_NULL_HANDLE;
+#endif
+	};
+	std::unique_ptr<LevelState> m_level;
+
 };
 
 #endif // ENGINE_VULKAN_H

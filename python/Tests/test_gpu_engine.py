@@ -9,10 +9,13 @@
 #
 
 import os
+import ctypes
 import shutil
 import sys
 import unittest
 import uuid
+import xml.etree.ElementTree as ET
+import h5py
 import numpy as np
 
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -37,6 +40,12 @@ if hasattr(os, 'add_dll_directory'):
                 _dll_directory_handles.append(os.add_dll_directory(path_entry))
             except OSError:
                 pass
+
+    # Resolve the local backend before the installed Python bindings can load
+    # another libopenEMS.dll through their dependency search directories.
+    _local_backend = os.path.join(repo_root, 'build', 'libopenEMS.dll')
+    if os.path.isfile(_local_backend):
+        _dll_directory_handles.append(ctypes.CDLL(_local_backend))
 
 from CSXCAD import ContinuousStructure
 from CSXCAD.CSProperties import CSPropLorentzMaterial, CSPropDebyeMaterial
@@ -708,35 +717,82 @@ class Test_GPUEngine(unittest.TestCase):
         rel_diff = diff / peak
         self.assertLess(rel_diff, 0.001, f"Cylinder coordinates relative probe error {rel_diff:.4%} exceeded 0.1%")
 
-    def test_cylindrical_multigrid_fallback(self):
-        """Verify that a model with Cylindrical MultiGrid falls back gracefully to CPU and completes."""
-        sim_dir = self._sim_path('test_cyl_mg')
-        os.makedirs(sim_dir, exist_ok=True)
-        csx = ContinuousStructure(CoordSystem=1)
-        grid = csx.GetGrid()
-        grid.SetDeltaUnit(1e-3)
-        grid.SetLines('x', np.linspace(0.0, 50.0, 16))
-        grid.SetLines('y', np.linspace(-np.pi, np.pi, 17))
-        grid.SetLines('z', np.linspace(0.0, 50.0, 16))
+    def _run_multigrid_pair(self, splits, name, field_dumps=False):
+        """Compare probes in the refined and active regions against the CPU."""
+        outputs = {}
+        for engine in ('multithreaded', 'vulkan'):
+            sdir = self._sim_path(name + '_' + engine)
+            csx = ContinuousStructure(CoordSystem=1)
+            grid = csx.GetGrid()
+            grid.SetDeltaUnit(1e-3)
+            grid.SetLines('x', np.linspace(0.0, 40.0, 41))
+            grid.SetLines('y', np.linspace(-np.pi, np.pi, 33))
+            grid.SetLines('z', np.linspace(0.0, 20.0, 17))
+            exc = csx.AddExcitation('excite', exc_type=0, exc_val=[0, 0, 1])
+            exc.AddBox([0, -0.4, 8], [36, 0.4, 12])
+            for radius in (4, 18, 32):
+                probe = csx.AddProbe('probe_' + str(radius), p_type=0)
+                probe.AddBox([radius, 0, 5], [radius, 0, 15])
+            if field_dumps:
+                for level in range(len(splits) + 1):
+                    dump = csx.AddDump('level_' + str(level), dump_type=0, dump_mode=0, file_type=1)
+                    dump.AddBox([0, -0.4, 5], [40, 0.4, 15])
+            fdtd = openEMS(NrTS=160, EndCriteria=0.0, CoordSystem=1, OverSampling=100)
+            fdtd.SetMultiGrid(splits)
+            fdtd.SetCSX(csx)
+            fdtd.SetGaussExcite(20e9, 10e9)
+            fdtd.SetBoundaryCond(['PEC'] * 6)
+            if field_dumps:
+                # MultiGridLevel is an existing XML setting, not exposed by the
+                # CSXCAD Python dump wrapper. Exercise the public XML path.
+                os.makedirs(sdir, exist_ok=True)
+                model_path = os.path.join(sdir, 'model.xml')
+                self.assertTrue(fdtd.Write2XML(model_path))
+                model = ET.parse(model_path)
+                for dump in model.findall('.//DumpBox'):
+                    dump.set('MultiGridLevel', dump.get('Name').split('_')[-1])
+                model.write(model_path, encoding='utf-8', xml_declaration=True)
+                self.assertTrue(fdtd.ReadFromXML(model_path))
+            ret = fdtd.Run(sdir, engine=engine, cleanup=False, numThreads=1)
+            self.assertIn(ret, [0, None])
+            outputs[engine] = {
+                radius: np.atleast_2d(np.loadtxt(os.path.join(sdir, 'probe_' + str(radius)), comments='%'))
+                for radius in (4, 18, 32)
+            }
+        for radius in (4, 18, 32):
+            cpu = outputs['multithreaded'][radius]
+            gpu = outputs['vulkan'][radius]
+            np.testing.assert_array_equal(cpu[:, 0], gpu[:, 0])
+            self.assertTrue(np.isfinite(gpu).all())
+            peak = np.max(np.abs(cpu[:, 1]))
+            self.assertGreater(peak, 0.0, 'Multigrid probe has zero fields')
+            error = np.max(np.abs(cpu[:, 1] - gpu[:, 1])) / peak
+            self.assertLess(error, 0.001, f'Multigrid probe at r={radius} relative error {error:.4%}')
+        if field_dumps:
+            for level in range(len(splits) + 1):
+                cpu_path = os.path.join(self._sim_path(name + '_multithreaded'), 'level_' + str(level) + '.h5')
+                gpu_path = os.path.join(self._sim_path(name + '_vulkan'), 'level_' + str(level) + '.h5')
+                with h5py.File(cpu_path, 'r') as cpu, h5py.File(gpu_path, 'r') as gpu:
+                    self.assertEqual(set(cpu['FieldData/TD']), set(gpu['FieldData/TD']))
+                    peak = 0.0
+                    error = 0.0
+                    for timestep in cpu['FieldData/TD']:
+                        expected = cpu['FieldData/TD/' + timestep][...]
+                        actual = gpu['FieldData/TD/' + timestep][...]
+                        self.assertTrue(np.isfinite(actual).all())
+                        np.testing.assert_array_equal(cpu['FieldData/TD/' + timestep].attrs['time'],
+                                                      gpu['FieldData/TD/' + timestep].attrs['time'])
+                        peak = max(peak, np.max(np.abs(expected)))
+                        error = max(error, np.max(np.abs(expected - actual)))
+                    self.assertGreater(peak, 0.0, 'Child-level dump contains zero fields')
+                    self.assertLess(error, 1e-4)
+                    self.assertLess(error / peak, 0.001)
 
-        exc = csx.AddExcitation('excite', exc_type=0, exc_val=[0, 0, 1])
-        exc.AddBox([15, -0.5, 15], [35, 0.5, 35])
+    def test_cylindrical_multigrid_equivalence(self):
+        self._run_multigrid_pair([24.0], 'cyl_mg')
 
-        p = csx.AddProbe('probe_cyl_mg', p_type=0)
-        p.AddBox([25, 0, 15], [25, 0, 35])
-
-        fdtd = openEMS(NrTS=15, EndCriteria=0.0, CoordSystem=1)
-        fdtd.SetMultiGrid([20.0])
-        fdtd.SetCSX(csx)
-        fdtd.SetGaussExcite(1e9, 0.5e9)
-        fdtd.SetBoundaryCond(['PEC'] * 6)
-
-        ret = fdtd.Run(sim_dir, engine='vulkan', cleanup=False)
-        self.assertIn(ret, [0, None])
-
-        f_probe = os.path.join(sim_dir, 'probe_cyl_mg')
-        self.assertTrue(os.path.exists(f_probe), "probe_cyl_mg file missing after multigrid fallback")
-
+    def test_nested_cylindrical_multigrid_equivalence(self):
+        self._run_multigrid_pair([12.0, 24.0], 'cyl_mg_nested', field_dumps=True)
 
 if __name__ == '__main__':
     unittest.main()

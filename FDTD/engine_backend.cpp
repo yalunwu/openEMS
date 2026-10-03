@@ -30,12 +30,6 @@ bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStruct
 		return false;
 	}
 
-	if (dynamic_cast<const Operator_CylinderMultiGrid*>(op))
-	{
-		unsupportedReason = "Cylindrical multi-grid is not supported on Vulkan.";
-		return false;
-	}
-
 	for (size_t i = 0; i < op->GetNumberOfExtentions(); ++i)
 	{
 		Operator_Extension* extension = op->GetExtension(i);
@@ -64,6 +58,15 @@ bool EngineBackend::CheckModelSupport(const Operator* op, const ContinuousStruct
 		return false;
 	}
 
-	// Every operator extension attached to the model has a Vulkan implementation.
+	if (const auto* multigrid = dynamic_cast<const Operator_CylinderMultiGrid*>(op))
+	{
+		if (!CheckModelSupport(multigrid->GetInnerOperator(), nullptr, unsupportedReason))
+		{
+			unsupportedReason += " (cylindrical multigrid child of level " +
+			                     std::to_string(multigrid->GetMultiGridLevel()) + ")";
+			return false;
+		}
+	}
+	unsupportedReason.clear();
 	return true;
 }

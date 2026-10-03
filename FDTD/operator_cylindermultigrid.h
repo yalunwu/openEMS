@@ -31,6 +31,8 @@
 class OPENEMS_EXPORT Operator_CylinderMultiGrid : public Operator_Cylinder
 {
 	friend class Engine_CylinderMultiGrid;
+	friend class EngineVulkan;
+	friend struct VulkanMultigridTestAccess;
 public:
 	static Operator_CylinderMultiGrid* New(
 		std::vector<double> Split_Radii,

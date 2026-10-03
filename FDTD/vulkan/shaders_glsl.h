@@ -11,6 +11,8 @@ layout(push_constant) uniform PushConstants {
     uint dimY;
     uint dimZ;
     uint numCells;
+	uint startX;
+	uint countX;
 } pc;
 
 layout(std430, binding = 0) readonly buffer BufVv { float vv[]; };
@@ -23,7 +25,11 @@ layout(std430, binding = 5) readonly buffer BufCurr { float curr[]; };
 void main() {
     uint z = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
-    uint x = gl_GlobalInvocationID.z;
+    uint localX = gl_GlobalInvocationID.z;
+    if (localX >= pc.countX) {
+        return;
+    }
+    uint x = pc.startX + localX;
 
     if (x >= pc.dimX || y >= pc.dimY || z >= pc.dimZ) {
         return;
@@ -62,6 +68,8 @@ layout(push_constant) uniform PushConstants {
     uint dimY;
     uint dimZ;
     uint numCells;
+	uint startX;
+	uint countX;
 } pc;
 
 layout(std430, binding = 0) readonly buffer BufVv { float vv[]; };
@@ -74,7 +82,11 @@ layout(std430, binding = 5) buffer BufCurr { float curr[]; };
 void main() {
     uint z = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
-    uint x = gl_GlobalInvocationID.z;
+    uint localX = gl_GlobalInvocationID.z;
+    if (localX >= pc.countX) {
+        return;
+    }
+    uint x = pc.startX + localX;
 
     if (x >= (pc.dimX - 1u) || y >= (pc.dimY - 1u) || z >= (pc.dimZ - 1u)) {
         return;
@@ -110,11 +122,16 @@ layout(local_size_x = 64) in;
 
 struct ExcPoint {
     uint index;
-    float value;
+    float amplitude;
+    uint delay;
+    uint signalOffset;
+    uint signalLength;
+    uint period;
 };
 
 layout(push_constant) uniform ExcParams {
     uint count;
+    uint timestep;
 } ep;
 
 layout(std430, binding = 0) readonly buffer PointsBuffer {
@@ -125,12 +142,21 @@ layout(std430, binding = 1) buffer FieldBuffer {
     float fieldData[];
 };
 
+layout(std430, binding = 2) readonly buffer SignalsBuffer {
+    float signals[];
+};
+
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= ep.count) {
         return;
     }
-    fieldData[points[idx].index] += points[idx].value;
+    ExcPoint point = points[idx];
+    uint position = (ep.timestep > point.delay) ? ep.timestep - point.delay : 0u;
+    if (point.period > 0u) position %= point.period;
+    if (position >= point.signalLength) position = 0u;
+    float value = point.amplitude * signals[point.signalOffset + position];
+    if (value != 0.0) fieldData[point.index] += value;
 }
 )";
 
@@ -754,6 +780,86 @@ void main() {
         currData[dst_offset] = currData[src_offset];
         // Copy Iz (dir=2)
         currData[2u * pc.numCells + dst_offset] = currData[2u * pc.numCells + src_offset];
+    }
+}
+)";
+
+static const char* kShaderCylinderMultigrid = R"(#version 450
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+struct Interpolation {
+    uvec4 posP;
+    uvec4 posPP;
+    vec4 coeffP;
+    vec4 coeffPP;
+};
+
+layout(std430, binding = 0) buffer ParentVolt { float parentVolt[]; };
+layout(std430, binding = 1) buffer ParentCurr { float parentCurr[]; };
+layout(std430, binding = 2) buffer ChildVolt { float childVolt[]; };
+layout(std430, binding = 3) buffer ChildCurr { float childCurr[]; };
+layout(std430, binding = 4) readonly buffer InterpolationBuffer { Interpolation interp[]; };
+
+layout(push_constant) uniform MultigridPushConstants {
+    uint parentDimX;
+    uint parentDimY;
+    uint parentDimZ;
+    uint parentCells;
+    uint childDimX;
+    uint childDimY;
+    uint childDimZ;
+    uint childCells;
+    uint radialStart;
+    uint radialCount;
+    uint mode;
+} pc;
+
+uint parentIndex(uint component, uint r, uint a, uint z) {
+    return component * pc.parentCells + r * (pc.parentDimY * pc.parentDimZ) + a * pc.parentDimZ + z;
+}
+
+uint childIndex(uint component, uint r, uint a, uint z) {
+    return component * pc.childCells + r * (pc.childDimY * pc.childDimZ) + a * pc.childDimZ + z;
+}
+
+void main() {
+    uint z = gl_GlobalInvocationID.x;
+    uint a = gl_GlobalInvocationID.y;
+    uint localR = gl_GlobalInvocationID.z;
+
+    if (pc.mode == 0u) {
+        uint childAlphaCount = pc.parentDimY / 2u;
+        if (z >= pc.childDimZ || a >= childAlphaCount || localR != 0u) return;
+        uint parentA = 2u * a;
+        uint r = pc.radialStart;
+        childVolt[childIndex(0u, r, a, z)] = 0.0;
+        childVolt[childIndex(2u, r, a, z)] = parentVolt[parentIndex(2u, r, parentA, z)];
+        childVolt[childIndex(1u, r, a, z)] = parentVolt[parentIndex(1u, r, parentA, z)]
+                                                 + parentVolt[parentIndex(1u, r, parentA + 1u, z)];
+        return;
+    }
+
+    if (z >= pc.parentDimZ || a >= pc.parentDimY || localR >= pc.radialCount) return;
+    uint r = pc.radialStart + localR;
+    Interpolation ip = interp[a];
+    bool current = (pc.mode == 1u || pc.mode == 3u);
+    uint slot0 = current ? 2u : 0u;
+    uint slot1 = current ? 3u : 1u;
+
+    for (uint component = 0u; component < 3u; ++component) {
+        uint slot = (component == 1u) ? slot1 : slot0;
+        uint p = ip.posP[slot];
+        uint pp = ip.posPP[slot];
+        float value;
+        if (current) {
+            value = ip.coeffP[slot] * childCurr[childIndex(component, r, p, z)]
+                  + ip.coeffPP[slot] * childCurr[childIndex(component, r, pp, z)];
+            parentCurr[parentIndex(component, r, a, z)] = value;
+        } else {
+            value = ip.coeffP[slot] * childVolt[childIndex(component, r, p, z)]
+                  + ip.coeffPP[slot] * childVolt[childIndex(component, r, pp, z)];
+            parentVolt[parentIndex(component, r, a, z)] = value;
+        }
     }
 }
 )";
