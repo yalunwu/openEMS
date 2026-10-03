@@ -63,8 +63,6 @@ public:
 
 	virtual Engine_Extension* CreateEngineExtention();
 
-	//virtual bool IsMPISave() const {return true;}
-
 	virtual std::string GetExtensionName() const
 	{
 		return std::string("Local absorbing boundary condition sheet");

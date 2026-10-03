@@ -30,6 +30,7 @@
 #include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/extensions/operator_ext_upml.h"
 #include "FDTD/extensions/operator_ext_lorentzmaterial.h"
+#include "FDTD/extensions/operator_ext_debyematerial.h"
 #include "FDTD/extensions/operator_ext_lumpedRLC.h"
 #include "FDTD/extensions/operator_ext_conductingsheet.h"
 #include "FDTD/extensions/operator_ext_steadystate.h"
@@ -82,6 +83,7 @@ openEMS::openEMS()
 	m_debugCSX = false;
 	m_debugBox = m_debugPEC = m_no_simulation = false;
 	m_DumpStats = false;
+	m_exactEndCriteria = false;
 
 	m_engine = EngineType_Multithreaded; //default engine type
 	m_engine_numThreads = 0;
@@ -267,11 +269,6 @@ void openEMS::collectCommandLineArguments()
 			"  multithreaded: \tengine using compressed "
 			"operator + sse vector extensions + multithreading\n"
 			"  vulkan/gpu: \tGPU-accelerated engine (Vulkan 1.2 compute) with CPU fallback\n"
-#ifdef MPI_SUPPORT
-			"operator + sse vector extensions + MPI + multithreading\n"
-#else
-			"operator + sse vector extensions + multithreading\n"
-#endif
 		)
 		(
 			"numThreads",
@@ -313,6 +310,22 @@ void openEMS::collectCommandLineArguments()
 			),
 			"dump simulation statistics to '" OPENEMS_RUN_STAT_FILE
 			"' and '" OPENEMS_STAT_FILE "'"
+		)
+		(
+			"exact-endcriteria",
+			po::bool_switch()->notifier(
+				[&](bool val)
+				{
+					if (!val) return;
+					cout << "openEMS - evaluating the end criteria on a fixed timestep schedule "
+						 << "for a machine-independent stopping point (reduces speed)" << endl;
+					m_exactEndCriteria = true;
+				}
+			),
+			"evaluate the energy end criteria every Nyquist timesteps instead of "
+			"every few seconds of wall-clock time, so the run stops at the same "
+			"timestep regardless of machine speed/load; costs performance, useful "
+			"mainly for engine/code verification"
 		);
 
 	// register our supported options to g_settings
@@ -339,8 +352,8 @@ void openEMS::SetLibraryArguments(std::vector<std::string> allOptions)
 
 void openEMS::SetNumberOfThreads(int val)
 {
-	if ((val<0) || (val>(int)boost::thread::hardware_concurrency()))
-		val = boost::thread::hardware_concurrency();
+	if ((val<0) || (val>(int)AvailableThreads()))
+		val = AvailableThreads();
 	m_engine_numThreads = val;
 }
 
@@ -582,9 +595,15 @@ bool openEMS::SetupProcessing()
 				}
 				if (pb->GetProbeType()==11)
 					proc->SetDualTime(true);
-				proc->SetProcessInterval(Nyquist/m_OverSampling);
+				// an explicit per-box override applies to both TD and FD; absent that, TD keeps the
+				// global OverSampling default while FD defaults to 1 (plain Nyquist rate) so existing
+				// simulations keep their FD/SAR results and performance unless they opt in
+				unsigned int probeOverSampling = (pb->GetOverSampling()>=0) ? (unsigned int)pb->GetOverSampling() : m_OverSampling;
+				unsigned int probeFDOverSampling = (pb->GetOverSampling()>=0) ? (unsigned int)pb->GetOverSampling() : 1;
+				proc->SetProcessInterval(Nyquist/probeOverSampling);
 				if (pb->GetStartTime()>0 || pb->GetStopTime()>0)
 					proc->SetProcessStartStopTime(pb->GetStartTime(), pb->GetStopTime());
+				proc->SetFDOverSampling(probeFDOverSampling);
 				proc->AddFrequency(pb->GetFDSamples());
 				proc->GetNormalDir(pb->GetNormalDir());
 				if (l_MultiBox==false)
@@ -595,6 +614,15 @@ bool openEMS::SetupProcessing()
 				if (g_settings.showProbeDiscretization())
 					proc->ShowSnappedCoords();
 				proc->SetWeight(pb->GetWeighting());
+				if (g_settings.GetVerboseLevel()>1)
+				{
+					cout << "openEMS::SetupProcessing: probe '" << proc->GetName() << "': time-domain sampling every "
+						 << proc->GetProcessInterval() << " timestep(s) (Nyquist/" << Nyquist/proc->GetProcessInterval() << ")";
+					if ((pb->CountFDSamples()>0) && (proc->GetFDInterval()!=proc->GetProcessInterval()))
+						cout << ", frequency-domain accumulation every " << proc->GetFDInterval() << " timestep(s) (Nyquist/"
+							 << Nyquist/proc->GetFDInterval() << ")";
+					cout << endl;
+				}
 				PA->AddProcessing(proc);
 				prim->SetPrimitiveUsed(true);
 			}
@@ -645,17 +673,23 @@ bool openEMS::SetupProcessing()
 					if (ProcField)
 					{
 						ProcField->SetEnable(Enable_Dumps);
-						ProcField->SetProcessInterval(Nyquist/m_OverSampling);
+						// an explicit per-box override applies to both TD and FD; absent that, TD keeps the
+						// global OverSampling default while FD defaults to 1 (plain Nyquist rate) so existing
+						// simulations keep their FD/SAR results and performance unless they opt in
+						unsigned int dumpOverSampling = (db->GetOverSampling()>=0) ? (unsigned int)db->GetOverSampling() : m_OverSampling;
+						unsigned int dumpFDOverSampling = (db->GetOverSampling()>=0) ? (unsigned int)db->GetOverSampling() : 1;
+						ProcField->SetProcessInterval(Nyquist/dumpOverSampling);
 						if (db->GetStopTime()>0 || db->GetStartTime()>0)
 							ProcField->SetProcessStartStopTime(db->GetStartTime(), db->GetStopTime());
-						if ((db->GetDumpType()==1) || (db->GetDumpType()==11))
+						if ((db->GetDumpType()==1) || (db->GetDumpType()==11) || (db->GetDumpType()==5) || (db->GetDumpType()==15))
 						{
 							ProcField->SetDualTime(true);
-							//make dualMesh the default mesh for h-field dumps, maybe overwritten by interpolation type (node-interpolation)
+							//make dualMesh the default mesh for h- and b-field dumps, maybe overwritten by interpolation type (node-interpolation)
 							ProcField->SetDualMesh(true);
 						}
 						if (db->GetDumpType()>=10)
 						{
+							ProcField->SetFDOverSampling(dumpFDOverSampling);
 							ProcField->AddFrequency(db->GetFDSamples());
 							ProcField->SetDumpType((ProcessFields::DumpType)(db->GetDumpType()-10));
 						}
@@ -699,6 +733,18 @@ bool openEMS::SetupProcessing()
 						ProcField->DefineStartStopCoord(start,stop);
 						if (g_settings.showProbeDiscretization())
 							ProcField->ShowSnappedCoords();
+						if (g_settings.GetVerboseLevel()>1)
+						{
+							cout << "openEMS::SetupProcessing: dump '" << ProcField->GetName() << "': ";
+							// FD/SAR dumps only ever accumulate on the FD interval; ProcessInterval is not used for those
+							if (db->CountFDSamples()>0)
+								cout << "frequency-domain accumulation every " << ProcField->GetFDInterval() << " timestep(s) (Nyquist/"
+									 << Nyquist/ProcField->GetFDInterval() << ")";
+							else
+								cout << "time-domain sampling every " << ProcField->GetProcessInterval() << " timestep(s) (Nyquist/"
+									 << Nyquist/ProcField->GetProcessInterval() << ")";
+							cout << endl;
+						}
 						PA->AddProcessing(ProcField);
 						prim->SetPrimitiveUsed(true);
 					}
@@ -1235,12 +1281,12 @@ int openEMS::SetupFDTD()
 			for (int p=0;p<3;++p)
 				pos[p] = FDTD_Op->GetNumberOfLines(p)/2;
 
-			pos[n] *= 1/4;
+			pos[n] = FDTD_Op->GetNumberOfLines(n)/4;
 			Op_Ext_SSD->Add_E_Probe(pos, 0);
 			Op_Ext_SSD->Add_E_Probe(pos, 1);
 			Op_Ext_SSD->Add_E_Probe(pos, 2);
 
-			pos[n] *= 3/4;
+			pos[n] = FDTD_Op->GetNumberOfLines(n)*3/4;
 			Op_Ext_SSD->Add_E_Probe(pos, 0);
 			Op_Ext_SSD->Add_E_Probe(pos, 1);
 			Op_Ext_SSD->Add_E_Probe(pos, 2);
@@ -1248,8 +1294,10 @@ int openEMS::SetupFDTD()
 		FDTD_Op->AddExtension(Op_Ext_SSD);
 	}
 
-	if ((m_CSX->GetQtyPropertyType(CSProperties::LORENTZMATERIAL)>0) || (m_CSX->GetQtyPropertyType(CSProperties::DEBYEMATERIAL)>0))
+	if (m_CSX->GetQtyPropertyType(CSProperties::LORENTZMATERIAL)>0)
 		FDTD_Op->AddExtension(new Operator_Ext_LorentzMaterial(FDTD_Op));
+	if (m_CSX->GetQtyPropertyType(CSProperties::DEBYEMATERIAL)>0)
+		FDTD_Op->AddExtension(new Operator_Ext_DebyeMaterial(FDTD_Op));
 	if (m_CSX->GetQtyPropertyType(CSProperties::CONDUCTINGSHEET)>0)
 		FDTD_Op->AddExtension(new Operator_Ext_ConductingSheet(FDTD_Op, m_Exc->GetMaxFreq()));
 	if (m_CSX->GetQtyPropertyType(CSProperties::LUMPED_ELEMENT)>0)
@@ -1448,6 +1496,16 @@ void openEMS::RunFDTD()
 	//add all timesteps to end-crit field processing with max excite amplitude
 	unsigned int maxExcite = FDTD_Op->GetExcitationSignal()->GetMaxExcitationTimestep();
 	ProcField->AddStep(maxExcite);
+	// --exact-endcriteria: also evaluate on a fixed timestep schedule, independent of the
+	// wall-clock progress report, at the cost of far more (expensive, full-domain) energy
+	// estimates -- default stays wall-clock throttled to keep normal runs fast
+	if ((Eng_Ext_SSD==NULL) && m_exactEndCriteria)
+	{
+		unsigned int endCritInterval = FDTD_Op->GetExcitationSignal()->GetNyquistNum();
+		cout << "Exact-endcriteria: evaluating the end criteria every "
+			 << endCritInterval << " timestep(s) (this excitation's Nyquist rate)" << endl;
+		ProcField->SetProcessInterval(endCritInterval);
+	}
 
 	double change=1;
 	int prevTS=0,currTS=0;
@@ -1538,11 +1596,15 @@ void openEMS::RunFDTD()
 		if (Eng_Ext_SSD != NULL && step > 1)
 			step = 1;
 
-		if ((Eng_Ext_SSD==NULL) && ProcField->CheckTimestep())
+		if (Eng_Ext_SSD)
+			change = Eng_Ext_SSD->GetLastDiff(); // cheap: extension keeps this up to date itself
+		else if (ProcField->CheckTimestep())
 		{
 			currE = ProcField->CalcTotalEnergyEstimate();
 			if (currE>maxE)
 				maxE=currE;
+			if (m_exactEndCriteria && maxE)
+				change = currE/maxE;
 		}
 
 		currTS = m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps();
@@ -1562,18 +1624,18 @@ void openEMS::RunFDTD()
 			cout << " || Speed: " << setw(6) << setprecision(1) << std::fixed << speed*1e-6 << " MC/s (" <<  setw(4) << setprecision(3) << std::scientific << t_diff/(currTS-prevTS) << " s/TS)" ;
 			if (Eng_Ext_SSD==NULL)
 			{
-				currE = ProcField->CalcTotalEnergyEstimate();
-				if (currE>maxE)
-					maxE=currE;
-				if (maxE)
-					change = currE/maxE;
+				if (!m_exactEndCriteria) // otherwise already kept current above, every Nyquist period
+				{
+					currE = ProcField->CalcTotalEnergyEstimate();
+					if (currE>maxE)
+						maxE=currE;
+					if (maxE)
+						change = currE/maxE;
+				}
 				cout << " || Energy: ~" << setw(6) << setprecision(2) << std::scientific << currE << " (-" << setw(5)  << setprecision(2) << std::fixed << fabs(10.0*log10(change)) << "dB)" << endl;
 			}
 			else
-			{
-				change = Eng_Ext_SSD->GetLastDiff();
 				cout << " || SteadyState: " << setw(6) << setprecision(2) << std::fixed << 10.0*log10(change) << " dB" << endl;
-			}
 			prevTime=currTime;
 			prevTS=currTS;
 
@@ -1590,6 +1652,8 @@ void openEMS::RunFDTD()
 	if ((change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
 		cerr << "RunFDTD: Warning: Max. number of timesteps was reached before the end-criteria of -" << fabs(10.0*log10(endCrit)) << "dB was reached... " << endl << \
 				"\tYou may want to choose a higher number of max. timesteps... " << endl;
+	else if (FDTD_Op->GetExcitationSignal()->GetExciteType()==0)
+		cout << "RunFDTD: end-criteria of -" << fabs(10.0*log10(endCrit)) << "dB reached after " << FDTD_Eng->GetNumberOfTimesteps() << " timesteps (-" << fabs(10.0*log10(change)) << "dB)" << endl;
 
 	gettimeofday(&currTime,NULL);
 	t_diff = CalcDiffTime(currTime,startTime);

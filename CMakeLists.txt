@@ -14,6 +14,21 @@ cmake_minimum_required(VERSION 3.1...3.10)
 
 PROJECT(openEMS CXX C)
 
+# Comparing the engine output of two builds bit by bit is a way to check that a
+# change which should not alter the result really does not. Two things get in
+# the way of that, both enabled by default because both are wanted in a normal
+# build. Turn them off in localConfig.cmake or on the cmake command line.
+
+# Flushing denormals to zero drops the lowest bits of a decaying field.
+OPTION(ENABLE_FLUSH_TO_ZERO "Flush denormal floating point values to zero in the engines" ON)
+
+# Floating-point contraction fuses a multiply and an add into an FMA, which
+# rounds once instead of twice, so the result depends on where the compiler
+# chose to contract. Debug builds turn it off, they are not built for speed.
+IF(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
+  SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -ffp-contract=off")
+ENDIF()
+
 # default
 set(LIB_VERSION_MAJOR 0)
 set(LIB_VERSION_MINOR 37)
@@ -27,6 +42,11 @@ IF(EXISTS ${PROJECT_SOURCE_DIR}/localConfig.cmake)
 ENDIF()
 
 #ADD_DEFINITIONS( -D__SSE2__ )
+
+IF(NOT ENABLE_FLUSH_TO_ZERO)
+  message(STATUS "Flush-to-zero disabled, the engines keep denormal values")
+  ADD_DEFINITIONS( -DOPENEMS_NO_FLUSH_TO_ZERO )
+ENDIF()
 
 # add git revision
 IF(EXISTS ${PROJECT_SOURCE_DIR}/.git )
@@ -62,15 +82,6 @@ if(UNIX AND ENABLE_RPATH)
   set(CMAKE_SKIP_BUILD_RPATH FALSE)
   set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
   set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-endif()
-
-if (WITH_MPI)
-	ADD_DEFINITIONS(-DMPI_SUPPORT)
-	# Require MPI for this project:
-	find_package(MPI REQUIRED)
-	INCLUDE_DIRECTORIES( ${MPI_INCLUDE_PATH} )
-
-	message(STATUS "Found MPI. INCLUDE " ${MPI_INCLUDE_PATH})
 endif()
 
 # Vulkan 1.2 compute backend option
@@ -190,12 +201,6 @@ INCLUDE_DIRECTORIES( ${openEMS_SOURCE_DIR} )    #find tools
 
 message(STATUS "Sources:"  ${SOURCES})
 
-if (${MPI_CXX_FOUND})
-	set(CMAKE_CXX_COMPILE_FLAGS ${CMAKE_CXX_COMPILE_FLAGS} ${MPI_COMPILE_FLAGS})
-	set(CMAKE_CXX_LINK_FLAGS ${CMAKE_CXX_LINK_FLAGS} ${MPI_LINK_FLAGS})
-	SET(CMAKE_CXX_COMPILER ${MPI_CXX_COMPILER})
-endif()
-
 add_library( openEMS SHARED ${SOURCES})
 #ADD_EXECUTABLE( openEMS main.cpp ${SOURCES})
 set_target_properties(openEMS PROPERTIES VERSION ${LIB_VERSION_STRING} SOVERSION ${LIB_VERSION_MAJOR} )
@@ -207,7 +212,6 @@ TARGET_LINK_LIBRARIES( openEMS
   ${HDF5_HL_LIBRARIES}
   ${Boost_LIBRARIES}
   ${vtk_LIBS}
-  ${MPI_LIBRARIES}
   ${VULKAN_LIBRARIES}
 )
 
@@ -240,14 +244,9 @@ if (UNIX)
     INSTALL( FILES openEMS.sh 
          DESTINATION bin 
          PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ OWNER_EXECUTE GROUP_EXECUTE WORLD_EXECUTE)
-	if (WITH_MPI)
-	INSTALL( FILES openEMS_MPI.sh
-		DESTINATION bin
-		PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ OWNER_EXECUTE GROUP_EXECUTE WORLD_EXECUTE)
-	endif()
 endif ()
 INSTALL(FILES ${PUB_HEADERS} DESTINATION include/openEMS)
 INSTALL( DIRECTORY matlab DESTINATION share/openEMS )
 INSTALL( DIRECTORY python/Tutorials DESTINATION share/openEMS/python )
 INSTALL( DIRECTORY resources DESTINATION share/openEMS )
-# TODO mpi, tarball, debug, release
+# TODO tarball, debug, release

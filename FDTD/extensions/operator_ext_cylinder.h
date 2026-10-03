@@ -28,6 +28,7 @@ class OPENEMS_EXPORT Operator_Ext_Cylinder : public Operator_Extension
 	friend class Engine_Ext_Cylinder;
 	friend class Operator_Ext_LorentzMaterial;
 	friend class EngineVulkan;
+	friend class Operator_Ext_DebyeMaterial;
 public:
 	Operator_Ext_Cylinder(Operator_Cylinder* op);
 	~Operator_Ext_Cylinder();
@@ -38,9 +39,6 @@ public:
 
 	virtual bool IsCylinderCoordsSave(bool closedAlpha, bool R0_included) const {UNUSED(closedAlpha); UNUSED(R0_included); return true;}
 	virtual bool IsCylindricalMultiGridSave(bool child) const {UNUSED(child); return true;}
-
-	// FIXME, this extension is not save or unknown to be save to use with MPI
-	virtual bool IsMPISave() const {return false;}
 
 	virtual std::string GetExtensionName() const
 	{

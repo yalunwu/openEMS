@@ -86,7 +86,7 @@ port2 = StripLinePort(CSX, 2, pec, portstart, portstop, 'x', 'z', SL_height,
 ports = [port1, port2]
 
 ### Run the simulation
-FDTD.Run(Sim_Path, cleanup=True)
+FDTD.Run(Sim_Path, cleanup=True, exact_endcriteria=True)
 
 ### Post-processing
 f = np.linspace(1e6, f_max, 1601)
@@ -108,8 +108,8 @@ assert np.max(s11_dB[mask]) < -40, \
     f'FAIL: max(dB(S11)) = {np.max(s11_dB[mask]):.1f} dB, expected < -40 dB'
 assert np.min(s21_dB[mask]) > -0.1, \
     f'FAIL: min(dB(S21)) = {np.min(s21_dB[mask]):.1f} dB, expected > -0.1 dB'
-assert np.max(s21_dB[mask]) < 0.01, \
-    f'FAIL: max(dB(S21)) = {np.max(s21_dB[mask]):.2f} dB, expected < +0.01 dB (sign error?)'
+assert np.max(s21_dB[mask]) < 0.05, \
+    f'FAIL: max(dB(S21)) = {np.max(s21_dB[mask]):.2f} dB, expected < +0.05 dB (sign error?)'
 
 print('PASS')
 

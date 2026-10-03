@@ -270,7 +270,7 @@ class Test_CircWGPort(unittest.TestCase):
     def test_all_pnm_modes_accepted(self):
         for (n, m) in CircWGPort._pnm:
             mode = 'TE{}{}'.format(n, m)
-            port = CircWGPort(self.csx, port_nr=1,
+            port = CircWGPort(_make_csx_circ(), port_nr=1,
                               start=[0, 0, 0], stop=[0, 0, 200],
                               exc_dir='z', radius=self.radius, mode_name=mode)
             self.assertAlmostEqual(port.kc, CircWGPort._pnm[(n, m)] / self.radius, places=6)
@@ -312,26 +312,26 @@ class Test_CoaxialPort(unittest.TestCase):
         self.mat  = self.csx.AddMaterial('fill', epsilon=2.1)
         self.kw   = dict(r_i=2, r_o=6, r_os=7)
 
-    def _make_port(self, excite_amp=0, feed_R=np.inf, extra_kw=None):
+    def _make_port(self, excite=0, feed_R=np.inf, extra_kw=None):
         kw = dict(**self.kw)
         kw['Feed_R'] = feed_R
         if extra_kw:
             kw.update(extra_kw)
         return CoaxialPort(self.csx, port_nr=1, pec_prop=self.pec, mat_prop=self.mat,
                            start=[0, 0, 0], stop=[0, 0, 100],
-                           prop_dir='z', excite_amp=excite_amp, **kw)
+                           prop_dir='z', excite=excite, **kw)
 
     def test_passive_port(self):
         port = self._make_port()
         self.assertEqual(port.excite, 0)
 
     def test_active_port_has_more_props(self):
-        passive = self._make_port(excite_amp=0)
+        passive = self._make_port(excite=0)
         active  = CoaxialPort(_make_csx_coax(), port_nr=1,
                                pec_prop=_make_csx_coax().AddMetal('p'),
                                mat_prop=None,
                                start=[0, 0, 0], stop=[0, 0, 100],
-                               prop_dir='z', excite_amp=1, **self.kw)
+                               prop_dir='z', excite=1, **self.kw)
         self.assertGreater(len(active.port_props), len(passive.port_props))
 
     def test_three_voltage_probes(self):
@@ -474,7 +474,7 @@ class Test_CPWPort(unittest.TestCase):
             kw.update(extra_kw)
         return CPWPort(self.csx, port_nr=1, metal_prop=self.metal,
                        start=[0, -3, 0], stop=[100, 3, 0],
-                       prop_dir='x', exc_dir='z', gap_width=1,
+                       prop_dir='x', exc_dir='y', gap_width=1,
                        excite=excite, **kw)
 
     def test_passive_port(self):
@@ -499,15 +499,31 @@ class Test_CPWPort(unittest.TestCase):
         active  = CPWPort(_make_csx_tl(), port_nr=1,
                           metal_prop=_make_csx_tl().AddMetal('c2'),
                           start=[0, -3, 0], stop=[100, 3, 0],
-                          prop_dir='x', exc_dir='z', gap_width=1,
+                          prop_dir='x', exc_dir='y', gap_width=1,
                           excite=True)
         self.assertGreater(len(active.port_props), len(passive.port_props))
+
+    def test_exc_dir_is_the_field_across_the_gaps(self):
+        port = self._make_port(excite=1)
+        excitations = [prop.GetExcitation() for prop in port.port_props
+                       if isinstance(prop, CSPropExcitation)]
+        self.assertEqual(len(excitations), 2)
+        for val in excitations:
+            self.assertNotEqual(val[1], 0)
+            self.assertEqual(val[0], 0)
+            self.assertEqual(val[2], 0)
+
+    def test_exc_dir_along_prop_dir_raises(self):
+        with self.assertRaises(Exception):
+            CPWPort(self.csx, port_nr=1, metal_prop=self.metal,
+                    start=[0, -3, 0], stop=[100, 3, 0],
+                    prop_dir='x', exc_dir='x', gap_width=1)
 
     def test_height_direction_mismatch_raises(self):
         with self.assertRaises(Exception):
             CPWPort(self.csx, port_nr=1, metal_prop=self.metal,
                     start=[0, -3, 0], stop=[100, 3, 5],
-                    prop_dir='x', exc_dir='z', gap_width=1, excite=False)
+                    prop_dir='x', exc_dir='y', gap_width=1, excite=False)
 
     def test_measplane_shift_set(self):
         port = self._make_port()
@@ -528,7 +544,7 @@ class Test_CPWPort(unittest.TestCase):
     def test_port_number_in_probe_names(self):
         port = CPWPort(self.csx, port_nr=4, metal_prop=self.metal,
                        start=[0, -3, 0], stop=[100, 3, 0],
-                       prop_dir='x', exc_dir='z', gap_width=1)
+                       prop_dir='x', exc_dir='y', gap_width=1)
         self.assertIn('4', port.U_filenames[0])
 
 
@@ -595,6 +611,48 @@ class Test_CurvePort(unittest.TestCase):
                          start=[0, 0, -5], stop=[0, 0, 5],
                          PortNamePrefix='cv_')
         self.assertTrue(port.U_filenames[0].startswith('cv_'))
+
+
+class Test_CircWGPort_Cylindrical(unittest.TestCase):
+    """On a cylindrical mesh the mode profile must stay in its native
+    (rho, a, z) form and must not be shifted by a local origin: the port box
+    spans the full 0..2*pi in a, so its midpoint is not a point on the axis.
+    """
+
+    def setUp(self):
+        self.csx = _make_csx_cylindrical()
+
+    def _make_port(self, exc_dir='z'):
+        stop = [350, 2 * np.pi, 200]
+        return CircWGPort(self.csx, port_nr=1,
+                          start=[0, 0, 0], stop=stop,
+                          exc_dir=exc_dir, radius=350e-3, mode_name='TE11',
+                          excite=1)
+
+    def test_mode_profile_uses_native_rho_and_a(self):
+        port = self._make_port()
+        # E_rho / E_a carry the profile, E_z is zero, and the Cartesian
+        # transverse form (sqrt(x*x+y*y), atan2) is not used at all.
+        self.assertEqual(port.E_func[2], '0')
+        for func in (port.E_func[0], port.E_func[1]):
+            self.assertIn('rho', func)
+            self.assertNotIn('atan2', func)
+            self.assertNotIn('sqrt(', func)
+
+    def test_no_local_origin_shift(self):
+        port = self._make_port()
+        for prop in port.port_props:
+            if isinstance(prop, CSPropExcitation):
+                origin = prop.GetWeightOrigin()
+            elif isinstance(prop, CSPropProbeBox):
+                origin = prop.GetModeOrigin()
+            else:
+                continue
+            np.testing.assert_allclose(origin, [0, 0, 0])
+
+    def test_non_z_propagation_raises(self):
+        with self.assertRaises(Exception):
+            self._make_port(exc_dir='x')
 
 
 class Test_WaveguidePort_LocalOrigin(unittest.TestCase):
@@ -697,6 +755,89 @@ class Test_WaveguidePort_LocalOrigin(unittest.TestCase):
         weight, mode = self._origins(port)
         for origin in weight + mode:
             np.testing.assert_allclose(origin, [0, 0, 200])
+
+
+class Test_UniquePortNumber(unittest.TestCase):
+    """openEMS writes each port probe to a file named after the port number, so
+    two ports with the same number would corrupt each other's files."""
+
+    def _lumped(self, csx, port_nr, x, **kw):
+        return LumpedPort(csx, port_nr=port_nr, R=50, start=[x, 0, -1], stop=[x, 0, 1],
+                          exc_dir='z', **kw)
+
+    def test_duplicate_lumped_port_raises(self):
+        csx = _make_csx()
+        self._lumped(csx, 1, -20, excite=1)
+        with self.assertRaises(ValueError):
+            self._lumped(csx, 1, 20)
+
+    def test_duplicate_transmission_line_port_raises(self):
+        csx = _make_csx_tl()
+        metal = csx.AddMetal('strip')
+        StripLinePort(csx, 1, metal, [0, -3, 0], [100, 3, 0], 'x', 'z', height=8, excite=1)
+        with self.assertRaises(ValueError):
+            StripLinePort(csx, 1, metal, [100, -3, 0], [0, 3, 0], 'x', 'z', height=8)
+
+    def test_different_number_or_prefix_allowed(self):
+        csx = _make_csx()
+        self._lumped(csx, 1, -20, excite=1)
+        self._lumped(csx, 2, 20)
+        self._lumped(csx, 1, 0, PortNamePrefix='other_')
+
+
+class Test_ExciteAmplitude(unittest.TestCase):
+    """excite is an amplitude for every port type, not just an on/off switch."""
+
+    @staticmethod
+    def _excitations(port):
+        return [prop.GetExcitation() for prop in port.port_props
+                if isinstance(prop, CSPropExcitation)]
+
+    def _check(self, make_port):
+        unit   = self._excitations(make_port(1))
+        scaled = self._excitations(make_port(-2))
+        self.assertGreater(len(unit), 0)
+        self.assertEqual(len(unit), len(scaled))
+        for u, s in zip(unit, scaled):
+            self.assertTrue(np.any(u != 0))
+            np.testing.assert_allclose(s, -2*u)
+
+    def test_lumped_port(self):
+        self._check(lambda excite: LumpedPort(_make_csx(), port_nr=1, R=50,
+                    start=[0, 0, -1], stop=[0, 0, 1], exc_dir='z', excite=excite))
+
+    def test_curve_port(self):
+        self._check(lambda excite: CurvePort(_make_csx(), port_nr=1, R=50,
+                    start=[0, 0, -5], stop=[0, 0, 5], excite=excite))
+
+    def test_waveguide_port(self):
+        self._check(lambda excite: CircWGPort(_make_csx_circ(), port_nr=1,
+                    start=[0, 0, 0], stop=[0, 0, 200], exc_dir='z',
+                    radius=320e-3, mode_name='TE11', excite=excite))
+
+    def test_coaxial_port(self):
+        def make_port(excite):
+            csx = _make_csx_coax()
+            return CoaxialPort(csx, port_nr=1, pec_prop=csx.AddMetal('pec'), mat_prop=None,
+                               start=[0, 0, 0], stop=[0, 0, 100], prop_dir='z',
+                               r_i=2, r_o=6, r_os=7, excite=excite)
+        self._check(make_port)
+
+    def test_stripline_port(self):
+        def make_port(excite):
+            csx = _make_csx_tl()
+            return StripLinePort(csx, port_nr=1, metal_prop=csx.AddMetal('strip'),
+                                 start=[0, -3, 0], stop=[100, 3, 0],
+                                 prop_dir='x', exc_dir='z', height=8, excite=excite)
+        self._check(make_port)
+
+    def test_cpw_port(self):
+        def make_port(excite):
+            csx = _make_csx_tl()
+            return CPWPort(csx, port_nr=1, metal_prop=csx.AddMetal('cpw'),
+                           start=[0, -3, 0], stop=[100, 3, 0],
+                           prop_dir='x', exc_dir='y', gap_width=1, excite=excite)
+        self._check(make_port)
 
 
 if __name__ == '__main__':

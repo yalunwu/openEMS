@@ -56,7 +56,9 @@ cdef class openEMS:
     :param NrTS:           max. number of timesteps to simulate (e.g. default=1e9)
     :param EndCriteria:    end criteria, e.g. 1e-5, simulations stops if energy has decayed by this value (<1e-4 is recommended, default=1e-5)
     :param MaxTime:        max. real time in seconds to simulate
-    :param OverSampling:   nyquist oversampling of time domain dumps
+    :param OverSampling:   nyquist oversampling of the time domain dumps and probes (default 4).
+                            Frequency-domain dumps/probes accumulate at the plain Nyquist rate
+                            unless a box sets its own ``over_sampling`` (CSXCAD AddDump/AddProbe).
     :param CoordSystem:    choose coordinate system (0 Cartesian, 1 Cylindrical)
     :param MultiGrid:      define a cylindrical sub-grid radius
     :param TimeStep:       force to use a given timestep (dangerous!)
@@ -136,7 +138,10 @@ cdef class openEMS:
     def SetOverSampling(self, val):
         """ SetOverSampling(val)
 
-        Set the time domain signal oversampling as multiple of the Nyquist-rate.
+        Set the sampling of the time domain dumps and probes as a multiple of
+        the Nyquist rate (default 4). Frequency-domain dumps/probes accumulate
+        at the plain Nyquist rate unless a box sets its own ``over_sampling``
+        via CSXCAD's AddDump/AddProbe.
         """
         self.thisptr.SetOverSampling(val)
 
@@ -237,7 +242,15 @@ cdef class openEMS:
     def SetMaxTime(self, val):
         """ SetMaxTime(val)
 
-        Set max simulation time for a max. number of timesteps.
+        Set the maximum simulated time, i.e. the physical time the fields are
+        propagated for. This is not a wall-clock limit: openEMS divides it by
+        the timestep and uses the result as a cap on the number of timesteps.
+
+        Typical values for RF simulations are in the nanosecond range. The
+        simulated duration also sets the frequency resolution of the result,
+        `df = 1/val`, which is the usual way to choose it.
+
+        :param val: float -- max. simulated time in seconds
         """
         self.thisptr.SetMaxTime(val)
 
@@ -392,8 +405,8 @@ cdef class openEMS:
             raise Exception('AddCircWaveGuidePort: CSX is not set!')
         return ports.CircWGPort(self.__CSX, port_nr, start, stop, exc_dir, radius, mode_name, pol_ang, excite, **kw)
 
-    def AddCoaxialPort(self, port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os, excite_amp=0, **kw):
-        """ AddCoaxialPort(port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os, excite_amp=0, **kw)
+    def AddCoaxialPort(self, port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os, excite=0, **kw):
+        """ AddCoaxialPort(port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os, excite=0, **kw)
 
         Add a coaxial port.
 
@@ -403,7 +416,7 @@ cdef class openEMS:
         """
         if self.__CSX is None:
             raise Exception('AddCoaxialPort: CSX is not set!')
-        return ports.CoaxialPort(self.__CSX, port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os, excite_amp, **kw)
+        return ports.CoaxialPort(self.__CSX, port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os, excite, **kw)
 
     def AddMSLPort(self, port_nr, metal_prop, start, stop, prop_dir, exc_dir, excite=0, **kw):
         """ AddMSLPort(port_nr, metal_prop, start, stop, prop_dir, exc_dir, excite=0, **kw)
@@ -452,6 +465,12 @@ cdef class openEMS:
         This method will automatically adept the recording box to the current
         FDTD grid and boundary conditions.
 
+        The automatically derived `directions` and `mirror` settings can be
+        overruled by passing them explicitly, e.g. to skip a face the antenna
+        feed passes through:
+
+        >>> FDTD.CreateNF2FFBox(directions=[1, 1, 1, 1, 0, 1])
+
         Notes
         -----
         * Make sure the mesh grid and all boundary conditions are finially defined.
@@ -492,6 +511,9 @@ cdef class openEMS:
                     raise Exception('Error::CreateNF2FFBox: not enough lines in some direction')
                 start[n] = l[BC_size[2*n]]
                 stop[n]  = l[-1*BC_size[2*n+1]-1]
+        # an explicitly given directions/mirror wins over the derived one
+        directions = kw.pop('directions', directions)
+        mirror     = kw.pop('mirror',     mirror)
         return nf2ff.nf2ff(self.__CSX, name, start, stop, directions=directions, mirror=mirror, **kw)
 
     def SetCSX(self, ContinuousStructure CSX):
@@ -654,6 +676,8 @@ cdef class openEMS:
         * nativeFieldDumps (bool) - dump all fields using the native field
           components
         """
+        # a relative sim_path would be resolved against itself after the chdir below
+        sim_path = os.path.abspath(sim_path)
         if cleanup and os.path.exists(sim_path):
             self._cleanup_sim_path(sim_path, verbose=kw.get('verbose'))
         if not os.path.exists(sim_path):

@@ -7,8 +7,12 @@ function FDTD = InitFDTD(varargin)
 % - NrTS:           max. number of timesteps to simulate (e.g. default=1e9)
 % - EndCriteria:    end criteria, e.g. 1e-5, simulations stops if energy has
 %                   decayed by this value (<1e-4 is recommended, default=1e-5)
-% - MaxTime:        max. real time in seconds to simulate
-% - OverSampling:   nyquist oversampling of time domain dumps
+% - MaxTime:        max. simulated time in seconds (physical time, not
+%                   wall-clock); typically nanoseconds for RF
+% - OverSampling:   nyquist oversampling of the time domain dumps and probes
+%                   (default 4). Frequency-domain dumps/probes accumulate at
+%                   the plain Nyquist rate unless a box sets its own
+%                   'OverSampling' via CSXCAD's AddDump/AddProbe.
 % - CoordSystem:    choose coordinate system (0 Cartesian, 1 Cylindrical)
 % - MultiGrid:      define a cylindrical sub-grid radius
 % - TimeStep:       force to use a given timestep (dangerous!)

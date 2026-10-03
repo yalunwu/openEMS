@@ -16,7 +16,11 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
+
 import numpy as np
 
 from CSXCAD import ContinuousStructure
@@ -212,6 +216,32 @@ class Test_SetCSX(unittest.TestCase):
             self.fdtd.CreateNF2FFBox()
 
 
+class Test_CreateNF2FFBox(unittest.TestCase):
+    """The recording directions are derived from the boundary conditions, but
+    must be overridable: an antenna whose feed crosses one face needs that
+    face left out of the Huygens surface (see Tutorials/Conical_Horn_Antenna).
+    """
+
+    def setUp(self):
+        self.fdtd = openEMS()
+        self.fdtd.SetCSX(_make_csx_with_grid())
+        self.start = [-40, -40, -4]
+        self.stop  = [ 40,  40,  4]
+
+    def test_explicit_directions_override_the_derived_ones(self):
+        self.fdtd.SetBoundaryCond(['PML_8']*6)
+        nf2ff = self.fdtd.CreateNF2FFBox('nf2ff', self.start, self.stop,
+                                         directions=[1, 1, 1, 1, 0, 1])
+        self.assertEqual(list(nf2ff.directions), [1, 1, 1, 1, 0, 1])
+
+    def test_directions_still_derived_from_boundary_conditions(self):
+        # a PEC boundary disables its direction and mirrors instead
+        self.fdtd.SetBoundaryCond(['PML_8', 'PML_8', 'PML_8', 'PML_8', 'PEC', 'PML_8'])
+        nf2ff = self.fdtd.CreateNF2FFBox('nf2ff', self.start, self.stop)
+        self.assertEqual(list(nf2ff.directions), [True]*4 + [False, True])
+        self.assertEqual(list(nf2ff.mirror), [0, 0, 0, 0, 1, 0])
+
+
 class Test_AddLumpedPort(unittest.TestCase):
     def setUp(self):
         self.fdtd = openEMS()
@@ -235,6 +265,38 @@ class Test_AddLumpedPort(unittest.TestCase):
         self.fdtd.AddLumpedPort(1, 50, [0, 0, -2], [0, 0, 2], 'z', excite=0, edges2grid='z')
         n_lines_after = self.csx.GetGrid().GetQtyLines('z')
         self.assertGreaterEqual(n_lines_after, n_lines_before)
+
+
+class Test_Run(unittest.TestCase):
+    # Run() changes into sim_path, so every test starts and ends in a known directory
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.tmp = tempfile.TemporaryDirectory()
+        os.chdir(self.tmp.name)
+        self.fdtd = openEMS(NrTS=10)
+        self.fdtd.SetGaussExcite(1e9, 1e9)
+        self.fdtd.SetBoundaryCond(['PEC'] * 6)
+        self.fdtd.SetCSX(_make_csx_with_grid())
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        self.tmp.cleanup()
+
+    def assertInDir(self, path):
+        self.assertEqual(Path(os.getcwd()).resolve(), Path(path).resolve())
+
+    def test_relative_sim_path(self):
+        self.fdtd.Run('sim', setup_only=True, verbose=0)
+        self.assertInDir(os.path.join(self.tmp.name, 'sim'))
+
+    def test_sim_path_through_symlink(self):
+        os.mkdir('real')
+        try:
+            os.symlink('real', 'link')
+        except OSError:  # Windows without developer mode
+            self.skipTest('cannot create symlinks')
+        self.fdtd.Run(os.path.join(self.tmp.name, 'link'), setup_only=True, verbose=0)
+        self.assertInDir(os.path.join(self.tmp.name, 'real'))
 
 
 if __name__ == '__main__':

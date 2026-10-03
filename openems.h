@@ -150,6 +150,7 @@ protected:
 	bool m_debugCSX;
 	bool m_DumpStats;
 	bool m_debugBox, m_debugPEC, m_no_simulation;
+	bool m_exactEndCriteria;
 
 	double endCrit;
 	int m_OverSampling;
@@ -163,11 +164,7 @@ protected:
 
 	bool m_Abort;
 
-#ifdef MPI_SUPPORT
-	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_MPI, EngineType_Vulkan};
-#else
 	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_Vulkan};
-#endif
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;
 	std::unique_ptr<EngineBackend> m_EngineBackend;

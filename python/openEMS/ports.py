@@ -21,6 +21,7 @@ import os
 import numpy as np
 from CSXCAD.Utilities import CheckNyDir
 from CSXCAD.CSRectGrid import CoordinateSystem
+from CSXCAD.CSProperties import CSPropProbeBox, CSPropDumpBox
 from openEMS import utilities
 
 from openEMS.physical_constants import *
@@ -81,7 +82,9 @@ class Port(object):
     The port base class.
 
     :param CSX: Continuous Structure
-    :param port_nr: int -- port number
+    :param port_nr: int -- port number, must be unique among all ports with the
+        same PortNamePrefix, as openEMS writes each port probe to a file named
+        after the port number
     :param R: float -- port reference impedance, e.g. 50 (Ohms)
     :param start, stop: (3,) array -- Start/Stop box coordinates
     :param p_dir: int -- port direction
@@ -115,7 +118,27 @@ class Port(object):
 
         self.lbl_temp = self.prefix + 'port_{}' +  '_{}'.format(self.number)
 
+    def _AddProbe(self, CSX, name, **kw):
+        # openEMS writes each probe to a file of its name, two probes with the
+        # same name would corrupt each other's file
+        for prop in CSX.GetPropertiesByName(name):
+            if isinstance(prop, CSPropProbeBox) and not isinstance(prop, CSPropDumpBox):
+                raise ValueError('port {}: a probe named "{}" already exists, port numbers '
+                                 'must be unique (or use a different PortNamePrefix)'.format(self.number, name))
+        return CSX.AddProbe(name, **kw)
+
     def SetEnabled(self, val):
+        """ SetEnabled(val)
+
+        Enable or disable this port's excitation, so the same structure can be
+        run once per active port without rebuilding it. A passive port still
+        records what arrives at it.
+
+        :param val: bool -- True to excite from this port
+
+        Raises an exception when enabling a port that was created with
+        ``excite=0`` and therefore has no excitation to enable.
+        """
         from CSXCAD.CSProperties import CSPropExcitation
         found_any = False
         for prop in self.port_props:
@@ -127,6 +150,18 @@ class Port(object):
             raise Exception('Unable to enable port! No excitation found!')
 
     def ReadUIData(self, sim_path, freq, signal_type ='pulse'):
+        """ ReadUIData(sim_path, freq, signal_type='pulse')
+
+        Read the voltage and current probe files this port wrote and sum them
+        into the total voltage and current, in the time domain (`ut_tot`,
+        `it_tot`) and the frequency domain (`uf_tot`, `if_tot`). Called by
+        :meth:`CalcPort`; call it directly only to inspect the raw probe data.
+
+        :param sim_path: str -- simulation directory holding the probe files
+        :param freq: array -- frequencies to evaluate
+        :param signal_type: str -- 'pulse' (default) or 'periodic', see
+            :func:`openEMS.utilities.DFT_time2freq`
+        """
         self.u_data = UI_data(self.U_filenames, sim_path, freq, signal_type )
         self.uf_tot = 0
         self.ut_tot = 0
@@ -149,6 +184,29 @@ class Port(object):
 
 
     def CalcPort(self, sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse'):
+        """ CalcPort(sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse')
+
+        Post-process this port: read its probe files and separate the total
+        voltage and current into incident and reflected waves. Run it after
+        the simulation, once per port, before reading any of the results.
+
+        The results are attributes of the port: `uf_inc`, `uf_ref`, `uf_tot`
+        and the matching `if_*` currents in the frequency domain, `ut_*` and
+        `it_*` in the time domain (incident and reflected only for a scalar
+        reference impedance), and the powers `P_inc`, `P_ref` and `P_acc`.
+        S-parameters follow from the ratios, e.g.
+        ``s11 = port[0].uf_ref / port[0].uf_inc``.
+
+        :param sim_path: str -- simulation directory holding the probe files
+        :param freq: array -- frequencies to evaluate
+        :param ref_impedance: float or array -- reference impedance to
+            normalize to, e.g. 50. Defaults to the port resistance for a
+            lumped port, or the extracted line impedance for a transmission
+            line or waveguide port.
+        :param ref_plane_shift: float -- move the reference plane by this
+            distance in drawing units (transmission line and waveguide ports)
+        :param signal_type: str -- 'pulse' (default) or 'periodic'
+        """
         self.ReadUIData(sim_path, freq, signal_type)
 
         if ref_impedance is not None:
@@ -224,7 +282,7 @@ class LumpedPort(Port):
         u_start[self.exc_ny] = self.start[self.exc_ny]
         u_stop  = 0.5*(self.start+self.stop)
         u_stop[self.exc_ny]  = self.stop[self.exc_ny]
-        u_probe = CSX.AddProbe(self.U_filenames[0], p_type=0, weight=-1)
+        u_probe = self._AddProbe(CSX, self.U_filenames[0], p_type=0, weight=-1)
         u_probe.AddBox(u_start, u_stop)
         self.port_props.append(u_probe)
 
@@ -233,11 +291,17 @@ class LumpedPort(Port):
         i_start[self.exc_ny] = 0.5*(self.start[self.exc_ny]+self.stop[self.exc_ny])
         i_stop  = np.array(self.stop)
         i_stop[self.exc_ny]  = 0.5*(self.start[self.exc_ny]+self.stop[self.exc_ny])
-        i_probe = CSX.AddProbe(self.I_filenames[0], p_type=1, weight=self.direction, norm_dir=self.exc_ny)
+        i_probe = self._AddProbe(CSX, self.I_filenames[0], p_type=1, weight=self.direction, norm_dir=self.exc_ny)
         i_probe.AddBox(i_start, i_stop)
         self.port_props.append(i_probe)
 
     def CalcPort(self, sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse'):
+        """ CalcPort(sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse')
+
+        As :meth:`Port.CalcPort`, with the reference impedance defaulting to
+        the port resistance `R`. A lumped port has no reference plane to move,
+        so `ref_plane_shift` is ignored.
+        """
         if ref_impedance is None:
             self.Z_ref = self.R
         if ref_plane_shift is not None:
@@ -310,7 +374,7 @@ class MSLPort(Port):
             u_stop[self.exc_ny]   = self.stop [self.exc_ny]
             u_name = self.lbl_temp.format('ut') + suffix[n]
             self.U_filenames.append(u_name)
-            u_probe = CSX.AddProbe(u_name, p_type=0)
+            u_probe = self._AddProbe(CSX, u_name, p_type=0)
             u_probe.AddBox(u_start, u_stop)
             self.port_props.append(u_probe)
 
@@ -325,7 +389,7 @@ class MSLPort(Port):
             i_stop[self.prop_ny]  = i_prope_pos[n]
             i_name = self.lbl_temp.format('it') + suffix[n]
             self.I_filenames.append(i_name)
-            i_probe = CSX.AddProbe(i_name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
+            i_probe = self._AddProbe(CSX, i_name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
             i_probe.AddBox(i_start, i_stop)
             self.port_props.append(i_probe)
 
@@ -353,6 +417,12 @@ class MSLPort(Port):
                 self.port_props.append(lumped_R)
 
     def ReadUIData(self, sim_path, freq, signal_type ='pulse'):
+        """ ReadUIData(sim_path, freq, signal_type='pulse')
+
+        As :meth:`Port.ReadUIData`, but the total voltage and current are taken
+        from the probe at the measurement plane rather than summed over all
+        probes; the other probes are used to separate the traveling waves.
+        """
         self.u_data = UI_data(self.U_filenames, sim_path, freq, signal_type )
         self.uf_tot = self.u_data.ui_f_val[1]
         self.ut_tot = self.u_data.ui_val[1]
@@ -396,7 +466,7 @@ class WaveguidePort(Port):
         Use ``None`` when supplying a mode file.
     kc : float
         Cut-off wavenumber of the mode in drawing units (e.g. pi/a for TE10).
-        Used by :meth:`CalcPort` to compute the propagation constant beta and
+        Used by :meth:`~openEMS.ports.Port.CalcPort` to compute the propagation constant beta and
         the analytic waveguide impedance.
     E_WG_file : str or None
         Path to an HDF5 file containing the electric field mode profile.
@@ -467,7 +537,7 @@ class WaveguidePort(Port):
             e_start = np.array(start)
             e_stop  = np.array(stop)
             e_stop[self.exc_ny] = e_start[self.exc_ny]
-            e_vec = np.ones(3)
+            e_vec = excite*np.ones(3)
             e_vec[self.exc_ny] = 0
             exc = CSX.AddExcitation(self.lbl_temp.format('excite'), exc_type=excite_type, exc_val=e_vec, delay=self.delay)
 
@@ -518,7 +588,7 @@ class WaveguidePort(Port):
 
         self.U_filenames = [self.lbl_temp.format('ut'), ]
         u_probe_kw = {'mode_function': self.E_func} if use_function_expr else {}
-        u_probe = CSX.AddProbe(self.U_filenames[0], p_type=10, **u_probe_kw)
+        u_probe = self._AddProbe(CSX, self.U_filenames[0], p_type=10, **u_probe_kw)
         if not use_function_expr:
             u_probe.SetModeFile(self.E_file)
         if local_origin is not None:
@@ -528,7 +598,7 @@ class WaveguidePort(Port):
 
         self.I_filenames = [self.lbl_temp.format('it'), ]
         i_probe_kw = {'mode_function': self.H_func} if use_function_expr else {}
-        i_probe = CSX.AddProbe(self.I_filenames[0], p_type=11, weight=self.direction, **i_probe_kw)
+        i_probe = self._AddProbe(CSX, self.I_filenames[0], p_type=11, weight=self.direction, **i_probe_kw)
         if not use_function_expr:
             i_probe.SetModeFile(self.H_file)
         if local_origin is not None:
@@ -537,6 +607,15 @@ class WaveguidePort(Port):
         self.port_props.append(i_probe)
 
     def CalcPort(self, sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse', ZL = -1):
+        """ CalcPort(sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse', ZL=-1)
+
+        As :meth:`Port.CalcPort`, but the propagation constant `beta` and the
+        wave impedance `ZL` are calculated analytically from the mode's cutoff
+        wavenumber, and the S-parameters are normalized to `ZL` unless
+        `ref_impedance` is given.
+
+        :param ZL: float -- override the analytic wave impedance
+        """
         k = 2.0*np.pi*freq/C0*self.ref_index
         self.beta = np.sqrt(k**2 - self.kc**2)
         if ZL <= 0:
@@ -628,10 +707,7 @@ class CircWGPort(WaveguidePort):
 
     Generates Bessel-function mode functions (Pozar 3rd ed.) and forwards
     them to :class:`WaveguidePort`.  Only TE modes with the listed (n, m)
-    indices are supported.  The fparser variables ``rho`` and ``a`` describe
-    cylindrical coordinates in the xy-plane, so **the propagation axis must
-    be z** (``exc_dir=2``) for the mode functions to be evaluated correctly
-    in Cartesian meshes.
+    indices are supported.
 
     Parameters
     ----------
@@ -648,9 +724,18 @@ class CircWGPort(WaveguidePort):
     local_origin : array-like, 'corner', or 'center', optional
         Forwarded to :class:`WaveguidePort`.  Defaults to ``'center'`` so
         that the mode functions are evaluated relative to the port midpoint.
+        Ignored on a cylindrical mesh, see the notes below.
 
     Notes
     -----
+    On a **cylindrical** mesh the mode profile is used in its native
+    (rho, a, z) form and the propagation direction must be ``'z'``.  ``rho``
+    and ``a`` are then the mesh coordinates themselves, already measured from
+    the mesh axis = the waveguide axis, so no ``local_origin`` shift is
+    applied (the port box spans the full 0..2*pi in ``a``, whose midpoint is
+    not a point on the axis).  On a Cartesian mesh the profile is converted
+    to the two transverse Cartesian components and masked to ``rho < radius``.
+
     Supported modes and their Bessel zeros p'_nm (zeros of J_n'):
 
       TE01 3.832  TE11 1.841  TE21 3.054
@@ -694,12 +779,23 @@ class CircWGPort(WaveguidePort):
         ny_P   = (exc_ny + 1) % 3
         ny_PP  = (exc_ny + 2) % 3
 
-        # Transverse cylindrical coordinates as fparser expressions for any propagation axis
-        coords = 'xyz'
-        u     = coords[ny_P]
-        v     = coords[ny_PP]
-        rho_t = 'sqrt({0}*{0}+{1}*{1})'.format(u, v)
-        a_t   = 'atan2({},{})'.format(v, u)
+        cyl_mesh = CSX.GetGrid().GetMeshType() == CoordinateSystem.CYLINDRICAL
+
+        if cyl_mesh:
+            # Cylindrical mesh: rho/a are the mesh coordinates themselves and are
+            # already measured from the mesh axis, which is the waveguide axis.
+            if exc_ny != 2:
+                raise Exception('CircWGPort: on a cylindrical mesh the propagation '
+                                'direction must be z')
+            rho_t = 'rho'
+            a_t   = 'a'
+        else:
+            # Transverse cylindrical coordinates as fparser expressions for any propagation axis
+            coords = 'xyz'
+            u     = coords[ny_P]
+            v     = coords[ny_PP]
+            rho_t = 'sqrt({0}*{0}+{1}*{1})'.format(u, v)
+            a_t   = 'atan2({},{})'.format(v, u)
         ang   = '({})-{:.15g}'.format(a_t, pol_ang)
 
         # Cylindrical E and H components (Pozar 3rd ed., TE_nm pattern n=1)
@@ -710,17 +806,27 @@ class CircWGPort(WaveguidePort):
         Hr = '{C:.15g}*sin({a})*0.5*(j0({k:.15g}*({r}))-jn(2,{k:.15g}*({r})))'.format(C=-c_a, r=rho_t, a=ang, k=kc_draw)
         Ha = '{C:.15g}/({r})*cos({a})*j1({k:.15g}*({r}))'.format(C=c_r,  r=rho_t, a=ang, k=kc_draw)
 
-        # Cartesian conversion: cos(a_t)=u/rho_t, sin(a_t)=v/rho_t; map to transverse axes
-        r_draw = radius / unit
-        mask  = '(({r})<{d:.15g})'.format(r=rho_t, d=r_draw)
-        cos_a = '{}/({})'.format(u, rho_t)
-        sin_a = '{}/({})'.format(v, rho_t)
-        E_func = ['0', '0', '0']
-        H_func = ['0', '0', '0']
-        E_func[ny_P]  = '(({Er})*({ca})-({Ea})*({sa}))*{m}'.format(Er=Er, Ea=Ea, ca=cos_a, sa=sin_a, m=mask)
-        E_func[ny_PP] = '(({Er})*({sa})+({Ea})*({ca}))*{m}'.format(Er=Er, Ea=Ea, ca=cos_a, sa=sin_a, m=mask)
-        H_func[ny_P]  = '(({Hr})*({ca})-({Ha})*({sa}))*{m}'.format(Hr=Hr, Ha=Ha, ca=cos_a, sa=sin_a, m=mask)
-        H_func[ny_PP] = '(({Hr})*({sa})+({Ha})*({ca}))*{m}'.format(Hr=Hr, Ha=Ha, ca=cos_a, sa=sin_a, m=mask)
+        if cyl_mesh:
+            # The mesh components already are (rho, a, z), so the mode profile is
+            # used as-is. The port box spans the full 0..2*pi in a, so its
+            # "center" is not a point on the axis and must not be used as local
+            # origin --> no shift at all.
+            E_func = [Er, Ea, '0']
+            H_func = [Hr, Ha, '0']
+            if local_origin in ('center', 'corner'):
+                local_origin = None
+        else:
+            # Cartesian conversion: cos(a_t)=u/rho_t, sin(a_t)=v/rho_t; map to transverse axes
+            r_draw = radius / unit
+            mask  = '(({r})<{d:.15g})'.format(r=rho_t, d=r_draw)
+            cos_a = '{}/({})'.format(u, rho_t)
+            sin_a = '{}/({})'.format(v, rho_t)
+            E_func = ['0', '0', '0']
+            H_func = ['0', '0', '0']
+            E_func[ny_P]  = '(({Er})*({ca})-({Ea})*({sa}))*{m}'.format(Er=Er, Ea=Ea, ca=cos_a, sa=sin_a, m=mask)
+            E_func[ny_PP] = '(({Er})*({sa})+({Ea})*({ca}))*{m}'.format(Er=Er, Ea=Ea, ca=cos_a, sa=sin_a, m=mask)
+            H_func[ny_P]  = '(({Hr})*({ca})-({Ha})*({sa}))*{m}'.format(Hr=Hr, Ha=Ha, ca=cos_a, sa=sin_a, m=mask)
+            H_func[ny_PP] = '(({Hr})*({sa})+({Ha})*({ca}))*{m}'.format(Hr=Hr, Ha=Ha, ca=cos_a, sa=sin_a, m=mask)
 
         super(CircWGPort, self).__init__(
             CSX, port_nr=port_nr, start=start, stop=stop,
@@ -750,7 +856,7 @@ class CoaxialPort(Port):
         Outer conductor inner radius in drawing units.
     r_os : float
         Outer conductor outer radius in drawing units.
-    excite_amp : float, optional
+    excite : float, optional
         Excitation amplitude of the transverse E-field profile.  Set to 0
         (default) for a passive port.
     FeedShift : float, optional
@@ -768,8 +874,8 @@ class CoaxialPort(Port):
     """
 
     def __init__(self, CSX, port_nr, pec_prop, mat_prop, start, stop,
-                 prop_dir, r_i, r_o, r_os, excite_amp=0, **kw):
-        super(CoaxialPort, self).__init__(CSX, port_nr=port_nr, start=start, stop=stop, excite=excite_amp, **kw)
+                 prop_dir, r_i, r_o, r_os, excite=0, **kw):
+        super(CoaxialPort, self).__init__(CSX, port_nr=port_nr, start=start, stop=stop, excite=excite, **kw)
 
         self.prop_ny = CheckNyDir(prop_dir)
         self.ny_P    = (self.prop_ny + 1) % 3
@@ -783,7 +889,6 @@ class CoaxialPort(Port):
 
         feed_shift = kw.get('FeedShift', 0)
         feed_R     = kw.get('Feed_R', np.inf)
-        excite_amp = self.excite
 
         # Default measurement plane at midpoint
         measplane_pos = 0.5 * (start[self.prop_ny] + stop[self.prop_ny])
@@ -824,7 +929,7 @@ class CoaxialPort(Port):
 
             u_name = self.lbl_temp.format('ut') + suffix[n]
             self.U_filenames.append(u_name)
-            u_probe = CSX.AddProbe(u_name, p_type=0, weight=1)
+            u_probe = self._AddProbe(CSX, u_name, p_type=0, weight=1)
             u_probe.AddBox(v_start, v_stop)
             self.port_props.append(u_probe)
 
@@ -842,12 +947,12 @@ class CoaxialPort(Port):
 
             i_name = self.lbl_temp.format('it') + suffix[n]
             self.I_filenames.append(i_name)
-            i_probe = CSX.AddProbe(i_name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
+            i_probe = self._AddProbe(CSX, i_name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
             i_probe.AddBox(i_start, i_stop)
             self.port_props.append(i_probe)
 
         # Excitation: thin cylindrical shell with radial E-field weighting
-        if excite_amp != 0:
+        if excite != 0:
             prop_feed_idx = np.argmin(np.abs(prop_lines - (start[self.prop_ny] + feed_shift*self.direction)))
             min_cell = np.min(np.diff(prop_lines))
             ex_start = np.array(start, dtype=float)
@@ -868,7 +973,7 @@ class CoaxialPort(Port):
             func_E[self.ny_P]  = '{}/{}{}' .format(dX, r2, mask)
             func_E[self.ny_PP] = '{}/{}{}' .format(dY, r2, mask)
 
-            exc_val = np.ones(3)
+            exc_val = excite*np.ones(3)
             exc_val[self.prop_ny] = 0
             exc = CSX.AddExcitation(self.lbl_temp.format('excite'), exc_type=0,
                                     exc_val=exc_val, delay=self.delay)
@@ -891,6 +996,11 @@ class CoaxialPort(Port):
             raise Exception('CoaxialPort: Feed_R <= 0 is not allowed')
 
     def ReadUIData(self, sim_path, freq, signal_type='pulse'):
+        """ ReadUIData(sim_path, freq, signal_type='pulse')
+
+        As :meth:`Port.ReadUIData`, taking the total voltage and current from
+        the probe at the measurement plane.
+        """
         self.u_data = UI_data(self.U_filenames, sim_path, freq, signal_type)
         self.uf_tot = self.u_data.ui_f_val[1]
         self.ut_tot = self.u_data.ui_val[1]
@@ -1014,7 +1124,7 @@ class StripLinePort(Port):
             for s, sign in [(s1, +1), (s2, -1)]:
                 u_name = self.lbl_temp.format('ut') + s
                 self.U_filenames.append(u_name)
-                u_probe = CSX.AddProbe(u_name, p_type=0, weight=0.5)
+                u_probe = self._AddProbe(CSX, u_name, p_type=0, weight=0.5)
                 u_probe.AddBox(v_pt, v_pt + sign * height_vec, priority=self.priority)
                 self.port_props.append(u_probe)
 
@@ -1044,7 +1154,7 @@ class StripLinePort(Port):
 
             i_name = self.lbl_temp.format('it') + s
             self.I_filenames.append(i_name)
-            i_probe = CSX.AddProbe(i_name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
+            i_probe = self._AddProbe(CSX, i_name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
             i_probe.AddBox(i_start, i_stop)
             self.port_props.append(i_probe)
 
@@ -1061,7 +1171,7 @@ class StripLinePort(Port):
             ex_stop[self.height_ny]  = nstop[self.height_ny]
 
             exc_val = np.zeros(3)
-            exc_val[self.height_ny] = 1
+            exc_val[self.height_ny] = excite
             for lbl_s, sign in [('excite_1', +1), ('excite_2', -1)]:
                 exc = CSX.AddExcitation(self.lbl_temp.format(lbl_s), exc_type=0,
                                         exc_val=sign * exc_val, delay=self.delay)
@@ -1087,6 +1197,11 @@ class StripLinePort(Port):
             raise Exception('StripLinePort: Feed_R must be >= 0')
 
     def ReadUIData(self, sim_path, freq, signal_type='pulse'):
+        """ ReadUIData(sim_path, freq, signal_type='pulse')
+
+        As :meth:`Port.ReadUIData`, taking the total voltage and current from
+        the probe at the measurement plane.
+        """
         all_u = UI_data(self.U_filenames, sim_path, freq, signal_type)
 
         # Sum paired (upper+lower) probes at each of the three positions
@@ -1126,8 +1241,10 @@ class CPWPort(Port):
         Metal property for the CPW conductor.
     prop_dir : int or str
         Direction of wave propagation (0/1/2 or 'x'/'y'/'z').
-    exc_dir : int or str or (3,) array
-        E-field direction across the gaps (one non-zero component).
+    exc_dir : int or str
+        E-field direction across the gaps (0/1/2 or 'x'/'y'/'z'), i.e. the
+        width direction of the CPW. The CPW plane is normal to the cross
+        product of ``prop_dir`` and ``exc_dir``.
     gap_width : float
         Width of each CPW gap in drawing units.
     excite : bool or float, optional
@@ -1150,14 +1267,12 @@ class CPWPort(Port):
 
         self.prop_ny = CheckNyDir(prop_dir)
 
-        # Height direction = E-field direction; width direction = cross product
-        exc_vec = np.zeros(3)
-        exc_vec[CheckNyDir(exc_dir)] = 1.0
-        self.height_ny = int(np.argmax(np.abs(exc_vec)))
-
-        prop_vec = np.zeros(3)
-        prop_vec[self.prop_ny] = 1.0
-        self.width_ny = int(np.argmax(np.abs(np.cross(prop_vec, exc_vec))))
+        # Width direction = E-field direction across the gaps; height direction
+        # (normal of the CPW plane) = cross product, as in AddCPWPort.m
+        self.width_ny = CheckNyDir(exc_dir)
+        if self.width_ny == self.prop_ny:
+            raise Exception('CPWPort: exc_dir must differ from prop_dir')
+        self.height_ny = 3 - self.prop_ny - self.width_ny
 
         if start[self.height_ny] != stop[self.height_ny]:
             raise Exception('CPWPort: start/stop in height direction must be equal')
@@ -1215,7 +1330,7 @@ class CPWPort(Port):
             for s, sign in [(s1, -1), (s2, +1)]:
                 u_name = self.lbl_temp.format('ut') + s
                 self.U_filenames.append(u_name)
-                u_probe = CSX.AddProbe(u_name, p_type=0, weight=0.5)
+                u_probe = self._AddProbe(CSX, u_name, p_type=0, weight=0.5)
                 u_probe.AddBox(v_pt + sign*w_add_start, v_pt + sign*w_add_stop,
                                priority=self.priority)
                 self.port_props.append(u_probe)
@@ -1247,7 +1362,7 @@ class CPWPort(Port):
 
             i_name = self.lbl_temp.format('it') + s
             self.I_filenames.append(i_name)
-            i_probe = CSX.AddProbe(i_name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
+            i_probe = self._AddProbe(CSX, i_name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
             i_probe.AddBox(i_start, i_stop)
             self.port_props.append(i_probe)
 
@@ -1261,7 +1376,7 @@ class CPWPort(Port):
 
             for lbl_s, sign in [('excite_1', -1), ('excite_2', +1)]:
                 exc_val = np.zeros(3)
-                exc_val[self.width_ny] = sign
+                exc_val[self.width_ny] = sign*excite
                 exc = CSX.AddExcitation(self.lbl_temp.format(lbl_s), exc_type=0,
                                         exc_val=exc_val, delay=self.delay)
                 exc.AddBox(ex_pt + sign*w_add_start, ex_pt + sign*w_add_stop,
@@ -1288,6 +1403,11 @@ class CPWPort(Port):
             raise Exception('CPWPort: Feed_R must be >= 0')
 
     def ReadUIData(self, sim_path, freq, signal_type='pulse'):
+        """ ReadUIData(sim_path, freq, signal_type='pulse')
+
+        As :meth:`Port.ReadUIData`, taking the total voltage and current from
+        the probe at the measurement plane.
+        """
         all_u = UI_data(self.U_filenames, sim_path, freq, signal_type)
 
         # Sum paired (left+right gap) probes at each of the three positions
@@ -1412,12 +1532,12 @@ class CurvePort(Port):
 
         # Voltage probe (with weight=-1 to get correct sign) and current probe
         self.U_filenames = [self.lbl_temp.format('ut')]
-        u_probe = CSX.AddProbe(self.U_filenames[0], p_type=0, weight=-1)
+        u_probe = self._AddProbe(CSX, self.U_filenames[0], p_type=0, weight=-1)
         u_probe.AddBox(edge_start, edge_stop)
         self.port_props.append(u_probe)
 
         self.I_filenames = [self.lbl_temp.format('it')]
-        i_probe = CSX.AddProbe(self.I_filenames[0], p_type=1, weight=1)
+        i_probe = self._AddProbe(CSX, self.I_filenames[0], p_type=1, weight=1)
         i_probe.AddBox(i_start, i_stop)
         self.port_props.append(i_probe)
 
@@ -1435,13 +1555,19 @@ class CurvePort(Port):
 
         # Excitation
         if excite:
-            exc_dir_vec = (np.array(port_stop_idx) != np.array(port_start_idx)).astype(float)
+            exc_dir_vec = excite*(np.array(port_stop_idx) != np.array(port_start_idx)).astype(float)
             exc = CSX.AddExcitation(self.lbl_temp.format('excite'), exc_type=0,
                                     exc_val=exc_dir_vec, delay=self.delay)
             exc.AddBox(edge_start, edge_stop, priority=self.priority)
             self.port_props.append(exc)
 
     def CalcPort(self, sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse'):
+        """ CalcPort(sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse')
+
+        As :meth:`Port.CalcPort`, with the reference impedance defaulting to
+        the port resistance `R`. A curve port has no reference plane to move,
+        so `ref_plane_shift` is ignored.
+        """
         if ref_impedance is None:
             self.Z_ref = self.R
         if ref_plane_shift is not None:

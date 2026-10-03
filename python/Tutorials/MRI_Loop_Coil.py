@@ -29,7 +29,7 @@ from CSXCAD  import ContinuousStructure
 from openEMS import openEMS
 from openEMS.physical_constants import *
 from openEMS.sar_utils import readSAR
-from openEMS.utilities import HDF5Dump
+from openEMS.utilities import HDF5Dump, get_resource_path
 
 
 ### General Setup
@@ -80,12 +80,8 @@ if not use_body_model:
         'VF body model not found — using homogeneous ellipsoidal phantom fallback.\n'
         '  Expected: {}'.format(body_model_file)
     )
-
-# Bundled phantom: two levels up from this file → openEMS/resources/phantoms/
-_here = os.path.dirname(os.path.abspath(__file__))
-phantom_file = os.path.normpath(
-    os.path.join(_here, '..', '..', 'resources', 'phantoms', 'phantom_head_298MHz.h5')
-)
+    # Ellipsoidal head phantom shipped with openEMS
+    phantom_file = get_resource_path('phantoms', 'phantom_head_298MHz.h5')
 
 ### FDTD Setup
 ## * Disabled advanced material cell interpolation and make sure to use an unaveraged constant cell material
@@ -140,7 +136,8 @@ if use_body_model:
     body_mat = CSX.AddDiscMaterial('body_model', filename=body_model_file, filetype=0, scale=1/unit)
     tr = body_mat.GetTransform()
     for op, *args in body_model_transform:
-        tr.AddTransform(op, *args, deg=False)
+        kw = {'deg': False} if op in ('RotateAxis', 'RotateOrigin') else {}
+        tr.AddTransform(op, *args, **kw)
 else:
     body_mat = CSX.AddDiscMaterial('body_model', filename=phantom_file, filetype=0, scale=1/unit)
 
@@ -233,7 +230,7 @@ ax.grid(True)
 
 ## SAR — axial (xy) and sagittal (xz) planes
 # readSAR returns (sar[Nx,Ny,Nz], mesh[m], sar_data); mesh coords are in SI metres
-fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+fig, axs = plt.subplots(1, 2, figsize=(10, 5))
 
 sar, sar_mesh, sar_data = readSAR(os.path.join(Sim_Path, 'SAR_xy.h5'))
 sar_xy = sar[:, :, 0] / P0_in                          # (Nx, Ny)
@@ -278,7 +275,7 @@ B1m_xy = 0.5 * MUE0 * (Hx - 1j * Hy) / np.sqrt(P0_in)
 
 X, Y = np.meshgrid(H_mesh['lines'][0] / unit, H_mesh['lines'][1] / unit, indexing='ij')
 
-fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+fig, axs = plt.subplots(1, 2, figsize=(10, 5))
 im_B1p_xy = axs[0].pcolormesh(X, Y, np.log10(np.abs(B1p_xy)), shading='auto')
 plt.colorbar(im_B1p_xy, ax=axs[0])
 axs[0].set_aspect('equal')
@@ -305,7 +302,7 @@ B1m_xz = 0.5 * MUE0 * (Hx - 1j * Hy) / np.sqrt(P0_in)
 
 X, Z = np.meshgrid(H_mesh['lines'][0] / unit, H_mesh['lines'][2] / unit, indexing='ij')
 
-fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+fig, axs = plt.subplots(1, 2, figsize=(10, 5))
 im_B1p_xz = axs[0].pcolormesh(X, Z, np.log10(np.abs(B1p_xz)), shading='auto')
 plt.colorbar(im_B1p_xz, ax=axs[0])
 axs[0].set_aspect('equal')

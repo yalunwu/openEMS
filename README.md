@@ -15,7 +15,7 @@ and is used together with [CSXCAD](https://github.com/thliebig/CSXCAD) for geome
 
 - 3-D FDTD solver for electromagnetic wave propagation
 - Cartesian and cylindrical (including multi-grid) coordinate systems
-- SIMD-accelerated engines (SSE2, multi-threaded, optional MPI)
+- SIMD-accelerated engines (SSE2, multi-threaded)
 - Uniaxial PML and Mur ABC absorbing boundary conditions
 - Total-field / scattered-field (TFSF) excitation
 - Lumped RLC elements
@@ -114,8 +114,8 @@ python3 -c "import openEMS; print(openEMS.__version__)"
 
 After installation, follow the official tutorials to run your first simulation:
 
-- **Octave/Matlab tutorials:** https://docs.openems.de — also available locally in `matlab/Tutorials/`
-- **Python tutorials:** https://docs.openems.de/python/openEMS/Tutorials/ — also available locally in `python/Tutorials/`
+- **Octave/Matlab tutorials:** https://docs.openems.de/en/latest/octave/Tutorials/index.html — also available locally in `matlab/Tutorials/`
+- **Python tutorials:** https://docs.openems.de/en/latest/python/openEMS/Tutorials/index.html — also available locally in `python/Tutorials/`
 
 ---
 
@@ -136,8 +136,10 @@ python3 MSL_NotchFilter.py
 **Full Octave test suite:**
 ```bash
 cd TESTSUITE
-octave --no-gui run_testsuite.m
+octave --no-gui run_testsuite.m          # add --list, --all-engines or a test name
 ```
+It reports PASS/FAIL per test and exits non-zero on failure. See
+[TESTSUITE/README.md](TESTSUITE/README.md).
 
 **Python unit tests:**
 ```bash
@@ -148,12 +150,10 @@ python3 -m unittest discover -s python/Tests -p "test_*.py" -v
 
 ## Contributing
 
-Pull requests are welcome. Please:
-
-1. Follow the existing code style (C++11, no trailing whitespace — enforced by CI).
-2. Add or update tests in `TESTSUITE/` for non-trivial changes.
-3. Disclose AI tool usage per [AI_POLICY.md](AI_POLICY.md).
-4. Include `Signed-off-by: Your Name <email>` in commit messages (DCO).
+Pull requests are welcome. [AGENTS.md](AGENTS.md) has the working rules —
+architecture, build and test cycle, code style, changelog and commit
+conventions — and applies to human and AI-assisted contributions alike.
+Disclosure and sign-off requirements are in [AI_POLICY.md](AI_POLICY.md).
 
 ---
 

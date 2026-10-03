@@ -49,7 +49,7 @@ Engine* Operator_Multithread::CreateEngine()
 	return m_Engine;
 }
 
-Operator_Multithread::Operator_Multithread() : OPERATOR_MULTITHREAD_BASE()
+Operator_Multithread::Operator_Multithread() : Operator_SSE_Compressed()
 {
 	m_CalcEC_Start=NULL;
 	m_CalcEC_Stop=NULL;
@@ -60,7 +60,7 @@ Operator_Multithread::Operator_Multithread() : OPERATOR_MULTITHREAD_BASE()
 
 void Operator_Multithread::Init()
 {
-	OPERATOR_MULTITHREAD_BASE::Init();
+	Operator_SSE_Compressed::Init();
 
 	m_CalcEC_Start=NULL;
 	m_CalcEC_Stop=NULL;
@@ -87,7 +87,7 @@ void Operator_Multithread::Delete()
 void Operator_Multithread::Reset()
 {
 	Delete();
-	OPERATOR_MULTITHREAD_BASE::Reset();
+	Operator_SSE_Compressed::Reset();
 }
 
 void Operator_Multithread::CalcStartStopLines(
@@ -115,8 +115,8 @@ void Operator_Multithread::CalcStartStopLines(
 
 int Operator_Multithread::CalcECOperator( DebugFlags debugFlags )
 {
-	if ((m_numThreads == 0) || (m_numThreads > boost::thread::hardware_concurrency()))
-		m_numThreads = boost::thread::hardware_concurrency();
+	if ((m_numThreads == 0) || (m_numThreads > AvailableThreads()))
+		m_numThreads = AvailableThreads();
 
 	std::vector<unsigned int> m_Start_Lines;
 	std::vector<unsigned int> m_Stop_Lines;
@@ -142,7 +142,7 @@ int Operator_Multithread::CalcECOperator( DebugFlags debugFlags )
 		m_thread_group.add_thread( t );
 	}
 
-	return OPERATOR_MULTITHREAD_BASE::CalcECOperator( debugFlags );
+	return Operator_SSE_Compressed::CalcECOperator( debugFlags );
 }
 
 bool Operator_Multithread::Calc_EC()
