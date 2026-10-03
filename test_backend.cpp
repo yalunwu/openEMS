@@ -4,6 +4,10 @@
  *  Unit tests for pluggable EngineBackend and EngineVulkan
  */
 
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include <iostream>
 #include <cassert>
 #include <vector>

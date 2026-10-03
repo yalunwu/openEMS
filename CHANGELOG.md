@@ -188,6 +188,9 @@ number moved up and patch releases now have somewhere to go.
 
 ### Build
 
+- Vulkan builds support vcpkg's shaderc CMake target, including its static
+  shader compiler dependencies on Windows.
+
 - C++11 is now required, and CMake 3.1 or newer.
 - VTK 9 and newer are supported without deprecated names.
 - Windows: builds via vcpkg manifest with MSVC and clang-cl under Visual
