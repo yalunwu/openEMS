@@ -1625,12 +1625,18 @@ static bool RunMultigridEquivalence(const std::vector<double>& splits, bool open
 		gpu->Reset();
 		TEST_ASSERT(gpu->Initialize(), "Multigrid reinitialization failed");
 	}
+	if (!benchmark) TEST_ASSERT(gpu->SetProfilingEnabled(true), "Multigrid profiling initialization failed");
 
 	// Distinct batches check projection and continuation, including every child.
 	const unsigned int batches[] = {1, 7, 19, 33, 65};
 	unsigned int completed = 0;
 	for (unsigned int batch : batches)
 	{
+		if (!benchmark) {
+			if (batch == 19u || batch == 33u)
+				TEST_ASSERT(gpu->SetReadbackOptimizationsEnabled(batch == 33u), "Multigrid readback toggle failed");
+			TEST_ASSERT(gpu->ClearProfile(), "Multigrid profile reset failed");
+		}
 		TEST_ASSERT(fdtd.GetEng()->IterateTS(batch), "CPU multigrid iteration failed");
 		std::vector<std::vector<float>> reference(levels.size());
 		for (size_t level = 0; level < levels.size(); ++level)
@@ -1655,6 +1661,11 @@ static bool RunMultigridEquivalence(const std::vector<double>& splits, bool open
 			for (const auto& dump : levelDumps)
 				TEST_ASSERT(dump->IsTimestep(), "MultiGridLevel processing did not reach its scheduled timestep");
 		TEST_ASSERT(gpu->SyncFieldsToHost(), "Multigrid field synchronization failed");
+		if (!benchmark) {
+			const auto profile = gpu->GetProfile();
+			TEST_ASSERT(profile.gpuSamples[EngineVulkan::ProfileBatch] > 0 && profile.gpuSamples[EngineVulkan::ProfileReadback] > 0,
+			            "Multigrid stepping or child readback timestamps were not collected");
+		}
 		for (size_t level = 0; level < levels.size(); ++level)
 		{
 			Operator* op = levels[level];
@@ -1832,6 +1843,17 @@ bool Test_Vulkan_EnergyReduction()
 		std::unique_ptr<Engine_Interface_Base> reference(fdtd.Interface());
 		double energy = -1;
 		TEST_ASSERT(gpu.GetFastEnergy(energy) && energy == 0, "Zero fields must have zero energy");
+		for (unsigned int steps : {1u, 33u, 5u}) {
+			TEST_ASSERT(gpu.ClearProfile() && gpu.IterateTS(steps) && gpu.GetFastEnergy(energy) && energy == 0,
+			            "Zero fields after stepping requested CPU fallback");
+			const auto zero = gpu.GetProfile();
+			TEST_ASSERT(zero.downloadedBytes == 0 && zero.energyBytes > 0, "Zero energy downloaded full fields");
+			TEST_ASSERT(gpu.GetFastEnergy(energy) && gpu.GetProfile().submissions == zero.submissions, "Zero energy was not cached");
+		}
+		gpu.SetVolt(2, 34, 22, 40, 1.0f); // Basic CPU energy excludes the final planes.
+		gpu.SetCurr(0, 1, 1, 1, -0.0f);
+		TEST_ASSERT(gpu.GetFastEnergy(energy) && energy == 0, "Boundary fields or signed zero caused a false energy fallback");
+		gpu.SetVolt(2, 34, 22, 40, 0.0f);
 		for (unsigned int n = 0; n < 3; ++n)
 		for (unsigned int x = 0; x < 35; ++x)
 		for (unsigned int y = 0; y < 23; ++y)
@@ -1870,8 +1892,14 @@ bool Test_Vulkan_EnergyReduction()
 		TEST_ASSERT(gpu.SetReadbackOptimizationsEnabled(false) && !gpu.GetFastEnergy(energy), "Reference mode still used GPU energy");
 		gpu.Reset();
 		TEST_ASSERT(gpu.Initialize() && gpu.SetReadbackOptimizationsEnabled(true) && gpu.GetFastEnergy(energy) && energy == 0, "Reset retained energy cache");
-		TEST_ASSERT(gpu.ClearProfile() && gpu.IterateTS(1) && gpu.SyncFieldsToHost() && gpu.GetProfile().submissions == 3,
-		            "Single-field staging fallback did not retain separate copies");
+		for (unsigned int toggle = 0; toggle < 3; ++toggle) {
+			TEST_ASSERT(gpu.SetReadbackOptimizationsEnabled(false) && gpu.ClearProfile() && gpu.IterateTS(1) && gpu.SyncFieldsToHost(),
+			            "Reference field readback failed");
+			TEST_ASSERT(gpu.GetProfile().submissions == 3, "Reference mode did not use two separate field copies");
+			TEST_ASSERT(gpu.SetReadbackOptimizationsEnabled(true) && gpu.ClearProfile() && gpu.IterateTS(1) && gpu.SyncFieldsToHost(),
+			            "Re-enabled field readback failed");
+			TEST_ASSERT(gpu.GetProfile().submissions == 2, "Live re-enable did not restore combined field copies");
+		}
 		{
 #if BOOST_ARCH_X86
 			struct RestoreDenormals { unsigned int previous = _mm_getcsr(); ~RestoreDenormals() { _mm_setcsr(previous); } } restore;
@@ -1884,6 +1912,8 @@ bool Test_Vulkan_EnergyReduction()
 #if BOOST_ARCH_X86
 			TEST_ASSERT(reference->CalcFastEnergy() > 0, "Tiny CPU energy lost preserved subnormal products");
 #endif
+			gpu.SetCurr(0, 1, 1, 1, std::numeric_limits<float>::denorm_min());
+			TEST_ASSERT(!gpu.GetFastEnergy(energy), "Nonzero subnormal input bits were mistaken for exact zero fields");
 		}
 	}
 	TestFDTDAccess sse;
@@ -1899,6 +1929,70 @@ bool Test_Vulkan_EnergyReduction()
 	gpu.SetCurr(2, 1, 1, 8, 0.5f); // SSE includes the final z vector, unlike basic energy.
 	std::unique_ptr<Engine_Interface_Base> reference(sse.Interface());
 	TEST_ASSERT(gpu.SyncFieldsToHost() && std::abs(reference->CalcFastEnergy() - MUE0 * 0.25) < 1e-20, "SSE fallback lost the final z lane");
+	return true;
+#endif
+}
+
+bool Test_Vulkan_OptionalResources()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+	fdtd.SetCSX(CreateCustomGrid(7, 5, 9));
+	fdtd.SetNumberOfTimeSteps(64);
+	fdtd.SetGaussExcite(20e9, 10e9);
+	fdtd.SetEnableDumps(false);
+	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Optional resource fixture setup failed");
+	EngineVulkan gpu(fdtd.GetOp());
+	TEST_ASSERT(gpu.Initialize() && gpu.SetProfilingEnabled(true), "Optional resource backend setup failed");
+	std::unique_ptr<Engine_Interface_Base> reference(fdtd.Interface());
+	// Exhaust an independent pool to fail after the energy buffer, layouts and pipeline exist.
+	VkDescriptorPoolSize size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+	VkDescriptorPoolCreateInfo info = {};
+	info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	info.maxSets = 1;
+	info.poolSizeCount = 1;
+	info.pPoolSizes = &size;
+	VkDescriptorPool pool = VK_NULL_HANDLE;
+	TEST_ASSERT(vkCreateDescriptorPool(gpu.m_device, &info, nullptr, &pool) == VK_SUCCESS, "Failure injection pool creation failed");
+	struct PoolGuard { VkDevice device; VkDescriptorPool pool; ~PoolGuard() { vkDestroyDescriptorPool(device, pool, nullptr); } } poolGuard = {gpu.m_device, pool};
+	VkDescriptorSetAllocateInfo allocation = {};
+	allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocation.descriptorPool = pool;
+	allocation.descriptorSetCount = 1;
+	allocation.pSetLayouts = &gpu.m_level->m_descLayoutEnergy;
+	VkDescriptorSet occupied = VK_NULL_HANDLE;
+	TEST_ASSERT(vkAllocateDescriptorSets(gpu.m_device, &allocation, &occupied) == VK_SUCCESS, "Failure injection pool exhaustion failed");
+	gpu.DestroyEnergyResources();
+	bool allocated = true;
+	{
+		struct RestorePool { VkDescriptorPool& target; VkDescriptorPool previous; ~RestorePool() { target = previous; } } restore = {gpu.m_descPool, gpu.m_descPool};
+		gpu.m_descPool = pool;
+		allocated = gpu.AllocateEnergyResources();
+	}
+	TEST_ASSERT(!allocated, "Exhausted pool did not reject optional energy allocation");
+	TEST_ASSERT(!gpu.m_level->m_bufEnergy.buffer && !gpu.m_level->m_bufEnergy.memory && !gpu.m_level->m_bufEnergy.mapped &&
+	            !gpu.m_level->m_pipelineEnergy && !gpu.m_level->m_pipelineLayoutEnergy && !gpu.m_level->m_descLayoutEnergy &&
+	            !gpu.m_level->m_descSetEnergy && !gpu.m_level->m_energyGroups && !gpu.SupportsFastEnergy(),
+	            "Failed energy allocation retained resources or advertised zero energy");
+	double energy = -1;
+	gpu.SetCurr(0, 1, 1, 1, 0.25f);
+	TEST_ASSERT(!gpu.GetFastEnergy(energy) && energy == -1 && gpu.SyncFieldsToHost() && reference->CalcFastEnergy() > 0,
+	            "Unavailable energy capability suppressed CPU fallback");
+	TEST_ASSERT(gpu.IterateTS(4) && gpu.SyncFieldsToHost(), "Optional allocation failure disabled field stepping");
+	TEST_ASSERT(gpu.AllocateEnergyResources() && gpu.GetFastEnergy(energy), "Energy resources did not recover after allocation failure");
+	TEST_ASSERT(std::abs(energy - reference->CalcFastEnergy()) / reference->CalcFastEnergy() < 3e-7, "Recovered energy disagrees with CPU");
+	// Retain coverage for the supported smaller staging buffer without memory-pressure testing.
+	EngineVulkan::VulkanBuffer smaller;
+	TEST_ASSERT(gpu.CreateBuffer(3ull * 7u * 5u * 9u * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, smaller), "Smaller staging allocation failed");
+	smaller.Swap(gpu.m_level->m_bufFieldStaging);
+	TEST_ASSERT(gpu.ClearProfile() && gpu.IterateTS(1) && gpu.SyncFieldsToHost() && gpu.GetProfile().submissions == 3,
+	            "Smaller staging fallback did not retain separate copies");
+	TEST_ASSERT(gpu.GetFastEnergy(energy) && std::abs(energy - reference->CalcFastEnergy()) / reference->CalcFastEnergy() < 3e-7,
+	            "Smaller staging fallback lost field values");
 	return true;
 #endif
 }
@@ -2012,6 +2106,82 @@ bool Test_Vulkan_ProbeReadbackCache()
 	gpu->RegisterProbes(processing);
 	TEST_ASSERT(gpu->SetReadbackOptimizationsEnabled(false) && gpu->ClearProfile() && gpu->IterateTS(1) && gpu->SyncProbesToHost(), "Reference gather failed");
 	TEST_ASSERT(gpu->GetProfile().submissions == 2, "Reference mode did not retain separate probe gather");
+	return true;
+#endif
+}
+
+bool Test_Vulkan_ProbeValidation()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (const std::string engine : {"basic", "sse"}) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=" + engine, "--numThreads=1"});
+		ContinuousStructure* csx = CreateCustomGrid(7, 5, 9);
+		const double bounds[][6] = {{0, 0, 0, 0, -5, 5}, {-5, 5, -5, 5, 0, 0}, {0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0}};
+		for (int kind = 0; kind < 4; ++kind) {
+			auto* property = new CSPropProbeBox(csx->GetParameterSet());
+			property->SetName("validation_probe_" + std::to_string(kind));
+			property->SetProbeType(kind);
+			auto* box = new CSPrimBox(csx->GetParameterSet(), property);
+			for (unsigned int n = 0; n < 6; ++n) box->SetCoord(n, bounds[kind][n]);
+			csx->AddProperty(property);
+		}
+		fdtd.SetCSX(csx);
+		fdtd.SetNumberOfTimeSteps(64);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetEnableDumps(false);
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Probe validation fixture setup failed");
+		EngineVulkan gpu(fdtd.GetOp());
+		TEST_ASSERT(gpu.Initialize() && gpu.SetProfilingEnabled(true), "Probe validation backend setup failed");
+		ProcessingArray* registry = fdtd.GetProcessings();
+		Processing* probes[4] = {};
+		for (size_t i = 0; i < registry->GetNumberOfProcessings(); ++i)
+		for (unsigned int kind = 0; kind < 4; ++kind) {
+			Processing* processing = registry->GetProcessing(i);
+			if (processing->GetName() == "validation_probe_" + std::to_string(kind)) probes[kind] = processing;
+		}
+		for (auto* probe : probes) TEST_ASSERT(probe && probe->GetEnable(), "Validation probe missing or disabled");
+		// Mutate real processing coordinates to exercise malformed registrations through the public API.
+		auto setCoordinates = [](Processing* probe, const unsigned int* first, const unsigned int* last) {
+			for (unsigned int n = 0; n < 3; ++n) {
+				const_cast<unsigned int*>(probe->GetStartCoord())[n] = first[n];
+				const_cast<unsigned int*>(probe->GetStopCoord())[n] = last[n];
+			}
+		};
+		const unsigned int first[] = {0, 0, 8}, corner[] = {6, 4, 8}, lineEnd[] = {6, 0, 8};
+		setCoordinates(probes[2], corner, corner);
+		setCoordinates(probes[3], corner, corner);
+		setCoordinates(probes[0], first, lineEnd);
+		setCoordinates(probes[1], first, corner);
+		gpu.RegisterProbes(registry);
+		for (unsigned int n = 0; n < 3; ++n) {
+			gpu.SetVolt(n, 6, 4, 8, 0.25f * (n + 1));
+			gpu.SetCurr(n, 6, 4, 8, 0.5f * (n + 1));
+		}
+		TEST_ASSERT(gpu.SyncProbesToHost(), "Valid boundary probes failed to gather");
+		for (unsigned int n = 0; n < 3; ++n) {
+			TEST_ASSERT(fdtd.GetEng()->GetVolt(n, 6, 4, 8) == 0.25f * (n + 1) && fdtd.GetEng()->GetCurr(n, 6, 4, 8) == 0.5f * (n + 1),
+			            "Boundary probe mirroring lost voltage or current components");
+		}
+		const unsigned int invalid[][3] = {{7, 1, 1}, {1, 5, 1}, {1, 1, 9}, {UINT32_MAX, 1, 1}};
+		for (const auto& position : invalid)
+		for (unsigned int kind = 0; kind < 4; ++kind) {
+			setCoordinates(probes[kind], position, position);
+			bool rejected = false;
+			try { gpu.RegisterProbes(registry); }
+			catch (const std::out_of_range& error) { rejected = std::string(error.what()).find("outside the field grid") != std::string::npos; }
+			TEST_ASSERT(rejected, "Invalid probe coordinate was not explicitly rejected");
+			TEST_ASSERT(gpu.ClearProfile() && gpu.SyncProbesToHost() && gpu.GetProfile().submissions == 0,
+			            "Rejected registration replaced the valid probe registry or cache");
+			setCoordinates(probes[2], corner, corner);
+			setCoordinates(probes[3], corner, corner);
+			setCoordinates(probes[0], first, lineEnd);
+			setCoordinates(probes[1], first, corner);
+		}
+		gpu.RegisterProbes(nullptr);
+	}
 	return true;
 #endif
 }
@@ -2145,8 +2315,10 @@ int main(int argc, char* argv[])
 	}
 	if (argc > 1 && std::string(argv[1]) == "--readback-tests") {
 		RUN_TEST(Test_Vulkan_EnergyReduction);
+		RUN_TEST(Test_Vulkan_OptionalResources);
 		RUN_TEST(Test_Vulkan_EnergyDecay);
 		RUN_TEST(Test_Vulkan_ProbeReadbackCache);
+		RUN_TEST(Test_Vulkan_ProbeValidation);
 		RUN_TEST(Test_Vulkan_EnergyStopping);
 		return tests_failed ? 1 : 0;
 	}
@@ -2211,8 +2383,10 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_CheckedDimensionsAndIndices);
 	RUN_TEST(Test_Vulkan_BatchingAndProfiling);
 	RUN_TEST(Test_Vulkan_EnergyReduction);
+	RUN_TEST(Test_Vulkan_OptionalResources);
 	RUN_TEST(Test_Vulkan_EnergyDecay);
 	RUN_TEST(Test_Vulkan_ProbeReadbackCache);
+	RUN_TEST(Test_Vulkan_ProbeValidation);
 	RUN_TEST(Test_Vulkan_EnergyStopping);
 	RUN_TEST(Test_Vulkan_FailurePropagation);
 	RUN_TEST(Test_Vulkan_Multigrid_InvalidMetadata);

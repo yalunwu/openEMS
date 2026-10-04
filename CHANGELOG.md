@@ -140,6 +140,10 @@ number moved up and patch releases now have somewhere to go.
 
 ### Fixed
 
+- Validate Vulkan probe indices before registration and CPU mirroring, release
+  partial optional energy allocations immediately, avoid full-field fallback
+  for exact zero energy after stepping, and restore combined field readbacks
+  when readback optimizations are re-enabled.
 - Match CPU pre-update priority when Vulkan PML regions overlap Mur or other
   boundary/material extensions.
 - Keep Vulkan Debye material execution compatible with the coupled pole

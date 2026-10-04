@@ -220,12 +220,14 @@ layout(push_constant) uniform EnergyParams {
 } pc;
 shared ACC electric[256];
 shared ACC magnetic[256];
+shared uint nonzero[256];
 void main() {
     uint lane = gl_LocalInvocationID.x;
     uint group = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
     uint item = group * 256u + lane;
     uint count = pc.extentX * pc.extentY * pc.extentZ;
     precise ACC e = ACC(0), h = ACC(0);
+    uint fieldBits = 0u;
     if (item < count) {
         uint z = item % pc.extentZ;
         uint y = (item / pc.extentZ) % pc.extentY;
@@ -233,23 +235,27 @@ void main() {
         uint index = x * pc.dimY * pc.dimZ + y * pc.dimZ + z;
         for (uint component = 0u; component < 3u; ++component) {
             uint position = index + component * pc.numCells;
+            fieldBits |= (floatBitsToUint(volt[position]) | floatBitsToUint(curr[position])) & 0x7fffffffu;
             precise float ve = volt[position] * volt[position];
             precise float ih = curr[position] * curr[position];
             e += ACC(ve); h += ACC(ih);
         }
     }
     electric[lane] = e; magnetic[lane] = h;
+    nonzero[lane] = fieldBits;
     barrier();
     for (uint stride = 128u; stride > 0u; stride >>= 1u) {
         if (lane < stride) {
             electric[lane] += electric[lane + stride];
             magnetic[lane] += magnetic[lane + stride];
+            nonzero[lane] |= nonzero[lane + stride];
         }
         barrier();
     }
     if (lane == 0u && group < pc.groups) {
-        sums[2u * group] = electric[0];
-        sums[2u * group + 1u] = magnetic[0];
+        sums[3u * group] = electric[0];
+        sums[3u * group + 1u] = magnetic[0];
+        sums[3u * group + 2u] = ACC(nonzero[0] != 0u ? 1 : 0);
     }
 }
 )";

@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <iosfwd>
+#include <utility>
 
 #ifdef ENABLE_VULKAN
 #include <vulkan/vulkan.h>
@@ -67,6 +68,8 @@ public:
 	std::string GetDeviceDescription() const;
 
 private:
+	friend bool Test_Vulkan_OptionalResources();
+
 	struct GridDimensions {
 		uint32_t dimX = 0;
 		uint32_t dimY = 0;
@@ -127,6 +130,15 @@ private:
 		VulkanBuffer(const VulkanBuffer&) = delete;
 		VulkanBuffer& operator=(const VulkanBuffer&) = delete;
 		~VulkanBuffer() { Release(); }
+		void Swap(VulkanBuffer& other)
+		{
+			std::swap(device, other.device);
+			std::swap(buffer, other.buffer);
+			std::swap(memory, other.memory);
+			std::swap(size, other.size);
+			std::swap(memoryProperties, other.memoryProperties);
+			std::swap(mapped, other.mapped);
+		}
 		void Release()
 		{
 			if (device)
@@ -174,6 +186,7 @@ private:
 	VkPipeline m_pipelineProbe = VK_NULL_HANDLE;
 	bool m_energyFloat64 = false;
 	bool AllocateEnergyResources();
+	void DestroyEnergyResources();
 	void RecordProbeGather(VkCommandBuffer cmd);
 
 	VkDescriptorSetLayout m_descLayoutUpml = VK_NULL_HANDLE;
@@ -313,6 +326,7 @@ private:
 	bool InitCommandResources();
 	bool InitializeLevel();
 	bool AllocateBuffers();
+	bool AllocateFieldStagingBuffer();
 	bool AllocateExcitationBuffers();
 	bool AllocateProbeBuffers();
 	bool AllocateUpmlBuffers();
@@ -393,6 +407,7 @@ private:
 		VkDescriptorSet m_descSetProbe = VK_NULL_HANDLE;
 		VulkanBuffer m_bufEnergy;
 		uint32_t m_energyGroups = 0;
+		bool m_energyAvailable = false;
 		VkDescriptorSetLayout m_descLayoutEnergy = VK_NULL_HANDLE;
 		VkPipelineLayout m_pipelineLayoutEnergy = VK_NULL_HANDLE;
 		VkPipeline m_pipelineEnergy = VK_NULL_HANDLE;

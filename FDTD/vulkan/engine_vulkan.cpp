@@ -7,6 +7,7 @@
 #include <chrono>
 #include <limits>
 #include <cmath>
+#include <stdexcept>
 
 #include "FDTD/operator.h"
 #include "FDTD/operator_cylindermultigrid.h"
@@ -87,19 +88,7 @@ bool EngineVulkan::SetReadbackOptimizationsEnabled(bool enabled)
 #ifdef ENABLE_VULKAN
 	if (m_device && changed)
 	{
-		if (!enabled)
-		{
-			// Restore original staging memory/copies for the benchmark reference.
-			DestroyBuffer(m_level->m_bufFieldStaging);
-			if (!CreateBuffer(3ull * m_level->m_grid.numCells * sizeof(float),
-			                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-			                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			                  m_level->m_bufFieldStaging))
-			{
-				ProfileOwner().m_runtimeFailed = true;
-				return false;
-			}
-		}
+		if (!AllocateFieldStagingBuffer()) { ProfileOwner().m_runtimeFailed = true; return false; }
 		if (!AllocateProbeBuffers()) { ProfileOwner().m_runtimeFailed = true; return false; }
 	}
 #endif
@@ -122,7 +111,7 @@ bool EngineVulkan::SupportsFastEnergy() const
 	// SSE CalcFastEnergy includes padded z lanes and ordered FP32 accumulation.
 	// Retain that implementation, including projected root fields in multigrid.
 	const Engine* engine = m_level->m_op ? m_level->m_op->GetEngine() : nullptr;
-	return m_readbackOptimizations && m_device && engine && engine->GetType() == Engine::BASIC &&
+	return m_readbackOptimizations && m_device && engine && engine->GetType() == Engine::BASIC && m_level->m_energyAvailable &&
 	       (!m_level->m_energyGroups || (m_level->m_pipelineEnergy && m_level->m_descSetEnergy && m_level->m_bufEnergy.mapped));
 #else
 	return false;
@@ -170,11 +159,13 @@ bool EngineVulkan::GetFastEnergy(double& energy)
 	if (!WaitForFence()) return false;
 	if (owner.m_profileEnabled) owner.m_profile.energyBytes += m_level->m_bufEnergy.size;
 	double electric = 0, magnetic = 0;
+	bool nonzeroFields = false;
 	const auto* d = static_cast<const double*>(m_level->m_bufEnergy.mapped);
 	const auto* f = static_cast<const float*>(m_level->m_bufEnergy.mapped);
 	for (uint32_t i = 0; i < m_level->m_energyGroups; ++i) {
-		electric += m_energyFloat64 ? d[2u * i] : static_cast<double>(f[2u * i]);
-		magnetic += m_energyFloat64 ? d[2u * i + 1u] : static_cast<double>(f[2u * i + 1u]);
+		electric += m_energyFloat64 ? d[3u * i] : static_cast<double>(f[3u * i]);
+		magnetic += m_energyFloat64 ? d[3u * i + 1u] : static_cast<double>(f[3u * i + 1u]);
+		nonzeroFields |= (m_energyFloat64 ? d[3u * i + 2u] : static_cast<double>(f[3u * i + 2u])) != 0;
 	}
 	energy = EPS0 * electric + MUE0 * magnetic;
 	// Preserve the CPU's non-finite/overflow behavior through its existing path.
@@ -183,9 +174,8 @@ bool EngineVulkan::GetFastEnergy(double& energy)
 	// is bounded by the number of products times FLT_MIN and the energy weights.
 	const double denormalBound = 3.0 * m_level->m_grid.numCells * std::numeric_limits<float>::min() * (EPS0 + MUE0);
 	if (energy > 0 && energy < denormalBound / (m_energyFloat64 ? 1e-12 : 3e-7)) return false;
-	if (energy == 0 && (!m_level->m_hostFieldsValid ||
-	    std::any_of(m_level->m_hostVolt.begin(), m_level->m_hostVolt.end(), [](float value) { return value != 0; }) ||
-	    std::any_of(m_level->m_hostCurr.begin(), m_level->m_hostCurr.end(), [](float value) { return value != 0; }))) return false;
+	// A GPU-side bit check distinguishes exact zero from underflow without a field download.
+	if (energy == 0 && nonzeroFields) return false;
 	m_level->m_cachedEnergy = energy;
 	m_level->m_energyValid = true;
 	return true;
@@ -757,6 +747,26 @@ void EngineVulkan::DestroyBuffer(VulkanBuffer& buf)
 	buf.Release();
 }
 
+bool EngineVulkan::AllocateFieldStagingBuffer()
+{
+	const VkDeviceSize fieldBytes = 3ull * m_level->m_grid.numCells * sizeof(float);
+	const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	const VkMemoryPropertyFlags memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	VulkanBuffer replacement;
+	if (CreateBuffer((m_readbackOptimizations ? 2u : 1u) * fieldBytes, usage, memory, replacement))
+	{
+		replacement.Swap(m_level->m_bufFieldStaging);
+		return true;
+	}
+	if (!m_readbackOptimizations) return false;
+	replacement.Release();
+	// Re-enabling must keep a working single-field buffer if the larger allocation fails.
+	if (m_level->m_bufFieldStaging.mapped && m_level->m_bufFieldStaging.size >= fieldBytes) return true;
+	if (!CreateBuffer(fieldBytes, usage, memory, replacement)) return false;
+	replacement.Swap(m_level->m_bufFieldStaging);
+	return true;
+}
+
 VkShaderModule EngineVulkan::CreateShaderModule(const std::vector<uint32_t>& spirv)
 {
 	if (spirv.empty()) return VK_NULL_HANDLE;
@@ -933,14 +943,7 @@ bool EngineVulkan::AllocateBuffers()
 	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVolt)) return false;
 	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufCurr)) return false;
 
-	// Prefer two fields per transfer; retain the smaller staging allocation if needed.
-	const VkBufferUsageFlags stagingUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	const VkMemoryPropertyFlags stagingMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	if (!CreateBuffer((m_readbackOptimizations ? 2 : 1) * fieldBytes, stagingUsage, stagingMemory, m_level->m_bufFieldStaging))
-	{
-		DestroyBuffer(m_level->m_bufFieldStaging);
-		if (!m_readbackOptimizations || !CreateBuffer(fieldBytes, stagingUsage, stagingMemory, m_level->m_bufFieldStaging)) return false;
-	}
+	if (!AllocateFieldStagingBuffer()) return false;
 
 	// Upload initial material coefficient matrices if operator is present
 	if (m_level->m_op)
@@ -1805,15 +1808,23 @@ bool EngineVulkan::AllocateEnergyResources()
 {
 	const Engine* engine = m_level->m_op ? m_level->m_op->GetEngine() : nullptr;
 	if (!engine || engine->GetType() != Engine::BASIC) return true;
+	struct AllocationGuard {
+		EngineVulkan* engine;
+		bool committed;
+		~AllocationGuard() { if (!committed) engine->DestroyEnergyResources(); }
+	} guard = {this, false};
 	const auto& g = m_level->m_grid;
 	const uint64_t cells = uint64_t(g.dimX - 1u) * (g.dimY - 1u) * (g.dimZ - 1u);
 	m_level->m_energyGroups = static_cast<uint32_t>((cells + 255u) / 256u);
-	if (!m_level->m_energyGroups) return true;
+	if (!m_level->m_energyGroups) {
+		m_level->m_energyAvailable = guard.committed = true;
+		return true;
+	}
 	VkPhysicalDeviceProperties props = {};
 	vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
 	const uint32_t gx = std::min(m_level->m_energyGroups, props.limits.maxComputeWorkGroupCount[0]);
 	if ((m_level->m_energyGroups + gx - 1u) / gx > props.limits.maxComputeWorkGroupCount[1]) return false;
-	const VkDeviceSize bytes = uint64_t(m_level->m_energyGroups) * 2u * (m_energyFloat64 ? sizeof(double) : sizeof(float));
+	const VkDeviceSize bytes = uint64_t(m_level->m_energyGroups) * 3u * (m_energyFloat64 ? sizeof(double) : sizeof(float));
 	if (!CreateBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
 	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, m_level->m_bufEnergy)) return false;
 	std::string source(VulkanShaders::kShaderFastEnergy);
@@ -1821,7 +1832,7 @@ bool EngineVulkan::AllocateEnergyResources()
 	const auto spirv = CompileGLSLToSpirv(source, shaderc_glsl_compute_shader, "fast_energy.comp");
 	VkShaderModule module = CreateShaderModule(spirv);
 	if (!module) return false;
-	struct ModuleGuard { VkDevice device; VkShaderModule module; ~ModuleGuard() { vkDestroyShaderModule(device, module, nullptr); } } guard = {m_device, module};
+	struct ModuleGuard { VkDevice device; VkShaderModule module; ~ModuleGuard() { vkDestroyShaderModule(device, module, nullptr); } } moduleGuard = {m_device, module};
 	VkDescriptorSetLayoutBinding bindings[3] = {};
 	for (uint32_t i = 0; i < 3u; ++i) {
 		bindings[i].binding = i;
@@ -1872,8 +1883,24 @@ bool EngineVulkan::AllocateEnergyResources()
 		writes[i].pBufferInfo = &info[i];
 	}
 	vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+	m_level->m_energyAvailable = guard.committed = true;
 	std::cout << "[openEMS Vulkan] Fast energy uses " << (m_energyFloat64 ? "FP64" : "FP32") << " partial sums and CPU double accumulation." << std::endl;
 	return true;
+}
+
+void EngineVulkan::DestroyEnergyResources()
+{
+	DestroyBuffer(m_level->m_bufEnergy);
+	if (m_level->m_pipelineEnergy) vkDestroyPipeline(m_device, m_level->m_pipelineEnergy, nullptr);
+	if (m_level->m_pipelineLayoutEnergy) vkDestroyPipelineLayout(m_device, m_level->m_pipelineLayoutEnergy, nullptr);
+	if (m_level->m_descLayoutEnergy) vkDestroyDescriptorSetLayout(m_device, m_level->m_descLayoutEnergy, nullptr);
+	m_level->m_pipelineEnergy = VK_NULL_HANDLE;
+	m_level->m_pipelineLayoutEnergy = VK_NULL_HANDLE;
+	m_level->m_descLayoutEnergy = VK_NULL_HANDLE;
+	// Sets are owned by the descriptor pool; allocation is the last fallible step.
+	m_level->m_descSetEnergy = VK_NULL_HANDLE;
+	m_level->m_energyGroups = 0;
+	m_level->m_energyAvailable = m_level->m_energyValid = false;
 }
 
 void EngineVulkan::RecordProbeGather(VkCommandBuffer cmd)
@@ -3509,19 +3536,21 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 #ifdef ENABLE_VULKAN
 	if (m_device && !ProfileOwner().Synchronize()) return;
 #endif
-	m_level->m_probesValid = false;
-	m_level->m_pa = pa;
-	m_level->m_probePoints.clear();
-	if (!m_level->m_pa) {
-#ifdef ENABLE_VULKAN
-		if (m_device) AllocateProbeBuffers();
-#endif
-		return;
-	}
+	std::vector<ProbePoint> points;
+	auto appendPoint = [&](unsigned int component, unsigned int x, unsigned int y, unsigned int z, uint32_t fieldType) {
+		const size_t index = GetLinearIndex(component, x, y, z);
+		if (index == static_cast<size_t>(-1) || index > UINT32_MAX)
+			throw std::out_of_range("[openEMS Vulkan] Probe index is outside the field grid");
+		points.push_back({static_cast<uint32_t>(index), fieldType});
+	};
+	auto validatePosition = [&](const unsigned int* position) {
+		if (GetLinearIndex(0, position[0], position[1], position[2]) == static_cast<size_t>(-1))
+			throw std::out_of_range("[openEMS Vulkan] Probe coordinate is outside the field grid");
+	};
 
-	for (size_t i = 0; i < m_level->m_pa->GetNumberOfProcessings(); ++i)
+	for (size_t i = 0; pa && i < pa->GetNumberOfProcessings(); ++i)
 	{
-		Processing* proc = const_cast<ProcessingArray*>(m_level->m_pa)->GetProcessing(i);
+		Processing* proc = const_cast<ProcessingArray*>(pa)->GetProcessing(i);
 		if (!proc || !proc->GetEnable()) continue;
 
 		ProcessVoltage* pv = dynamic_cast<ProcessVoltage*>(proc);
@@ -3529,6 +3558,8 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 		{
 			const unsigned int* start = pv->GetStartCoord();
 			const unsigned int* stop = pv->GetStopCoord();
+			validatePosition(start);
+			validatePosition(stop);
 			for (int n = 0; n < 3; ++n)
 			{
 				if (start[n] < stop[n])
@@ -3536,8 +3567,7 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 					unsigned int pos[3] = {start[0], start[1], start[2]};
 					for (; pos[n] < stop[n]; ++pos[n])
 					{
-						size_t idx = GetLinearIndex(n, pos[0], pos[1], pos[2]);
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(idx), 0u});
+						appendPoint(n, pos[0], pos[1], pos[2], 0u);
 					}
 				}
 				else if (start[n] > stop[n])
@@ -3545,8 +3575,7 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 					unsigned int pos[3] = {stop[0], stop[1], stop[2]};
 					for (; pos[n] < start[n]; ++pos[n])
 					{
-						size_t idx = GetLinearIndex(n, pos[0], pos[1], pos[2]);
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(idx), 0u});
+						appendPoint(n, pos[0], pos[1], pos[2], 0u);
 					}
 				}
 			}
@@ -3558,53 +3587,57 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 		{
 			const unsigned int* start = pc->GetStartCoord();
 			const unsigned int* stop = pc->GetStopCoord();
+			validatePosition(start);
+			validatePosition(stop);
 			const bool* m_start_inside = pc->GetStartInside();
 			const bool* m_stop_inside = pc->GetStopInside();
 			int m_normDir = pc->GetNormalDir();
+			if (m_normDir < 0 || m_normDir >= 3)
+				throw std::out_of_range("[openEMS Vulkan] Invalid current probe normal direction");
 
 			switch (m_normDir)
 			{
 			case 0:
 				if (m_stop_inside[0] && m_start_inside[2])
 					for (unsigned int k = start[1] + 1; k <= stop[1]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(1, stop[0], k, start[2])), 1u});
+						appendPoint(1, stop[0], k, start[2], 1u);
 				if (m_stop_inside[0] && m_stop_inside[1])
 					for (unsigned int k = start[2] + 1; k <= stop[2]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(2, stop[0], stop[1], k)), 1u});
+						appendPoint(2, stop[0], stop[1], k, 1u);
 				if (m_start_inside[0] && m_stop_inside[2])
 					for (unsigned int k = start[1] + 1; k <= stop[1]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(1, start[0], k, stop[2])), 1u});
+						appendPoint(1, start[0], k, stop[2], 1u);
 				if (m_start_inside[0] && m_start_inside[1])
 					for (unsigned int k = start[2] + 1; k <= stop[2]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(2, start[0], start[1], k)), 1u});
+						appendPoint(2, start[0], start[1], k, 1u);
 				break;
 			case 1:
 				if (m_start_inside[0] && m_start_inside[1])
 					for (unsigned int k = start[2] + 1; k <= stop[2]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(2, start[0], start[1], k)), 1u});
+						appendPoint(2, start[0], start[1], k, 1u);
 				if (m_stop_inside[1] && m_stop_inside[2])
 					for (unsigned int k = start[0] + 1; k <= stop[0]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(0, k, stop[1], stop[2])), 1u});
+						appendPoint(0, k, stop[1], stop[2], 1u);
 				if (m_stop_inside[0] && m_stop_inside[1])
 					for (unsigned int k = start[2] + 1; k <= stop[2]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(2, stop[0], stop[1], k)), 1u});
+						appendPoint(2, stop[0], stop[1], k, 1u);
 				if (m_start_inside[1] && m_start_inside[2])
 					for (unsigned int k = start[0] + 1; k <= stop[0]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(0, k, start[1], start[2])), 1u});
+						appendPoint(0, k, start[1], start[2], 1u);
 				break;
 			case 2:
 				if (m_start_inside[1] && m_start_inside[2])
 					for (unsigned int k = start[0] + 1; k <= stop[0]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(0, k, start[1], start[2])), 1u});
+						appendPoint(0, k, start[1], start[2], 1u);
 				if (m_stop_inside[0] && m_start_inside[2])
 					for (unsigned int k = start[1] + 1; k <= stop[1]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(1, stop[0], k, start[2])), 1u});
+						appendPoint(1, stop[0], k, start[2], 1u);
 				if (m_stop_inside[1] && m_stop_inside[2])
 					for (unsigned int k = start[0] + 1; k <= stop[0]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(0, k, stop[1], stop[2])), 1u});
+						appendPoint(0, k, stop[1], stop[2], 1u);
 				if (m_start_inside[0] && m_stop_inside[2])
 					for (unsigned int k = start[1] + 1; k <= stop[1]; ++k)
-						m_level->m_probePoints.push_back({static_cast<uint32_t>(GetLinearIndex(1, start[0], k, stop[2])), 1u});
+						appendPoint(1, start[0], k, stop[2], 1u);
 				break;
 			}
 			continue;
@@ -3617,14 +3650,13 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 			uint32_t isCurr = (pfp->GetFieldType() == 1 ? 1u : 0u);
 			for (unsigned int n = 0; n < 3; ++n)
 			{
-				size_t idx = GetLinearIndex(n, start[0], start[1], start[2]);
-				m_level->m_probePoints.push_back({static_cast<uint32_t>(idx), isCurr});
+				appendPoint(n, start[0], start[1], start[2], isCurr);
 			}
 			continue;
 		}
 	}
 
-	if (m_level->m_op)
+	if (pa && m_level->m_op)
 	{
 		for (size_t i = 0; i < m_level->m_op->GetNumberOfExtentions(); ++i)
 		{
@@ -3637,29 +3669,30 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 					unsigned int pos[3];
 					ss->GetEProbePos(n, pos);
 					unsigned int dir = ss->GetEProbeDir(n);
-					size_t idx = GetLinearIndex(dir, pos[0], pos[1], pos[2]);
-					m_level->m_probePoints.push_back({static_cast<uint32_t>(idx), 0u});
+					appendPoint(dir, pos[0], pos[1], pos[2], 0u);
 				}
 				for (size_t n = 0; n < ss->GetNumberOfHProbes(); ++n)
 				{
 					unsigned int pos[3];
 					ss->GetHProbePos(n, pos);
 					unsigned int dir = ss->GetHProbeDir(n);
-					size_t idx = GetLinearIndex(dir, pos[0], pos[1], pos[2]);
-					m_level->m_probePoints.push_back({static_cast<uint32_t>(idx), 1u});
+					appendPoint(dir, pos[0], pos[1], pos[2], 1u);
 				}
 			}
 		}
 	}
 
 	// Sort and deduplicate probe points
-	std::sort(m_level->m_probePoints.begin(), m_level->m_probePoints.end(), [](const ProbePoint& a, const ProbePoint& b) {
+	std::sort(points.begin(), points.end(), [](const ProbePoint& a, const ProbePoint& b) {
 		if (a.field_type != b.field_type) return a.field_type < b.field_type;
 		return a.linear_index < b.linear_index;
 	});
-	m_level->m_probePoints.erase(std::unique(m_level->m_probePoints.begin(), m_level->m_probePoints.end(), [](const ProbePoint& a, const ProbePoint& b) {
+	points.erase(std::unique(points.begin(), points.end(), [](const ProbePoint& a, const ProbePoint& b) {
 		return a.field_type == b.field_type && a.linear_index == b.linear_index;
-	}), m_level->m_probePoints.end());
+	}), points.end());
+	m_level->m_probePoints.swap(points);
+	m_level->m_pa = pa;
+	m_level->m_probesValid = false;
 
 	if (!m_level->m_probePoints.empty())
 	{
@@ -4439,6 +4472,11 @@ bool EngineVulkan::SyncProbesToHost()
 		uint32_t linIdx = m_level->m_probePoints[i].linear_index;
 		uint32_t fType  = m_level->m_probePoints[i].field_type;
 		float val = values[i];
+		if (linIdx >= m_level->m_hostVolt.size() || linIdx >= m_level->m_hostCurr.size() || fType > 1u)
+		{
+			owner.m_runtimeFailed = true;
+			return false;
+		}
 
 		if (fType == 1u)
 		{
@@ -4681,13 +4719,7 @@ void EngineVulkan::Reset()
 		DestroyBuffer(m_level->m_bufExcSignals);
 		DestroyBuffer(m_level->m_bufProbePoints);
 		DestroyBuffer(m_level->m_bufProbeValues);
-		DestroyBuffer(m_level->m_bufEnergy);
-		if (m_level->m_pipelineEnergy) vkDestroyPipeline(m_device, m_level->m_pipelineEnergy, nullptr);
-		if (m_level->m_pipelineLayoutEnergy) vkDestroyPipelineLayout(m_device, m_level->m_pipelineLayoutEnergy, nullptr);
-		if (m_level->m_descLayoutEnergy) vkDestroyDescriptorSetLayout(m_device, m_level->m_descLayoutEnergy, nullptr);
-		m_level->m_pipelineEnergy = VK_NULL_HANDLE;
-		m_level->m_pipelineLayoutEnergy = VK_NULL_HANDLE;
-		m_level->m_descLayoutEnergy = VK_NULL_HANDLE;
+		DestroyEnergyResources();
 
 		DestroyBuffer(m_level->m_bufUpmlIndices);
 		DestroyBuffer(m_level->m_bufUpmlVoltCoeffs);
