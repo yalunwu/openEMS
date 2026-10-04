@@ -237,9 +237,12 @@ if(BUILD_TESTING)
   ADD_EXECUTABLE( test_backend test_backend.cpp test_vulkan_performance.cpp )
   TARGET_LINK_LIBRARIES( test_backend openEMS ${CSXCAD_LIBRARIES} ${VULKAN_LIBRARIES} )
   ADD_TEST(NAME backend COMMAND test_backend)
-  ADD_TEST(NAME vulkan-batch-zero COMMAND openEMS_bin --vulkan-batch-size=0)
-  ADD_TEST(NAME vulkan-batch-large COMMAND openEMS_bin --vulkan-batch-size=65)
-  SET_TESTS_PROPERTIES(vulkan-batch-zero vulkan-batch-large PROPERTIES WILL_FAIL TRUE)
+  ADD_TEST(NAME vulkan-batch-zero COMMAND ${CMAKE_COMMAND}
+    "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>" -DBATCH_SIZE=0
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_batch_rejection.cmake)
+  ADD_TEST(NAME vulkan-batch-large COMMAND ${CMAKE_COMMAND}
+    "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>" -DBATCH_SIZE=65
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_batch_rejection.cmake)
 endif()
  
 if (WIN32)
