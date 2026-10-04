@@ -584,7 +584,7 @@ cdef class openEMS:
 
     def _SetLibraryArguments(self, arguments):
         allOptions = []
-        integerOptions = ["verbose", "numthreads"]
+        integerOptions = ["verbose", "numthreads", "vulkan-batch-size"]
 
         for key, val in arguments.items():
             key = key.replace("_", "-")
@@ -675,6 +675,10 @@ cdef class openEMS:
           for debugging
         * nativeFieldDumps (bool) - dump all fields using the native field
           components
+        * vulkan_batch_size (int) - maximum timesteps per Vulkan submission,
+          from 1 to 64 (default 32); processing intervals still limit advancement
+        * vulkan_profile (bool) - report CPU timings, sampled GPU timings and
+          submission/transfer counts; disabled by default
         """
         # a relative sim_path would be resolved against itself after the chdir below
         sim_path = os.path.abspath(sim_path)

@@ -25,6 +25,8 @@ function RunOpenEMS(Sim_Path, Sim_File, opts, Settings)
 %          --engine=sse-compressed  engine using compressed operator + sse vector extensions
 %          --engine=multithreaded   engine using compressed operator + sse vector extensions + multithreading
 %      --numThreads=<n>     Force use n threads for multithreaded engine
+%      --vulkan-batch-size=<n>  Maximum timesteps per Vulkan submission (1..64, default 32)
+%      --vulkan-profile        Report Vulkan CPU/GPU timings and submission/transfer counts
 %      --no-simulation      only run preprocessing; do not simulate
 %      --dump-statistics    dump simulation statistics to 'openEMS_run_stats.txt' and 'openEMS_stats.txt'
 %

@@ -19,6 +19,10 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Vulkan profiling with `--vulkan-profile`, plus a native benchmark matrix
+  (`test_backend --vulkan-benchmark`) with batch-size sweeps and CSV output.
+- A scalable Python dipole-array tutorial with 5.5M, 19.4M and 41.8M solver
+  cell presets, CPU/Vulkan selection, fixed-step runs and optional far-field output.
 - **SAR calculation reworked**, following IEEE/IEC 62704-1: averaging is done
   once for all frequencies instead of per frequency, and is multi-threaded,
   together giving a large speedup. The new `--autorange` option restricts the
@@ -88,6 +92,8 @@ number moved up and patch releases now have somewhere to go.
 
 ### Changed
 
+- Vulkan records up to 32 timesteps per submission. `--vulkan-batch-size=1..64`
+  overrides the limit; probe, dump and stopping schedules still bound advancement.
 - **The MPI engine was removed.** It had not compiled for years, as it used
   the C++ MPI bindings that MPI-3 dropped, it had no tests, and several
   extensions never supported it (#260). The multithreaded engine is
@@ -130,6 +136,8 @@ number moved up and patch releases now have somewhere to go.
 
 ### Fixed
 
+- Match CPU pre-update priority when Vulkan PML regions overlap Mur or other
+  boundary/material extensions.
 - Keep Vulkan Debye material execution compatible with the coupled pole
   capacitor update, including multi-pole materials and cylindrical multigrid.
 

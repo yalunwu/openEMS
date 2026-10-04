@@ -5,6 +5,9 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <array>
+#include <cstdint>
+#include <iosfwd>
 
 #ifdef ENABLE_VULKAN
 #include <vulkan/vulkan.h>
@@ -36,6 +39,27 @@ public:
 	std::string GetBackendName() const override;
 
 	static bool CheckModelSupport(const Operator* op, const ContinuousStructure* csx, std::string& unsupportedReason);
+
+	enum GpuProfileCategory { ProfileBatch, ProfileVoltage, ProfileCurrent,
+	                          ProfileExtension, ProfileMultigrid, ProfileProbe,
+	                          ProfileReadback, ProfileCategoryCount };
+	struct ProfileStatistics {
+		uint64_t submissions = 0, dispatches = 0, timesteps = 0, sampledSteps = 0;
+		uint64_t uploadedBytes = 0, downloadedBytes = 0, probeBytes = 0;
+		double recordSeconds = 0, submitSeconds = 0, waitSeconds = 0;
+		double readbackSeconds = 0, mirrorSeconds = 0;
+		std::array<double, ProfileCategoryCount> gpuSeconds = {};
+		std::array<uint64_t, ProfileCategoryCount> gpuSamples = {};
+	};
+	bool SetBatchSize(unsigned int size); // 1..64; does not change processing intervals
+	unsigned int GetBatchSize() const { return m_batchSize; }
+	bool SetProfilingEnabled(bool enabled);
+	bool IsProfilingEnabled() const { return m_profileEnabled; }
+	bool Synchronize(); // wait for stepping without downloading fields
+	bool ClearProfile();
+	ProfileStatistics GetProfile(); // collects only available timestamp results
+	void WriteProfile(std::ostream& stream);
+	std::string GetDeviceDescription() const;
 
 private:
 	struct GridDimensions {
@@ -69,7 +93,28 @@ private:
 		uint32_t field_type; // 0 = volt, 1 = curr
 	};
 	std::string m_deviceName = "Vulkan GPU";
+	unsigned int m_batchSize = 32;
+	bool m_profileEnabled = false;
+	ProfileStatistics m_profile;
 #ifdef ENABLE_VULKAN
+	struct ProfileSpan { uint32_t first; GpuProfileCategory category; };
+	VkQueryPool m_queryPool = VK_NULL_HANDLE;
+	std::array<ProfileSpan, 256> m_profileSpans;
+	uint32_t m_profileSpanCount = 0, m_queryCount = 0, m_timestampBits = 0;
+	float m_timestampPeriod = 0;
+	bool m_queriesPending = false, m_sampleDispatches = false, m_runtimeFailed = false;
+	EngineVulkan& ProfileOwner();
+	bool InitProfiling();
+	void CollectProfile();
+	void BeginProfileCommands(VkCommandBuffer cmd);
+	uint32_t BeginGpuSpan(VkCommandBuffer cmd, GpuProfileCategory category);
+	void EndGpuSpan(VkCommandBuffer cmd, uint32_t first);
+	void Dispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z,
+	              GpuProfileCategory category = ProfileExtension);
+	void CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst,
+	                const VkBufferCopy& region, bool download = false);
+	bool WaitForFence();
+	bool SubmitCommandBuffer();
 	struct VulkanBuffer {
 		VulkanBuffer() = default;
 		VulkanBuffer(const VulkanBuffer&) = delete;
@@ -279,10 +324,10 @@ private:
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
 	VkShaderModule CreateShaderModule(const std::vector<uint32_t>& spirv);
 
-	void RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc);
-	void RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc);
-	void RecordVoltageHierarchy(VkCommandBuffer cmd);
-	void RecordCurrentHierarchy(VkCommandBuffer cmd);
+	void RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsigned int timestep);
+	void RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsigned int timestep);
+	void RecordVoltageHierarchy(VkCommandBuffer cmd, unsigned int timestep);
+	void RecordCurrentHierarchy(VkCommandBuffer cmd, unsigned int timestep);
 	void RecordProjectionHierarchy(VkCommandBuffer cmd);
 	void RecordMultigridTransfer(VkCommandBuffer cmd, uint32_t mode, uint32_t radialCount);
 	void MarkHierarchyHostInvalid();

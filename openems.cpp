@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <iostream>
 #include <fstream>
+#include <stdexcept>
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "FDTD/operator_cylinder.h"
@@ -269,6 +270,20 @@ void openEMS::collectCommandLineArguments()
 			"  multithreaded: \tengine using compressed "
 			"operator + sse vector extensions + multithreading\n"
 			"  vulkan/gpu: \tGPU-accelerated engine (Vulkan 1.2 compute) with CPU fallback\n"
+		)
+		(
+			"vulkan-batch-size",
+			po::value<unsigned int>()->default_value(32)->notifier([&](unsigned int val) {
+				if (val == 0u || val > 64u)
+					throw std::invalid_argument("vulkan-batch-size must be between 1 and 64");
+				m_vulkanBatchSize = val;
+			}),
+			"Maximum Vulkan timesteps per submission (1..64; default 32)"
+		)
+		(
+			"vulkan-profile",
+			po::bool_switch()->notifier([&](bool val) { m_vulkanProfile = val; }),
+			"Report Vulkan CPU timings, sampled GPU timings and transfer/submission counts"
 		)
 		(
 			"numThreads",
@@ -1384,6 +1399,8 @@ int openEMS::SetupFDTD()
 		if (EngineVulkan::CheckModelSupport(FDTD_Op, m_CSX, unsupportedReason))
 		{
 			std::unique_ptr<EngineVulkan> vulkanBackend(new EngineVulkan(FDTD_Op));
+			vulkanBackend->SetBatchSize(m_vulkanBatchSize);
+			vulkanBackend->SetProfilingEnabled(m_vulkanProfile);
 			if (vulkanBackend->Initialize())
 			{
 				m_EngineBackend = std::move(vulkanBackend);
@@ -1484,6 +1501,9 @@ void openEMS::RunFDTD()
 	cout << "Running FDTD engine... this may take a while... grab a cup of coffee?!?" << endl;
 
 	Signal::SetupHandlerForSIGINT(SIGNAL_EXIT_GRACEFUL);
+	struct RestoreSignal {
+		~RestoreSignal() { Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL); }
+	} restoreSignal;
 
 	//special handling of a field processing, needed to realize the end criteria...
 	ProcessFields* ProcField = new ProcessFields(NewEngineInterface());
@@ -1533,7 +1553,8 @@ void openEMS::RunFDTD()
 	{
 		if (vulkanBackend)
 		{
-			m_EngineBackend->IterateTS(step);
+			if (!m_EngineBackend->IterateTS(step))
+				throw std::runtime_error("Vulkan timestep execution failed");
 			FDTD_Eng->SetNumberOfTimesteps(m_EngineBackend->GetNumberOfTimesteps());
 		}
 		else
@@ -1576,10 +1597,11 @@ void openEMS::RunFDTD()
 				}
 			}
 
-			if (needFullField)
-				vulkanBackend->SyncFieldsToHost();
+			if (needFullField && !vulkanBackend->SyncFieldsToHost())
+				throw std::runtime_error("Vulkan field synchronization failed");
 
-			vulkanBackend->SyncProbesToHost();
+			if (!vulkanBackend->SyncProbesToHost())
+				throw std::runtime_error("Vulkan probe synchronization failed");
 
 			if (Eng_Ext_SSD)
 			{
@@ -1649,6 +1671,9 @@ void openEMS::RunFDTD()
 				FDTD_Eng->NextInterval(speed);
 		}
 	}
+	// Complete pending GPU work before reporting successful execution or timing.
+	if (vulkanBackend && !vulkanBackend->SyncFieldsToHost())
+		throw std::runtime_error("Vulkan final field synchronization failed");
 	if ((change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))
 		cerr << "RunFDTD: Warning: Max. number of timesteps was reached before the end-criteria of -" << fabs(10.0*log10(endCrit)) << "dB was reached... " << endl << \
 				"\tYou may want to choose a higher number of max. timesteps... " << endl;
@@ -1666,12 +1691,10 @@ void openEMS::RunFDTD()
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
 
 	//*************** postproc ************//
-	if (vulkanBackend)
-		vulkanBackend->SyncFieldsToHost();
-
 	PA->PostProcess();
+	if (vulkanBackend && vulkanBackend->IsProfilingEnabled())
+		vulkanBackend->WriteProfile(cout);
 
-	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
 }
 
 bool openEMS::DumpStatistics(const string& filename, double time)

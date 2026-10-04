@@ -16,6 +16,9 @@
 #include <cstdio>
 #include <chrono>
 #include <limits>
+#include <sstream>
+#include <stdexcept>
+#include "test_vulkan_performance.h"
 
 #include "openems.h"
 #include "FDTD/engine_backend.h"
@@ -519,6 +522,7 @@ public:
 	Engine* GetEng() { return FDTD_Eng; }
 	EngineBackend* GetBackend() { return m_EngineBackend.get(); }
 	Engine_Ext_SteadyState* GetSteadyStateDetector() { return Eng_Ext_SSD; }
+	void ReplaceBackend(std::unique_ptr<EngineBackend> backend) { m_EngineBackend = std::move(backend); }
 };
 
 static ContinuousStructure* CreateCustomGrid(int nx, int ny, int nz)
@@ -1582,7 +1586,7 @@ static bool RunMultigridEquivalence(const std::vector<double>& splits, bool open
 	fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1"});
 	fdtd.SetCylinderCoords(true);
 	fdtd.SetupCylinderMultiGrid(splits);
-	fdtd.SetNumberOfTimeSteps(80);
+	fdtd.SetNumberOfTimeSteps(160);
 	fdtd.SetGaussExcite(20e9, 10e9);
 	fdtd.SetCSX(csx);
 	fdtd.SetEnableDumps(false);
@@ -1617,7 +1621,7 @@ static bool RunMultigridEquivalence(const std::vector<double>& splits, bool open
 	}
 
 	// Distinct batches check projection and continuation, including every child.
-	const unsigned int batches[3] = {1, 7, 19};
+	const unsigned int batches[] = {1, 7, 19, 33, 65};
 	unsigned int completed = 0;
 	for (unsigned int batch : batches)
 	{
@@ -1711,6 +1715,125 @@ bool Test_Vulkan_Multigrid_Debye() { return RunMultigridEquivalence({12.0, 24.0}
 bool Test_Vulkan_Multigrid_Reset() { return RunMultigridEquivalence({12.0, 24.0}, false, false, false, true); }
 bool Test_Vulkan_Multigrid_FiveLevels() { return RunMultigridEquivalence({8.0, 16.0, 24.0, 32.0}); }
 
+bool Test_Vulkan_BatchingAndProfiling()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (unsigned int size : {1u, 8u, 16u, 32u, 64u})
+	{
+		ContinuousStructure* csx = CreateCustomGrid(35, 23, 41);
+		auto* excitation = new CSPropExcitation(csx->GetParameterSet());
+		excitation->SetExcitType(0);
+		excitation->SetExcitation(1.0, 2);
+		excitation->SetDelay(5e-12);
+		auto* box = new CSPrimBox(csx->GetParameterSet(), excitation);
+		for (int i = 0; i < 6; ++i) box->SetCoord(i, i % 2 ? 2.0 : -2.0);
+		csx->AddProperty(excitation);
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1", "--vulkan-profile",
+		                          "--vulkan-batch-size=" + std::to_string(size)});
+		fdtd.SetCSX(csx);
+		fdtd.SetNumberOfTimeSteps(200);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetEnableDumps(false);
+		fdtd.Set_BC_Type(0, 2);
+		fdtd.Set_BC_PML(3, 4);
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Batching setup failed");
+		auto* gpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+		TEST_ASSERT(gpu && gpu->GetBatchSize() == size && gpu->IsProfilingEnabled(), "Vulkan options were not applied");
+		TEST_ASSERT(!gpu->SetBatchSize(0) && !gpu->SetBatchSize(65), "Invalid batch sizes must be rejected");
+		TEST_ASSERT(gpu->ClearProfile(), "Profile reset failed");
+		const unsigned int batches[] = {0, 1, 7, 33, 65};
+		unsigned int completed = 0;
+		for (unsigned int count : batches)
+		{
+			TEST_ASSERT(fdtd.GetEng()->IterateTS(count), "CPU reference failed");
+			std::vector<float> reference;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int x = 0; x < 35; ++x)
+			for (unsigned int y = 0; y < 23; ++y)
+			for (unsigned int z = 0; z < 41; ++z) {
+				reference.push_back(fdtd.GetEng()->GetVolt(n, x, y, z));
+				reference.push_back(fdtd.GetEng()->GetCurr(n, x, y, z));
+			}
+			TEST_ASSERT(gpu->IterateTS(count) && gpu->Synchronize(), "Batched stepping failed");
+			completed += count;
+			const auto profile = gpu->GetProfile();
+			TEST_ASSERT(profile.timesteps == count && profile.submissions == (count + size - 1u) / size, "Unexpected timestep submission count");
+			TEST_ASSERT(profile.downloadedBytes == 0, "Stepping unexpectedly downloaded fields");
+			TEST_ASSERT(std::isfinite(profile.recordSeconds) && std::isfinite(profile.waitSeconds), "Non-finite CPU profiling result");
+			if (profile.gpuSamples[EngineVulkan::ProfileBatch]) {
+				TEST_ASSERT(profile.gpuSamples[EngineVulkan::ProfileBatch] == profile.submissions, "Timestamp results were lost between submissions");
+				TEST_ASSERT(std::isfinite(profile.gpuSeconds[EngineVulkan::ProfileBatch]) && profile.gpuSeconds[EngineVulkan::ProfileBatch] > 0, "Invalid GPU timing result");
+			}
+			TEST_ASSERT(gpu->SyncFieldsToHost(), "Field readback failed");
+			size_t index = 0;
+			float error = 0, peak = 0;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int x = 0; x < 35; ++x)
+			for (unsigned int y = 0; y < 23; ++y)
+			for (unsigned int z = 0; z < 41; ++z) {
+				for (float value : {gpu->GetVolt(n, x, y, z), gpu->GetCurr(n, x, y, z)}) {
+					TEST_ASSERT(std::isfinite(value), "Non-finite batched field");
+					peak = std::max(peak, std::abs(reference[index]));
+					error = std::max(error, std::abs(value - reference[index++]));
+				}
+			}
+			std::cout << "Batch size=" << size << " count=" << count << " maxError=" << error << " peak=" << peak << std::endl;
+			TEST_ASSERT(error < 1e-4f && error <= peak * 0.001f, "Batched fields differ from CPU by more than 1e-4 / 0.1%");
+			if (count > 1u) TEST_ASSERT(peak > 0.0f, "Excited reference field is zero");
+			TEST_ASSERT(gpu->GetNumberOfTimesteps() == completed, "Published timestep is incorrect");
+			// Readback has its own submissions; start a fresh measurement interval.
+			TEST_ASSERT(gpu->ClearProfile(), "Could not clear readback statistics");
+		}
+		const unsigned int ts = gpu->GetNumberOfTimesteps();
+		TEST_ASSERT(!gpu->IterateTS(UINT32_MAX) && gpu->GetNumberOfTimesteps() == ts, "Overflow advanced the hierarchy");
+		gpu->SetVolt(2, 17, 11, 20, 0.125f);
+		fdtd.GetEng()->SetVolt(2, 17, 11, 20, 0.125f);
+		TEST_ASSERT(fdtd.GetEng()->IterateTS(1), "Edited CPU iteration failed");
+		const float expected = fdtd.GetEng()->GetVolt(2, 17, 11, 20);
+		TEST_ASSERT(gpu->IterateTS(1) && gpu->SyncFieldsToHost(), "Edited GPU iteration failed");
+		TEST_ASSERT(std::abs(gpu->GetVolt(2, 17, 11, 20) - expected) < 1e-4f, "Field edits were not uploaded before stepping");
+		TEST_ASSERT(gpu->GetProfile().uploadedBytes == 2ull * 3u * 35u * 23u * 41u * sizeof(float), "Edited field upload count is incorrect");
+		TEST_ASSERT(gpu->SetProfilingEnabled(false) && gpu->SetProfilingEnabled(true), "Profiling toggle failed");
+		TEST_ASSERT(gpu->IterateTS(5), "Pending reset setup failed");
+		gpu->Reset();
+		TEST_ASSERT(gpu->Initialize() && gpu->GetNumberOfTimesteps() == 0, "Pending batch did not reset");
+		TEST_ASSERT(gpu->GetVolt(2, 17, 11, 20) == 0, "Reset retained edited fields");
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_FailurePropagation()
+{
+	class FailingVulkan : public EngineVulkan {
+	public:
+		explicit FailingVulkan(bool iteration) : EngineVulkan(nullptr), failIteration(iteration) {}
+		bool IterateTS(unsigned int) override { return !failIteration; }
+		bool SyncFieldsToHost() override { return false; }
+		bool SyncProbesToHost() override { return false; }
+	private:
+		bool failIteration;
+	};
+	for (bool iteration : {true, false}) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+		fdtd.SetCSX(CreateSimpleGrid());
+		fdtd.SetGaussExcite(1e9, 500e6);
+		fdtd.SetNumberOfTimeSteps(1);
+		fdtd.SetEnableDumps(false);
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Failure propagation setup failed");
+		fdtd.ReplaceBackend(std::unique_ptr<EngineBackend>(new FailingVulkan(iteration)));
+		bool failed = false;
+		try { fdtd.RunFDTD(); }
+		catch (const std::runtime_error&) { failed = true; }
+		TEST_ASSERT(failed, "Backend failure must propagate from RunFDTD");
+	}
+	return true;
+}
+
 bool Benchmark_Vulkan_Multigrid()
 {
 	return RunMultigridEquivalence({}, false, false, false, false, true) &&
@@ -1720,6 +1843,13 @@ bool Benchmark_Vulkan_Multigrid()
 
 int main(int argc, char* argv[])
 {
+	if (argc > 1 && std::string(argv[1]) == "--vulkan-benchmark")
+		return RunVulkanPerformanceBenchmarks(argc, argv);
+	if (argc > 1 && std::string(argv[1]) == "--batching-tests") {
+		RUN_TEST(Test_Vulkan_BatchingAndProfiling);
+		RUN_TEST(Test_Vulkan_FailurePropagation);
+		return tests_failed ? 1 : 0;
+	}
 	if (argc > 1 && std::string(argv[1]) == "--multigrid-benchmark")
 	{
 		RUN_TEST(Benchmark_Vulkan_Multigrid);
@@ -1779,6 +1909,8 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_ConductingSheet_Equivalence);
 	RUN_TEST(Test_Vulkan_Cylinder_Equivalence);
 	RUN_TEST(Test_Vulkan_CheckedDimensionsAndIndices);
+	RUN_TEST(Test_Vulkan_BatchingAndProfiling);
+	RUN_TEST(Test_Vulkan_FailurePropagation);
 	RUN_TEST(Test_Vulkan_Multigrid_InvalidMetadata);
 	RUN_TEST(Test_Vulkan_Multigrid_ClosedAlpha);
 	RUN_TEST(Test_Vulkan_Multigrid_Nested);

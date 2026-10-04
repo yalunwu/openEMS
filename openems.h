@@ -151,6 +151,8 @@ protected:
 	bool m_DumpStats;
 	bool m_debugBox, m_debugPEC, m_no_simulation;
 	bool m_exactEndCriteria;
+	unsigned int m_vulkanBatchSize = 32;
+	bool m_vulkanProfile = false;
 
 	double endCrit;
 	int m_OverSampling;

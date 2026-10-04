@@ -51,6 +51,250 @@ static std::vector<uint32_t> CompileGLSLToSpirv(const std::string& source, shade
 
 #endif // ENABLE_VULKAN
 
+namespace {
+class ProfileTimer {
+public:
+	explicit ProfileTimer(double* seconds) : m_seconds(seconds)
+	{
+		if (m_seconds) m_start = std::chrono::steady_clock::now();
+	}
+	~ProfileTimer()
+	{
+		if (m_seconds)
+			*m_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start).count();
+	}
+private:
+	double* m_seconds;
+	std::chrono::steady_clock::time_point m_start;
+};
+}
+
+bool EngineVulkan::SetBatchSize(unsigned int size)
+{
+	if (size == 0u || size > 64u) return false;
+	m_batchSize = size;
+	return true;
+}
+
+bool EngineVulkan::SetProfilingEnabled(bool enabled)
+{
+#ifdef ENABLE_VULKAN
+	EngineVulkan& owner = ProfileOwner();
+	if (&owner != this) return owner.SetProfilingEnabled(enabled);
+	if (enabled == m_profileEnabled) return true;
+	if (m_device && !Synchronize()) return false;
+	if (m_queryPool) vkDestroyQueryPool(m_device, m_queryPool, nullptr);
+	m_queryPool = VK_NULL_HANDLE;
+	m_queriesPending = false;
+	m_queryCount = m_profileSpanCount = 0;
+#endif
+	m_profileEnabled = enabled;
+	m_profile = ProfileStatistics();
+#ifdef ENABLE_VULKAN
+	if (m_device && enabled) return InitProfiling();
+#endif
+	return true;
+}
+
+bool EngineVulkan::Synchronize()
+{
+#ifdef ENABLE_VULKAN
+	return m_device && WaitForFence();
+#else
+	return false;
+#endif
+}
+
+bool EngineVulkan::ClearProfile()
+{
+#ifdef ENABLE_VULKAN
+	EngineVulkan& owner = ProfileOwner();
+	if (&owner != this) return owner.ClearProfile();
+	if (m_device && !Synchronize()) return false;
+#endif
+	m_profile = ProfileStatistics();
+	return true;
+}
+
+EngineVulkan::ProfileStatistics EngineVulkan::GetProfile()
+{
+#ifdef ENABLE_VULKAN
+	EngineVulkan& owner = ProfileOwner();
+	owner.CollectProfile();
+	return owner.m_profile;
+#else
+	return m_profile;
+#endif
+}
+
+void EngineVulkan::WriteProfile(std::ostream& stream)
+{
+	const ProfileStatistics p = GetProfile();
+	stream << "VULKAN_PROFILE timesteps=" << p.timesteps << " submissions=" << p.submissions
+	       << " dispatches=" << p.dispatches << " sampled_steps=" << p.sampledSteps
+	       << " uploaded_bytes=" << p.uploadedBytes << " downloaded_bytes=" << p.downloadedBytes
+	       << " probe_bytes=" << p.probeBytes << " record_ms=" << p.recordSeconds * 1000
+	       << " submit_ms=" << p.submitSeconds * 1000 << " wait_ms=" << p.waitSeconds * 1000
+	       << " readback_ms=" << p.readbackSeconds * 1000 << " mirror_ms=" << p.mirrorSeconds * 1000;
+	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback"};
+	for (unsigned int i = 0; i < ProfileCategoryCount; ++i)
+		stream << " gpu_" << names[i] << "_ms=" << p.gpuSeconds[i] * 1000
+		       << " gpu_" << names[i] << "_samples=" << p.gpuSamples[i];
+	stream << std::endl;
+}
+
+std::string EngineVulkan::GetDeviceDescription() const
+{
+#ifdef ENABLE_VULKAN
+	if (m_physicalDevice)
+	{
+		VkPhysicalDeviceProperties props = {};
+		vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
+		return m_deviceName + " vendor=" + std::to_string(props.vendorID) +
+		       " device=" + std::to_string(props.deviceID) + " driver_raw=" + std::to_string(props.driverVersion) +
+		       " api=" + std::to_string(props.apiVersion);
+	}
+#endif
+	return m_deviceName;
+}
+
+#ifdef ENABLE_VULKAN
+EngineVulkan& EngineVulkan::ProfileOwner()
+{
+	return m_deviceOwner ? *m_deviceOwner : *this;
+}
+
+bool EngineVulkan::InitProfiling()
+{
+	if (!m_profileEnabled || !m_ownsVulkanDevice) return true;
+	VkPhysicalDeviceProperties props = {};
+	vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
+	uint32_t count = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &count, nullptr);
+	std::vector<VkQueueFamilyProperties> queues(count);
+	vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &count, queues.data());
+	m_timestampBits = queues[m_computeQueueFamily].timestampValidBits;
+	m_timestampPeriod = props.limits.timestampPeriod;
+	if (!m_timestampBits || m_timestampPeriod <= 0) return true;
+	VkQueryPoolCreateInfo info = {};
+	info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+	info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+	info.queryCount = static_cast<uint32_t>(m_profileSpans.size()) * 2u;
+	if (vkCreateQueryPool(m_device, &info, nullptr, &m_queryPool) != VK_SUCCESS)
+	{
+		std::cerr << "[openEMS Vulkan] GPU timestamps unavailable; CPU profiling remains enabled." << std::endl;
+		m_queryPool = VK_NULL_HANDLE;
+	}
+	return true;
+}
+
+void EngineVulkan::CollectProfile()
+{
+	if (!m_queriesPending || !m_queryPool) return;
+	struct Result { uint64_t ticks, available; };
+	std::array<Result, 512> results = {};
+	VkResult status = vkGetQueryPoolResults(m_device, m_queryPool, 0, m_queryCount,
+	                                      m_queryCount * sizeof(Result), results.data(), sizeof(Result),
+	                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+	if (status != VK_SUCCESS) return;
+	const uint64_t mask = m_timestampBits == 64u ? UINT64_MAX : (uint64_t(1) << m_timestampBits) - 1u;
+	for (uint32_t i = 0; i < m_profileSpanCount; ++i)
+	{
+		const ProfileSpan& span = m_profileSpans[i];
+		if (!results[span.first].available || !results[span.first + 1u].available) return;
+	}
+	for (uint32_t i = 0; i < m_profileSpanCount; ++i)
+	{
+		const ProfileSpan& span = m_profileSpans[i];
+		const uint64_t ticks = (results[span.first + 1u].ticks - results[span.first].ticks) & mask;
+		m_profile.gpuSeconds[span.category] += ticks * static_cast<double>(m_timestampPeriod) * 1e-9;
+		++m_profile.gpuSamples[span.category];
+	}
+	m_queriesPending = false;
+}
+
+uint32_t EngineVulkan::BeginGpuSpan(VkCommandBuffer cmd, GpuProfileCategory category)
+{
+	EngineVulkan& owner = ProfileOwner();
+	if (!owner.m_queryPool || owner.m_profileSpanCount == owner.m_profileSpans.size()) return UINT32_MAX;
+	const uint32_t first = owner.m_queryCount;
+	owner.m_queryCount += 2u;
+	owner.m_profileSpans[owner.m_profileSpanCount++] = {first, category};
+	vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, owner.m_queryPool, first);
+	return first;
+}
+
+void EngineVulkan::BeginProfileCommands(VkCommandBuffer cmd)
+{
+	EngineVulkan& owner = ProfileOwner();
+	owner.m_queryCount = owner.m_profileSpanCount = 0;
+	owner.m_queriesPending = false;
+	if (owner.m_queryPool)
+		vkCmdResetQueryPool(cmd, owner.m_queryPool, 0, static_cast<uint32_t>(owner.m_profileSpans.size()) * 2u);
+}
+
+void EngineVulkan::EndGpuSpan(VkCommandBuffer cmd, uint32_t first)
+{
+	if (first != UINT32_MAX)
+		vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ProfileOwner().m_queryPool, first + 1u);
+}
+
+void EngineVulkan::Dispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z, GpuProfileCategory category)
+{
+	EngineVulkan& owner = ProfileOwner();
+	if (!owner.m_profileEnabled) { vkCmdDispatch(cmd, x, y, z); return; }
+	++owner.m_profile.dispatches;
+	const uint32_t span = owner.m_sampleDispatches ? BeginGpuSpan(cmd, category) : UINT32_MAX;
+	vkCmdDispatch(cmd, x, y, z);
+	EndGpuSpan(cmd, span);
+}
+
+void EngineVulkan::CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst,
+                             const VkBufferCopy& region, bool download)
+{
+	EngineVulkan& owner = ProfileOwner();
+	if (owner.m_profileEnabled)
+	{
+		if (download) owner.m_profile.downloadedBytes += region.size;
+		else owner.m_profile.uploadedBytes += region.size;
+	}
+	vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+}
+
+bool EngineVulkan::WaitForFence()
+{
+	EngineVulkan& owner = ProfileOwner();
+	if (owner.m_runtimeFailed) return false;
+	ProfileTimer timer(owner.m_profileEnabled ? &owner.m_profile.waitSeconds : nullptr);
+	if (vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+	{
+		owner.m_runtimeFailed = true;
+		return false;
+	}
+	owner.CollectProfile();
+	return true;
+}
+
+bool EngineVulkan::SubmitCommandBuffer()
+{
+	EngineVulkan& owner = ProfileOwner();
+	if (owner.m_runtimeFailed) return false;
+	ProfileTimer timer(owner.m_profileEnabled ? &owner.m_profile.submitSeconds : nullptr);
+	VkSubmitInfo info = {};
+	info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	info.commandBufferCount = 1;
+	info.pCommandBuffers = &m_level->m_cmdBuffer;
+	if (vkResetFences(m_device, 1, &m_level->m_fence) != VK_SUCCESS ||
+	    vkQueueSubmit(m_computeQueue, 1, &info, m_level->m_fence) != VK_SUCCESS)
+	{
+		owner.m_runtimeFailed = true;
+		return false;
+	}
+	if (owner.m_profileEnabled) ++owner.m_profile.submissions;
+	return true;
+}
+#endif
+
 EngineVulkan::EngineVulkan(const Operator* op)
 	: m_level(new LevelState)
 {
@@ -127,6 +371,7 @@ bool EngineVulkan::Initialize()
 		return false;
 	}
 	std::cout << "[openEMS Vulkan] Backend ready. Device: " << m_deviceName << std::endl;
+	m_profile = ProfileStatistics();
 	return true;
 #else
 	std::cerr << "[openEMS Vulkan] Engine built without ENABLE_VULKAN support!" << std::endl;
@@ -530,6 +775,7 @@ bool EngineVulkan::InitCommandResources()
 	{
 		return false;
 	}
+	if (!InitProfiling()) return false;
 
 	return true;
 }
@@ -638,9 +884,7 @@ bool EngineVulkan::SyncFieldsToDevice()
 	size_t fieldBytes = 3 * static_cast<size_t>(m_level->m_grid.numCells) * sizeof(float);
 	auto uploadBuffer = [&](const std::vector<float>& source, VulkanBuffer& target) {
 		std::memcpy(m_level->m_bufFieldStaging.mapped, source.data(), fieldBytes);
-		if (vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-			return false;
-		if (vkResetFences(m_device, 1, &m_level->m_fence) != VK_SUCCESS)
+		if (!WaitForFence())
 			return false;
 
 		VkCommandBufferBeginInfo beginInfo = {};
@@ -650,7 +894,7 @@ bool EngineVulkan::SyncFieldsToDevice()
 			return false;
 
 		VkBufferCopy copyRegion = { 0, 0, fieldBytes };
-		vkCmdCopyBuffer(m_level->m_cmdBuffer, m_level->m_bufFieldStaging.buffer, target.buffer, 1, &copyRegion);
+		CopyBuffer(m_level->m_cmdBuffer, m_level->m_bufFieldStaging.buffer, target.buffer, copyRegion);
 		VkMemoryBarrier barrier = {};
 		barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -660,13 +904,7 @@ bool EngineVulkan::SyncFieldsToDevice()
 		if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS)
 			return false;
 
-		VkSubmitInfo submitInfo = {};
-		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-		submitInfo.commandBufferCount = 1;
-		submitInfo.pCommandBuffers = &m_level->m_cmdBuffer;
-		if (vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_level->m_fence) != VK_SUCCESS)
-			return false;
-		return vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+		return SubmitCommandBuffer() && WaitForFence();
 	};
 
 	if (!uploadBuffer(m_level->m_hostVolt, m_level->m_bufVolt) || !uploadBuffer(m_level->m_hostCurr, m_level->m_bufCurr))
@@ -3200,12 +3438,12 @@ void EngineVulkan::RecordDebyePhase(VkCommandBuffer cmd, uint32_t mode)
 	                       0, 1, &m_level->m_descSetDebye, 0, nullptr);
 	uint32_t pc[2] = {m_level->m_debyeCount, mode};
 	vkCmdPushConstants(cmd, m_pipelineLayoutDebye, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-	vkCmdDispatch(cmd, (m_level->m_debyeCount + 255u) / 256u, 1, 1);
+	Dispatch(cmd, (m_level->m_debyeCount + 255u) / 256u, 1, 1);
 	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
-void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
+void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsigned int timestep)
 {
 	uint32_t wgZ = (m_level->m_grid.dimZ + 31u) / 32u;
 	uint32_t wgY = (m_level->m_grid.dimY + 3u) / 4u;
@@ -3225,18 +3463,6 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 	memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
-	// 1. UPML Pre-Voltage Pass
-	if (m_level->m_numUpmlCells > 0 && m_pipelineUpmlPre && m_level->m_descSetUpmlVolt)
-	{
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPre);
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_level->m_descSetUpmlVolt, 0, nullptr);
-		vkCmdPushConstants(cmd, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_level->m_numUpmlCells), &m_level->m_numUpmlCells);
-		vkCmdDispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
-
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
-	}
-
 	// Mur ABC Pre-Voltage Pass
 	if (m_level->m_totalMurPoints > 0 && m_pipelineMurPre && m_level->m_descSetMur)
 	{
@@ -3247,9 +3473,9 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 			uint32_t count;
 			uint32_t current_TS;
 			uint32_t pad;
-		} murPC = { 0, m_level->m_totalMurPoints, m_level->m_numTS, 0 };
+		} murPC = { 0, m_level->m_totalMurPoints, timestep, 0 };
 		vkCmdPushConstants(cmd, m_pipelineLayoutMur, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(murPC), &murPC);
-		vkCmdDispatch(cmd, (m_level->m_totalMurPoints + 255) / 256, 1, 1);
+		Dispatch(cmd, (m_level->m_totalMurPoints + 255) / 256, 1, 1);
 
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3262,7 +3488,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutAbc, 0, 1, &m_level->m_descSetAbcVolt, 0, nullptr);
 		struct { uint32_t offset; uint32_t count; uint32_t mode; } abcPC = { 0, m_level->m_abcVoltCount, 0 };
 		vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
-		vkCmdDispatch(cmd, (m_level->m_abcVoltCount + 255) / 256, 1, 1);
+		Dispatch(cmd, (m_level->m_abcVoltCount + 255) / 256, 1, 1);
 
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3278,7 +3504,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 			uint32_t mode;
 		} rlcPC = { m_level->m_rlcCount, 0 };
 		vkCmdPushConstants(cmd, m_pipelineLayoutRlc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rlcPC), &rlcPC);
-		vkCmdDispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
+		Dispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
 
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3295,8 +3521,21 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		{
 			struct { uint32_t offset; uint32_t count; uint32_t mode; } dispPC = { pass.offset, pass.count, 0 };
 			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispPC), &dispPC);
-			vkCmdDispatch(cmd, (pass.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (pass.count + 255) / 256, 1, 1);
 		}
+
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+	}
+
+	// UPML pre-updates run after lower-priority extensions, as on the CPU.
+	// UPML Pre-Voltage Pass
+	if (m_level->m_numUpmlCells > 0 && m_pipelineUpmlPre && m_level->m_descSetUpmlVolt)
+	{
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPre);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_level->m_descSetUpmlVolt, 0, nullptr);
+		vkCmdPushConstants(cmd, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_level->m_numUpmlCells), &m_level->m_numUpmlCells);
+		Dispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
 
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3306,7 +3545,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineVolt);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutFields, 0, 1, &m_level->m_descSetFields, 0, nullptr);
 	vkCmdPushConstants(cmd, m_pipelineLayoutFields, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-	vkCmdDispatch(cmd, wgZ, wgY, (pc.countX + 1u) / 2u);
+	Dispatch(cmd, wgZ, wgY, (pc.countX + 1u) / 2u, ProfileVoltage);
 
 	// 3. UPML Post-Voltage Pass
 	if (m_level->m_numUpmlCells > 0 && m_pipelineUpmlPost && m_level->m_descSetUpmlVolt)
@@ -3317,7 +3556,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPost);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_level->m_descSetUpmlVolt, 0, nullptr);
 		vkCmdPushConstants(cmd, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_level->m_numUpmlCells), &m_level->m_numUpmlCells);
-		vkCmdDispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
+		Dispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
 	}
 
 	// Cylindrical Coordinates Post-Voltage Pass
@@ -3343,7 +3582,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 
 			CylPC r0PC = { m_level->m_grid.dimX, m_level->m_grid.dimY, m_level->m_grid.dimZ, m_level->m_grid.numCells, m_level->m_cylLastALine, 1u, 0u };
 			vkCmdPushConstants(cmd, m_pipelineLayoutCyl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(r0PC), &r0PC);
-			vkCmdDispatch(cmd, (m_level->m_grid.dimZ + 255) / 256, 1, 1);
+			Dispatch(cmd, (m_level->m_grid.dimZ + 255) / 256, 1, 1);
 		}
 
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -3351,7 +3590,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 
 		CylPC wrapPC = { m_level->m_grid.dimX, m_level->m_grid.dimY, m_level->m_grid.dimZ, m_level->m_grid.numCells, m_level->m_cylLastALine, m_level->m_cylR0Included ? 1u : 0u, 1u };
 		vkCmdPushConstants(cmd, m_pipelineLayoutCyl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wrapPC), &wrapPC);
-		vkCmdDispatch(cmd, (m_level->m_grid.dimX + 15) / 16, (m_level->m_grid.dimZ + 15) / 16, 1);
+		Dispatch(cmd, (m_level->m_grid.dimX + 15) / 16, (m_level->m_grid.dimZ + 15) / 16, 1);
 	}
 
 	// TFSF has a higher priority than the boundary and lumped-element
@@ -3372,9 +3611,9 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 				uint32_t current_TS;
 				uint32_t sigLength;
 				int32_t p;
-			} tfsfPC = { face.offset, face.count, m_level->m_numTS, m_level->m_tfsfSigLength, m_level->m_tfsfPeriod };
+			} tfsfPC = { face.offset, face.count, timestep, m_level->m_tfsfSigLength, m_level->m_tfsfPeriod };
 			vkCmdPushConstants(cmd, m_pipelineLayoutTfsf, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tfsfPC), &tfsfPC);
-			vkCmdDispatch(cmd, (face.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (face.count + 255) / 256, 1, 1);
 
 			if (m_level->m_tfsfVoltFaces.size() > 1)
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -3395,7 +3634,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutAbc, 0, 1, &m_level->m_descSetAbcVolt, 0, nullptr);
 		struct { uint32_t offset; uint32_t count; uint32_t mode; } abcPC = { 0, m_level->m_abcVoltCount, 1 };
 		vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
-		vkCmdDispatch(cmd, (m_level->m_abcVoltCount + 255) / 256, 1, 1);
+		Dispatch(cmd, (m_level->m_abcVoltCount + 255) / 256, 1, 1);
 	}
 
 	// Mur ABC Post-Voltage Pass (updates storeData += coeff * voltData[shift])
@@ -3411,9 +3650,9 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 			uint32_t count;
 			uint32_t current_TS;
 			uint32_t pad;
-		} murPC = { 0, m_level->m_totalMurPoints, m_level->m_numTS, 0 };
+		} murPC = { 0, m_level->m_totalMurPoints, timestep, 0 };
 		vkCmdPushConstants(cmd, m_pipelineLayoutMur, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(murPC), &murPC);
-		vkCmdDispatch(cmd, (m_level->m_totalMurPoints + 255) / 256, 1, 1);
+		Dispatch(cmd, (m_level->m_totalMurPoints + 255) / 256, 1, 1);
 	}
 
 	// Apply phases begin only after every extension's post-update phase
@@ -3431,7 +3670,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 			const TfsfFace& sheet = *it;
 			struct { uint32_t offset; uint32_t count; uint32_t mode; } abcPC = { sheet.offset, sheet.count, 2 };
 			vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
-			vkCmdDispatch(cmd, (sheet.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (sheet.count + 255) / 256, 1, 1);
 			if (m_level->m_abcVoltSheets.size() > 1)
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3451,13 +3690,13 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 			uint32_t mode;
 		} rlcPC = { m_level->m_rlcCount, 1 };
 		vkCmdPushConstants(cmd, m_pipelineLayoutRlc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rlcPC), &rlcPC);
-		vkCmdDispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
+		Dispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
 
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
 		rlcPC.mode = 2;
 		vkCmdPushConstants(cmd, m_pipelineLayoutRlc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rlcPC), &rlcPC);
-		vkCmdDispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
+		Dispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
 	}
 
 	RecordDebyePhase(cmd, 2u);
@@ -3474,7 +3713,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		{
 			struct { uint32_t offset; uint32_t count; uint32_t mode; } dispPC = { pass.offset, pass.count, 1 };
 			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispPC), &dispPC);
-			vkCmdDispatch(cmd, (pass.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (pass.count + 255) / 256, 1, 1);
 			if (m_level->m_dispVoltPasses.size() > 1)
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3495,16 +3734,16 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		for (auto it = m_level->m_murFaces.rbegin(); it != m_level->m_murFaces.rend(); ++it)
 		{
 			const MurFace& face = *it;
-			if (m_level->m_numTS < face.start_TS)
+			if (timestep < face.start_TS)
 				continue;
 			struct {
 				uint32_t offset;
 				uint32_t count;
 				uint32_t current_TS;
 				uint32_t pad;
-			} murPC = { face.offset, face.count, m_level->m_numTS, 0 };
+			} murPC = { face.offset, face.count, timestep, 0 };
 			vkCmdPushConstants(cmd, m_pipelineLayoutMur, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(murPC), &murPC);
-			vkCmdDispatch(cmd, (face.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (face.count + 255) / 256, 1, 1);
 
 			if (m_level->m_murFaces.size() > 1)
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -3519,11 +3758,11 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
 
-		uint32_t excPC[2] = {static_cast<uint32_t>(m_level->m_voltExcPoints.size()), m_level->m_numTS};
+		uint32_t excPC[2] = {static_cast<uint32_t>(m_level->m_voltExcPoints.size()), timestep};
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineExc);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutExc, 0, 1, &m_level->m_descSetVoltExc, 0, nullptr);
 		vkCmdPushConstants(cmd, m_pipelineLayoutExc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(excPC), excPC);
-		vkCmdDispatch(cmd, (excPC[0] + 63) / 64, 1, 1);
+		Dispatch(cmd, (excPC[0] + 63) / 64, 1, 1);
 	}
 
 	// Barrier between voltage and current
@@ -3531,7 +3770,7 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc)
 	                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
 }
 
-void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
+void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsigned int timestep)
 {
 	uint32_t wgZ = (m_level->m_grid.dimZ + 31u) / 32u;
 	uint32_t wgY = (m_level->m_grid.dimY + 3u) / 4u;
@@ -3551,18 +3790,6 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 	memBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
-	// 5. UPML Pre-Current Pass
-	if (m_level->m_numUpmlCells > 0 && m_pipelineUpmlPre && m_level->m_descSetUpmlCurr)
-	{
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPre);
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_level->m_descSetUpmlCurr, 0, nullptr);
-		vkCmdPushConstants(cmd, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_level->m_numUpmlCells), &m_level->m_numUpmlCells);
-		vkCmdDispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
-
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
-	}
-
 	// Absorbing BC Pre-Current Pass
 	if (m_level->m_abcCurrCount > 0 && m_pipelineAbcCurr && m_level->m_descSetAbcCurr)
 	{
@@ -3570,7 +3797,7 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutAbc, 0, 1, &m_level->m_descSetAbcCurr, 0, nullptr);
 		struct { uint32_t offset; uint32_t count; uint32_t mode; } abcPC = { 0, m_level->m_abcCurrCount, 0 };
 		vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
-		vkCmdDispatch(cmd, (m_level->m_abcCurrCount + 255) / 256, 1, 1);
+		Dispatch(cmd, (m_level->m_abcCurrCount + 255) / 256, 1, 1);
 
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3585,8 +3812,21 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 		{
 			struct { uint32_t offset; uint32_t count; uint32_t mode; } dispPC = { pass.offset, pass.count, 0 };
 			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispPC), &dispPC);
-			vkCmdDispatch(cmd, (pass.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (pass.count + 255) / 256, 1, 1);
 		}
+
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+	}
+
+	// UPML pre-updates run after lower-priority extensions, as on the CPU.
+	// UPML Pre-Current Pass
+	if (m_level->m_numUpmlCells > 0 && m_pipelineUpmlPre && m_level->m_descSetUpmlCurr)
+	{
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPre);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_level->m_descSetUpmlCurr, 0, nullptr);
+		vkCmdPushConstants(cmd, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_level->m_numUpmlCells), &m_level->m_numUpmlCells);
+		Dispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
 
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3596,7 +3836,7 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineCurr);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutFields, 0, 1, &m_level->m_descSetFields, 0, nullptr);
 	vkCmdPushConstants(cmd, m_pipelineLayoutFields, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-	vkCmdDispatch(cmd, wgZ, wgY, (pc.countX + 1u) / 2u);
+	Dispatch(cmd, wgZ, wgY, (pc.countX + 1u) / 2u, ProfileCurrent);
 
 	// 7. UPML Post-Current Pass
 	if (m_level->m_numUpmlCells > 0 && m_pipelineUpmlPost && m_level->m_descSetUpmlCurr)
@@ -3607,7 +3847,7 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPost);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_level->m_descSetUpmlCurr, 0, nullptr);
 		vkCmdPushConstants(cmd, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_level->m_numUpmlCells), &m_level->m_numUpmlCells);
-		vkCmdDispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
+		Dispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
 	}
 
 	// Cylindrical Coordinates Post-Current Pass
@@ -3631,7 +3871,7 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 
 		CylPC currPC = { m_level->m_grid.dimX, m_level->m_grid.dimY, m_level->m_grid.dimZ, m_level->m_grid.numCells, m_level->m_cylLastALine, 0u, 2u };
 		vkCmdPushConstants(cmd, m_pipelineLayoutCyl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(currPC), &currPC);
-		vkCmdDispatch(cmd, (m_level->m_grid.dimX + 15) / 16, (m_level->m_grid.dimZ + 15) / 16, 1);
+		Dispatch(cmd, (m_level->m_grid.dimX + 15) / 16, (m_level->m_grid.dimZ + 15) / 16, 1);
 	}
 
 	// TFSF post-current updates precede default-priority boundary sheets.
@@ -3651,9 +3891,9 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 				uint32_t current_TS;
 				uint32_t sigLength;
 				int32_t p;
-			} tfsfPC = { face.offset, face.count, m_level->m_numTS, m_level->m_tfsfSigLength, m_level->m_tfsfPeriod };
+			} tfsfPC = { face.offset, face.count, timestep, m_level->m_tfsfSigLength, m_level->m_tfsfPeriod };
 			vkCmdPushConstants(cmd, m_pipelineLayoutTfsf, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tfsfPC), &tfsfPC);
-			vkCmdDispatch(cmd, (face.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (face.count + 255) / 256, 1, 1);
 
 			if (m_level->m_tfsfCurrFaces.size() > 1)
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -3671,7 +3911,7 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutAbc, 0, 1, &m_level->m_descSetAbcCurr, 0, nullptr);
 		struct { uint32_t offset; uint32_t count; uint32_t mode; } abcPC = { 0, m_level->m_abcCurrCount, 1 };
 		vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
-		vkCmdDispatch(cmd, (m_level->m_abcCurrCount + 255) / 256, 1, 1);
+		Dispatch(cmd, (m_level->m_abcCurrCount + 255) / 256, 1, 1);
 	}
 
 	// Absorbing BC Apply Pass
@@ -3687,7 +3927,7 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 			const TfsfFace& sheet = *it;
 			struct { uint32_t offset; uint32_t count; uint32_t mode; } abcPC = { sheet.offset, sheet.count, 2 };
 			vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
-			vkCmdDispatch(cmd, (sheet.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (sheet.count + 255) / 256, 1, 1);
 			if (m_level->m_abcCurrSheets.size() > 1)
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3706,7 +3946,7 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 		{
 			struct { uint32_t offset; uint32_t count; uint32_t mode; } dispPC = { pass.offset, pass.count, 1 };
 			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispPC), &dispPC);
-			vkCmdDispatch(cmd, (pass.count + 255) / 256, 1, 1);
+			Dispatch(cmd, (pass.count + 255) / 256, 1, 1);
 			if (m_level->m_dispCurrPasses.size() > 1)
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
@@ -3719,11 +3959,11 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc)
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
 
-		uint32_t excPC[2] = {static_cast<uint32_t>(m_level->m_currExcPoints.size()), m_level->m_numTS};
+		uint32_t excPC[2] = {static_cast<uint32_t>(m_level->m_currExcPoints.size()), timestep};
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineExc);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutExc, 0, 1, &m_level->m_descSetCurrExc, 0, nullptr);
 		vkCmdPushConstants(cmd, m_pipelineLayoutExc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(excPC), excPC);
-		vkCmdDispatch(cmd, (excPC[0] + 63) / 64, 1, 1);
+		Dispatch(cmd, (excPC[0] + 63) / 64, 1, 1);
 	}
 
 	// Make this phase visible to the child, interface transfer, and next step.
@@ -3773,13 +4013,13 @@ void EngineVulkan::RecordMultigridTransfer(VkCommandBuffer cmd, uint32_t mode, u
 	if (mode == 0u)
 	{
 		const uint32_t childAlphaCount = m_level->m_grid.dimY / 2u;
-		vkCmdDispatch(cmd, (m_level->m_innerGrid->m_level->m_grid.dimZ + 31u) / 32u,
-		              (childAlphaCount + 3u) / 4u, 1u);
+		Dispatch(cmd, (m_level->m_innerGrid->m_level->m_grid.dimZ + 31u) / 32u,
+		              (childAlphaCount + 3u) / 4u, 1u, ProfileMultigrid);
 	}
 	else
 	{
-		vkCmdDispatch(cmd, (m_level->m_grid.dimZ + 31u) / 32u,
-		              (m_level->m_grid.dimY + 3u) / 4u, pc.radialCount);
+		Dispatch(cmd, (m_level->m_grid.dimZ + 31u) / 32u,
+		              (m_level->m_grid.dimY + 3u) / 4u, pc.radialCount, ProfileMultigrid);
 	}
 
 	VkMemoryBarrier barrier = {};
@@ -3791,24 +4031,24 @@ void EngineVulkan::RecordMultigridTransfer(VkCommandBuffer cmd, uint32_t mode, u
 	                     0, nullptr, 0, nullptr);
 }
 
-void EngineVulkan::RecordVoltageHierarchy(VkCommandBuffer cmd)
+void EngineVulkan::RecordVoltageHierarchy(VkCommandBuffer cmd, unsigned int timestep)
 {
 	const bool hasVoltExc = !m_level->m_voltExcPoints.empty();
-	RecordVoltagePhase(cmd, hasVoltExc);
+	RecordVoltagePhase(cmd, hasVoltExc, timestep);
 	if (m_level->m_innerGrid)
 	{
-		m_level->m_innerGrid->RecordVoltageHierarchy(cmd);
+		m_level->m_innerGrid->RecordVoltageHierarchy(cmd, timestep);
 		RecordMultigridTransfer(cmd, 0u, 1u);
 	}
 }
 
-void EngineVulkan::RecordCurrentHierarchy(VkCommandBuffer cmd)
+void EngineVulkan::RecordCurrentHierarchy(VkCommandBuffer cmd, unsigned int timestep)
 {
 	const bool hasCurrExc = !m_level->m_currExcPoints.empty();
-	RecordCurrentPhase(cmd, hasCurrExc);
+	RecordCurrentPhase(cmd, hasCurrExc, timestep);
 	if (m_level->m_innerGrid)
 	{
-		m_level->m_innerGrid->RecordCurrentHierarchy(cmd);
+		m_level->m_innerGrid->RecordCurrentHierarchy(cmd, timestep);
 		RecordMultigridTransfer(cmd, 1u, 1u);
 	}
 }
@@ -3853,82 +4093,88 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 	if (iterTS > std::numeric_limits<unsigned int>::max() - m_level->m_numTS)
 		return false;
 #ifdef ENABLE_VULKAN
-	if (m_device && m_computeQueue && m_pipelineVolt && m_pipelineCurr)
+	if (!m_device || ProfileOwner().m_runtimeFailed) return false;
+	if (iterTS == 0u) return true;
+	if (!SyncHierarchyToDevice()) return false;
+	for (unsigned int done = 0; done < iterTS;)
 	{
-		if (!SyncHierarchyToDevice())
-			return false;
-
-		for (unsigned int step = 0; step < iterTS; ++step)
+		if (!WaitForFence()) return false;
+		const unsigned int count = std::min(m_batchSize, iterTS - done);
+		const unsigned int firstTS = m_level->m_numTS;
+		VkCommandBufferBeginInfo begin = {};
+		begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		if (vkBeginCommandBuffer(m_level->m_cmdBuffer, &begin) != VK_SUCCESS)
 		{
-			if (vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS ||
-			    vkResetFences(m_device, 1, &m_level->m_fence) != VK_SUCCESS)
-				return false;
-
-			VkCommandBufferBeginInfo beginInfo = {};
-			beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-			if (vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo) != VK_SUCCESS)
-				return false;
-
-			// Make initialization uploads and extension state visible to this batch.
-			if (step == 0u)
-			{
-				VkMemoryBarrier barrier = {};
-				barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-				barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-				barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-				vkCmdPipelineBarrier(m_level->m_cmdBuffer,
-				                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
-			}
-			RecordVoltageHierarchy(m_level->m_cmdBuffer);
-			RecordCurrentHierarchy(m_level->m_cmdBuffer);
-			if (step + 1u == iterTS)
-				RecordProjectionHierarchy(m_level->m_cmdBuffer);
-
-			if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS)
-				return false;
-
-			VkSubmitInfo submitInfo = {};
-			submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-			submitInfo.commandBufferCount = 1;
-			submitInfo.pCommandBuffers = &m_level->m_cmdBuffer;
-			if (vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_level->m_fence) != VK_SUCCESS)
-				return false;
-
-			SetHierarchyTimestep(m_level->m_numTS + 1u);
+			ProfileOwner().m_runtimeFailed = true;
+			return false;
 		}
-
+		{
+			ProfileTimer timer(m_profileEnabled ? &m_profile.recordSeconds : nullptr);
+			BeginProfileCommands(m_level->m_cmdBuffer);
+			const uint32_t batchSpan = BeginGpuSpan(m_level->m_cmdBuffer, ProfileBatch);
+			// Cover initial uploads and previous submissions without a host field copy.
+			VkMemoryBarrier barrier = {};
+			barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			vkCmdPipelineBarrier(m_level->m_cmdBuffer,
+			                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+			for (unsigned int step = 0; step < count; ++step)
+			{
+				m_sampleDispatches = m_profileEnabled && step == 0u;
+				if (m_sampleDispatches) ++m_profile.sampledSteps;
+				RecordVoltageHierarchy(m_level->m_cmdBuffer, firstTS + step);
+				RecordCurrentHierarchy(m_level->m_cmdBuffer, firstTS + step);
+			}
+			m_sampleDispatches = m_profileEnabled;
+			if (done + count == iterTS) RecordProjectionHierarchy(m_level->m_cmdBuffer);
+			m_sampleDispatches = false;
+			EndGpuSpan(m_level->m_cmdBuffer, batchSpan);
+			if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS)
+			{
+				m_runtimeFailed = true;
+				return false;
+			}
+		}
+		if (!SubmitCommandBuffer()) return false;
+		m_queriesPending = m_queryCount != 0u;
+		if (m_profileEnabled) m_profile.timesteps += count;
+		SetHierarchyTimestep(firstTS + count);
 		MarkHierarchyHostInvalid();
-		return true;
+		done += count;
 	}
-#endif
-
+	return true;
+#else
+	if (iterTS == 0u) return true;
 	m_level->m_numTS += iterTS;
 	m_level->m_hostFieldsValid = false;
 	return true;
+#endif
 }
 
 bool EngineVulkan::SyncProbesToHost()
 {
 #ifdef ENABLE_VULKAN
+	if (!m_device || ProfileOwner().m_runtimeFailed) return false;
 	if (m_level->m_probePoints.empty() || !m_level->m_bufProbeValues.mapped) return true;
 
 	uint32_t count = static_cast<uint32_t>(m_level->m_probePoints.size());
 
-	vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX);
-	vkResetFences(m_device, 1, &m_level->m_fence);
+	if (!WaitForFence()) return false;
 
 	VkCommandBufferBeginInfo beginInfo = {};
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
+	if (vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo) != VK_SUCCESS) return false;
+	BeginProfileCommands(m_level->m_cmdBuffer);
+	const uint32_t probeSpan = BeginGpuSpan(m_level->m_cmdBuffer, ProfileProbe);
 
 	vkCmdBindPipeline(m_level->m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineProbe);
 	vkCmdBindDescriptorSets(m_level->m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutProbe, 0, 1, &m_level->m_descSetProbe, 0, nullptr);
 	vkCmdPushConstants(m_level->m_cmdBuffer, m_pipelineLayoutProbe, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
-	vkCmdDispatch(m_level->m_cmdBuffer, (count + 63) / 64, 1, 1);
+	Dispatch(m_level->m_cmdBuffer, (count + 63) / 64, 1, 1, ProfileProbe);
 
 	// Barrier to host read
 	VkMemoryBarrier hostBarrier = {};
@@ -3938,14 +4184,14 @@ bool EngineVulkan::SyncProbesToHost()
 	vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
 	                     0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
 
-	vkEndCommandBuffer(m_level->m_cmdBuffer);
-
-	VkSubmitInfo submitInfo = {};
-	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	submitInfo.commandBufferCount = 1;
-	submitInfo.pCommandBuffers = &m_level->m_cmdBuffer;
-	vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_level->m_fence);
-	vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX);
+	EndGpuSpan(m_level->m_cmdBuffer, probeSpan);
+	if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS) return false;
+	if (!SubmitCommandBuffer()) return false;
+	ProfileOwner().m_queriesPending = ProfileOwner().m_queryCount != 0u;
+	if (!WaitForFence()) return false;
+	EngineVulkan& owner = ProfileOwner();
+	if (owner.m_profileEnabled) owner.m_profile.probeBytes += count * sizeof(float);
+	ProfileTimer mirrorTimer(owner.m_profileEnabled ? &owner.m_profile.mirrorSeconds : nullptr);
 
 	// Direct zero-copy read from host-visible mapped memory!
 	const float* values = static_cast<const float*>(m_level->m_bufProbeValues.mapped);
@@ -4017,6 +4263,8 @@ bool EngineVulkan::SyncFieldsToHost()
 #ifdef ENABLE_VULKAN
 bool EngineVulkan::SyncLevelFieldsToHost()
 {
+	EngineVulkan& owner = ProfileOwner();
+	if (owner.m_runtimeFailed) return false;
 	if (m_level->m_hostFieldsValid) return true;
 
 	if (m_device && m_level->m_bufFieldStaging.mapped)
@@ -4024,16 +4272,18 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 		size_t fieldBytes = 3 * static_cast<size_t>(m_level->m_grid.numCells) * sizeof(float);
 
 		auto downloadBuffer = [&](VulkanBuffer& srcBuf, std::vector<float>& targetHost) {
-			if (vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS ||
-			    vkResetFences(m_device, 1, &m_level->m_fence) != VK_SUCCESS)
+			if (!WaitForFence())
 				return false;
 
+			ProfileTimer readbackTimer(owner.m_profileEnabled ? &owner.m_profile.readbackSeconds : nullptr);
 			VkCommandBufferBeginInfo beginInfo = {};
 			beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 			beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 			if (vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo) != VK_SUCCESS)
 				return false;
 
+			BeginProfileCommands(m_level->m_cmdBuffer);
+			const uint32_t readbackSpan = BeginGpuSpan(m_level->m_cmdBuffer, ProfileReadback);
 			VkMemoryBarrier barrier = {};
 			barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 			barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -4043,22 +4293,19 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 			                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
 			VkBufferCopy copyRegion = { 0, 0, fieldBytes };
-			vkCmdCopyBuffer(m_level->m_cmdBuffer, srcBuf.buffer, m_level->m_bufFieldStaging.buffer, 1, &copyRegion);
+			CopyBuffer(m_level->m_cmdBuffer, srcBuf.buffer, m_level->m_bufFieldStaging.buffer, copyRegion, true);
 			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 			barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
 			vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
+			EndGpuSpan(m_level->m_cmdBuffer, readbackSpan);
 			if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS)
 				return false;
 
-			VkSubmitInfo submitInfo = {};
-			submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-			submitInfo.commandBufferCount = 1;
-			submitInfo.pCommandBuffers = &m_level->m_cmdBuffer;
-			if (vkQueueSubmit(m_computeQueue, 1, &submitInfo, m_level->m_fence) != VK_SUCCESS ||
-			    vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-				return false;
+			if (!SubmitCommandBuffer()) return false;
+			owner.m_queriesPending = owner.m_queryCount != 0u;
+			if (!WaitForFence()) return false;
 
 			std::memcpy(targetHost.data(), m_level->m_bufFieldStaging.mapped, fieldBytes);
 			return true;
@@ -4069,6 +4316,7 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 			return false;
 		m_level->m_hostFieldsDirty = false;
 
+		ProfileTimer mirrorTimer(owner.m_profileEnabled ? &owner.m_profile.mirrorSeconds : nullptr);
 		Engine* cpuEng = (m_level->m_op ? m_level->m_op->GetEngine() : nullptr);
 		if (cpuEng)
 		{
@@ -4255,6 +4503,7 @@ void EngineVulkan::Reset()
 		if (m_level->m_descLayoutMultigrid != VK_NULL_HANDLE) { vkDestroyDescriptorSetLayout(m_device, m_level->m_descLayoutMultigrid, nullptr); m_level->m_descLayoutMultigrid = VK_NULL_HANDLE; }
 
 		if (m_descPool != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyDescriptorPool(m_device, m_descPool, nullptr); m_descPool = VK_NULL_HANDLE; }
+		if (m_queryPool) { vkDestroyQueryPool(m_device, m_queryPool, nullptr); m_queryPool = VK_NULL_HANDLE; }
 		if (m_level->m_fence != VK_NULL_HANDLE)    { vkDestroyFence(m_device, m_level->m_fence, nullptr);              m_level->m_fence = VK_NULL_HANDLE; }
 		if (m_level->m_cmdPool != VK_NULL_HANDLE)  { vkDestroyCommandPool(m_device, m_level->m_cmdPool, nullptr);      m_level->m_cmdPool = VK_NULL_HANDLE; }
 
@@ -4272,7 +4521,11 @@ void EngineVulkan::Reset()
 #endif
 
 	m_level->m_numTS = 0;
+	m_profile = ProfileStatistics();
 #ifdef ENABLE_VULKAN
+	m_runtimeFailed = m_queriesPending = m_sampleDispatches = false;
+	m_queryCount = m_profileSpanCount = 0;
+	m_physicalDevice = VK_NULL_HANDLE;
 	m_level->m_numUpmlCells = 0;
 	m_level->m_totalMurPoints = 0;
 	m_level->m_murFaces.clear();

@@ -794,5 +794,45 @@ class Test_GPUEngine(unittest.TestCase):
     def test_nested_cylindrical_multigrid_equivalence(self):
         self._run_multigrid_pair([12.0, 24.0], 'cyl_mg_nested', field_dumps=True)
 
+    def test_vulkan_batch_sizes_preserve_samples(self):
+        """Batching preserves probe/dump times and fields within 1e-4 / 0.1%."""
+        outputs = {}
+        for batch in (1, 32, 64):
+            csx = ContinuousStructure()
+            grid = csx.GetGrid()
+            grid.SetDeltaUnit(1e-3)
+            grid.SetLines('x', np.linspace(-20, 20, 25))
+            grid.SetLines('y', np.linspace(-20, 20, 17))
+            grid.SetLines('z', np.linspace(-20, 20, 33))
+            exc = csx.AddExcitation('excite', exc_type=0, exc_val=[0, 0, 1])
+            exc.AddBox([-2, -2, -2], [2, 2, 2])
+            probe = csx.AddProbe('probe', p_type=0)
+            probe.AddBox([5, 0, -5], [5, 0, 5])
+            dump = csx.AddDump('fields', dump_type=0, file_type=1)
+            dump.AddBox([-20, -20, 0], [20, 20, 0])
+            fdtd = openEMS(NrTS=97, EndCriteria=0, OverSampling=1)
+            fdtd.SetCSX(csx)
+            fdtd.SetGaussExcite(20e9, 10e9)
+            fdtd.SetBoundaryCond(['MUR', 'PEC', 'PEC', 'PML_4', 'PEC', 'PEC'])
+            sdir = self._sim_path('batch_' + str(batch))
+            fdtd.Run(sdir, engine='vulkan', vulkan_batch_size=batch,
+                     vulkan_profile=(batch == 32), numThreads=1, cleanup=False)
+            outputs[batch] = (np.loadtxt(os.path.join(sdir, 'probe'), comments='%'),
+                              os.path.join(sdir, 'fields.h5'))
+        expected, expected_dump = outputs[1]
+        peak = np.max(np.abs(expected[:, 1]))
+        self.assertGreater(peak, 0)
+        for batch in (32, 64):
+            actual, actual_dump = outputs[batch]
+            np.testing.assert_array_equal(actual[:, 0], expected[:, 0])
+            self.assertLess(np.max(np.abs(actual[:, 1] - expected[:, 1])), peak * 0.001)
+            with h5py.File(expected_dump) as reference, h5py.File(actual_dump) as result:
+                self.assertEqual(set(reference['FieldData/TD']), set(result['FieldData/TD']))
+                for timestep in reference['FieldData/TD']:
+                    a = reference['FieldData/TD/' + timestep]
+                    b = result['FieldData/TD/' + timestep]
+                    np.testing.assert_array_equal(a.attrs['time'], b.attrs['time'])
+                    np.testing.assert_allclose(a[...], b[...], rtol=0.001, atol=1e-4)
+
 if __name__ == '__main__':
     unittest.main()
