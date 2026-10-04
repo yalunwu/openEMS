@@ -35,6 +35,10 @@ public:
 
 	bool SyncFieldsToHost() override;
 	bool SyncProbesToHost() override;
+	bool GetFastEnergy(double& energy) override;
+	bool SupportsFastEnergy() const;
+	bool SetReadbackOptimizationsEnabled(bool enabled); // benchmark/reference switch
+	bool SetEnergyFloat64Enabled(bool enabled); // before Initialize(); exercise FP32 fallback
 	void RegisterProbes(const ProcessingArray* pa) override;
 	std::string GetBackendName() const override;
 
@@ -42,10 +46,11 @@ public:
 
 	enum GpuProfileCategory { ProfileBatch, ProfileVoltage, ProfileCurrent,
 	                          ProfileExtension, ProfileMultigrid, ProfileProbe,
-	                          ProfileReadback, ProfileCategoryCount };
+	                          ProfileReadback, ProfileEnergy, ProfileCategoryCount };
 	struct ProfileStatistics {
 		uint64_t submissions = 0, dispatches = 0, timesteps = 0, sampledSteps = 0;
 		uint64_t uploadedBytes = 0, downloadedBytes = 0, probeBytes = 0;
+		uint64_t energyBytes = 0;
 		double recordSeconds = 0, submitSeconds = 0, waitSeconds = 0;
 		double readbackSeconds = 0, mirrorSeconds = 0;
 		std::array<double, ProfileCategoryCount> gpuSeconds = {};
@@ -95,6 +100,8 @@ private:
 	std::string m_deviceName = "Vulkan GPU";
 	unsigned int m_batchSize = 32;
 	bool m_profileEnabled = false;
+	bool m_readbackOptimizations = true;
+	bool m_enableEnergyFloat64 = true;
 	ProfileStatistics m_profile;
 #ifdef ENABLE_VULKAN
 	struct ProfileSpan { uint32_t first; GpuProfileCategory category; };
@@ -133,11 +140,13 @@ private:
 			memory = VK_NULL_HANDLE;
 			mapped = nullptr;
 			size = 0;
+			memoryProperties = 0;
 		}
 		VkDevice device = VK_NULL_HANDLE;
 		VkBuffer buffer = VK_NULL_HANDLE;
 		VkDeviceMemory memory = VK_NULL_HANDLE;
 		VkDeviceSize size = 0;
+		VkMemoryPropertyFlags memoryProperties = 0;
 		void* mapped = nullptr;
 	};
 
@@ -163,6 +172,9 @@ private:
 	VkDescriptorSetLayout m_descLayoutProbe = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutProbe = VK_NULL_HANDLE;
 	VkPipeline m_pipelineProbe = VK_NULL_HANDLE;
+	bool m_energyFloat64 = false;
+	bool AllocateEnergyResources();
+	void RecordProbeGather(VkCommandBuffer cmd);
 
 	VkDescriptorSetLayout m_descLayoutUpml = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutUpml = VK_NULL_HANDLE;
@@ -345,6 +357,8 @@ private:
 		unsigned int m_numTS = 0;
 		bool m_hostFieldsValid = true;
 		bool m_hostFieldsDirty = true;
+		bool m_probesValid = false, m_energyValid = false;
+		double m_cachedEnergy = 0;
 		std::vector<float> m_hostVolt;
 		std::vector<float> m_hostCurr;
 		std::vector<GpuExcPoint> m_voltExcPoints;
@@ -377,6 +391,12 @@ private:
 		VkDescriptorSet m_descSetVoltExc = VK_NULL_HANDLE;
 		VkDescriptorSet m_descSetCurrExc = VK_NULL_HANDLE;
 		VkDescriptorSet m_descSetProbe = VK_NULL_HANDLE;
+		VulkanBuffer m_bufEnergy;
+		uint32_t m_energyGroups = 0;
+		VkDescriptorSetLayout m_descLayoutEnergy = VK_NULL_HANDLE;
+		VkPipelineLayout m_pipelineLayoutEnergy = VK_NULL_HANDLE;
+		VkPipeline m_pipelineEnergy = VK_NULL_HANDLE;
+		VkDescriptorSet m_descSetEnergy = VK_NULL_HANDLE;
 		VkDescriptorSet m_descSetUpmlVolt = VK_NULL_HANDLE;
 		VkDescriptorSet m_descSetUpmlCurr = VK_NULL_HANDLE;
 		uint32_t m_totalMurPoints = 0;

@@ -19,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include "test_vulkan_performance.h"
+#include "tools/denormal.h"
 
 #include "openems.h"
 #include "FDTD/engine_backend.h"
@@ -45,6 +46,7 @@
 #include "ContinuousStructure.h"
 #include "CSProperties.h"
 #include "CSPropExcitation.h"
+#include "CSPropProbeBox.h"
 #include "CSPropLumpedElement.h"
 #include "CSPropAbsorbingBC.h"
 #include "CSPrimBox.h"
@@ -521,6 +523,8 @@ public:
 	Operator* GetOp() { return FDTD_Op; }
 	Engine* GetEng() { return FDTD_Eng; }
 	EngineBackend* GetBackend() { return m_EngineBackend.get(); }
+	Engine_Interface_Base* Interface() { return NewEngineInterface(); }
+	ProcessingArray* GetProcessings() { return PA; }
 	Engine_Ext_SteadyState* GetSteadyStateDetector() { return Eng_Ext_SSD; }
 	void ReplaceBackend(std::unique_ptr<EngineBackend> backend) { m_EngineBackend = std::move(backend); }
 };
@@ -1600,6 +1604,8 @@ static bool RunMultigridEquivalence(const std::vector<double>& splits, bool open
 	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Cylindrical multigrid setup failed");
 	auto* gpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
 	TEST_ASSERT(gpu != nullptr, "Multigrid Vulkan initialization fell back to CPU");
+	double unsupportedEnergy = 0;
+	TEST_ASSERT(!gpu->SupportsFastEnergy() && !gpu->GetFastEnergy(unsupportedEnergy), "Multigrid SSE energy must retain the CPU calculation");
 	std::vector<Operator*> levels;
 	for (Operator* op = fdtd.GetOp(); op;)
 	{
@@ -1806,6 +1812,293 @@ bool Test_Vulkan_BatchingAndProfiling()
 #endif
 }
 
+bool Test_Vulkan_EnergyReduction()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (bool fp64 : {true, false}) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+		fdtd.SetCSX(CreateCustomGrid(35, 23, 41));
+		fdtd.SetNumberOfTimeSteps(64);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetEnableDumps(false);
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Energy fixture setup failed");
+		EngineVulkan gpu(fdtd.GetOp());
+		TEST_ASSERT(gpu.SetEnergyFloat64Enabled(fp64) && gpu.Initialize(), "Energy backend setup failed");
+		TEST_ASSERT(gpu.SupportsFastEnergy(), "Basic energy capability unavailable");
+		TEST_ASSERT(gpu.SetProfilingEnabled(true), "Energy profiling failed");
+		std::unique_ptr<Engine_Interface_Base> reference(fdtd.Interface());
+		double energy = -1;
+		TEST_ASSERT(gpu.GetFastEnergy(energy) && energy == 0, "Zero fields must have zero energy");
+		for (unsigned int n = 0; n < 3; ++n)
+		for (unsigned int x = 0; x < 35; ++x)
+		for (unsigned int y = 0; y < 23; ++y)
+		for (unsigned int z = 0; z < 41; ++z) {
+			const unsigned int hash = (n * 7919u + x * 104729u + y * 8191u + z * 131u) * 2654435761u;
+			const float v = std::ldexp(float(hash % 1023u) / 1023.0f, int(hash % 40u) - 20);
+			const float h = std::ldexp(float((hash / 1023u) % 1023u) / 1023.0f, int((hash / 41u) % 40u) - 20);
+			gpu.SetVolt(n, x, y, z, v);
+			gpu.SetCurr(n, x, y, z, h);
+			fdtd.GetEng()->SetVolt(n, x, y, z, v);
+			fdtd.GetEng()->SetCurr(n, x, y, z, h);
+		}
+		TEST_ASSERT(gpu.ClearProfile() && gpu.GetFastEnergy(energy), "Edited energy reduction failed");
+		const double expected = reference->CalcFastEnergy();
+		const double relative = std::abs(energy - expected) / expected;
+		std::cout << "Energy " << (fp64 ? "FP64" : "FP32") << " relative error=" << relative << std::endl;
+		TEST_ASSERT(relative < (fp64 ? 1e-12 : 3e-7), "Energy reduction precision exceeded tolerance");
+		const auto first = gpu.GetProfile();
+		TEST_ASSERT(first.downloadedBytes == 0 && first.energyBytes > 0 && first.energyBytes < 35u * 23u * 41u,
+		            "Energy check downloaded full fields");
+		TEST_ASSERT(gpu.GetFastEnergy(energy) && gpu.GetProfile().submissions == first.submissions, "Energy cache submitted work twice");
+		gpu.SetCurr(1, 10, 9, 8, 1e8f);
+		fdtd.GetEng()->SetCurr(1, 10, 9, 8, 1e8f);
+		TEST_ASSERT(gpu.GetFastEnergy(energy), "Current edit did not invalidate energy");
+		TEST_ASSERT(std::abs(energy - reference->CalcFastEnergy()) / reference->CalcFastEnergy() < (fp64 ? 1e-12 : 3e-7), "Edited energy stale");
+		if (!fp64) {
+			for (unsigned int z = 0; z < 40; ++z) gpu.SetCurr(0, 1, 1, z, 1e19f);
+			TEST_ASSERT(!gpu.GetFastEnergy(energy), "FP32 partial overflow must request CPU fallback");
+			TEST_ASSERT(gpu.SyncFieldsToHost() && std::isfinite(reference->CalcFastEnergy()), "Partial overflow lost finite CPU energy");
+		}
+		for (float value : {std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+			gpu.SetVolt(0, 1, 1, 1, value);
+			TEST_ASSERT(!gpu.GetFastEnergy(energy), "Non-finite energy must request CPU fallback");
+			TEST_ASSERT(gpu.SyncFieldsToHost() && !std::isfinite(reference->CalcFastEnergy()), "CPU non-finite fallback changed behavior");
+		}
+		TEST_ASSERT(gpu.SetReadbackOptimizationsEnabled(false) && !gpu.GetFastEnergy(energy), "Reference mode still used GPU energy");
+		gpu.Reset();
+		TEST_ASSERT(gpu.Initialize() && gpu.SetReadbackOptimizationsEnabled(true) && gpu.GetFastEnergy(energy) && energy == 0, "Reset retained energy cache");
+		TEST_ASSERT(gpu.ClearProfile() && gpu.IterateTS(1) && gpu.SyncFieldsToHost() && gpu.GetProfile().submissions == 3,
+		            "Single-field staging fallback did not retain separate copies");
+		{
+#if BOOST_ARCH_X86
+			struct RestoreDenormals { unsigned int previous = _mm_getcsr(); ~RestoreDenormals() { _mm_setcsr(previous); } } restore;
+			_mm_setcsr(restore.previous & ~0x8040u);
+#endif
+			gpu.SetCurr(0, 1, 1, 1, 1e-20f);
+			TEST_ASSERT(!gpu.GetFastEnergy(energy), "Subnormal-scale energy must retain CPU floating-point behavior");
+			TEST_ASSERT(gpu.SyncFieldsToHost(), "Tiny energy fallback synchronization failed");
+			TEST_ASSERT(std::isfinite(reference->CalcFastEnergy()), "Tiny CPU energy is non-finite");
+#if BOOST_ARCH_X86
+			TEST_ASSERT(reference->CalcFastEnergy() > 0, "Tiny CPU energy lost preserved subnormal products");
+#endif
+		}
+	}
+	TestFDTDAccess sse;
+	sse.SetLibraryArguments({"--engine=sse", "--numThreads=1"});
+	sse.SetCSX(CreateCustomGrid(7, 5, 9));
+	sse.SetNumberOfTimeSteps(64);
+	sse.SetGaussExcite(20e9, 10e9);
+	sse.SetEnableDumps(false);
+	TEST_ASSERT(sse.SetupFDTD() == 0, "SSE energy fallback fixture failed");
+	EngineVulkan gpu(sse.GetOp());
+	double energy = 0;
+	TEST_ASSERT(gpu.Initialize() && !gpu.SupportsFastEnergy() && !gpu.GetFastEnergy(energy), "SSE energy must retain its CPU accumulation");
+	gpu.SetCurr(2, 1, 1, 8, 0.5f); // SSE includes the final z vector, unlike basic energy.
+	std::unique_ptr<Engine_Interface_Base> reference(sse.Interface());
+	TEST_ASSERT(gpu.SyncFieldsToHost() && std::abs(reference->CalcFastEnergy() - MUE0 * 0.25) < 1e-20, "SSE fallback lost the final z lane");
+	return true;
+#endif
+}
+
+bool Test_Vulkan_EnergyDecay()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (bool fp64 : {true, false}) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+		ContinuousStructure* csx = CreateCustomGrid(21, 17, 25);
+		auto* material = new CSPropMaterial(csx->GetParameterSet());
+		material->SetEpsilon(2.0);
+		material->SetKappa(0.1);
+		auto* slab = new CSPrimBox(csx->GetParameterSet(), material);
+		const double bounds[] = {-20, 20, -20, 20, -20, 20};
+		for (unsigned int i = 0; i < 6; ++i) slab->SetCoord(i, bounds[i]);
+		csx->AddProperty(material);
+		auto* source = new CSPropExcitation(csx->GetParameterSet());
+		source->SetExcitType(0);
+		source->SetExcitation(1.0, 2);
+		auto* box = new CSPrimBox(csx->GetParameterSet(), source);
+		const double sourceBounds[] = {-2, 2, -2, 2, -3, 3};
+		for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, sourceBounds[i]);
+		csx->AddProperty(source);
+		fdtd.SetCSX(csx);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetEnableDumps(false);
+		fdtd.SetNumberOfTimeSteps(1024);
+		for (unsigned int i = 0; i < 6; ++i) fdtd.Set_BC_PML(i, 4);
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Decay energy fixture failed");
+		EngineVulkan gpu(fdtd.GetOp());
+		TEST_ASSERT(gpu.SetEnergyFloat64Enabled(fp64) && gpu.Initialize(), "Decay energy backend failed");
+		std::unique_ptr<Engine_Interface_Base> reference(fdtd.Interface());
+		double maxError = 0, peak = 0, last = 0;
+		unsigned int fallbacks = 0;
+		for (unsigned int count : {1u, 7u, 23u, 64u, 128u, 256u, 512u}) {
+			TEST_ASSERT(fdtd.GetEng()->IterateTS(count), "CPU decay stepping failed");
+			const double cpuEnergy = reference->CalcFastEnergy();
+			double energy = 0;
+			TEST_ASSERT(gpu.IterateTS(count), "GPU decay stepping failed");
+			if (!gpu.GetFastEnergy(energy)) {
+				TEST_ASSERT(gpu.SyncFieldsToHost(), "Decay energy fallback synchronization failed");
+				energy = reference->CalcFastEnergy();
+				const double tinyLimit = 3.0 * 21u * 17u * 25u * std::numeric_limits<float>::min() * (EPS0 + MUE0) / (fp64 ? 1e-12 : 3e-7);
+				TEST_ASSERT(energy <= tinyLimit, "Ordinary decay energy unexpectedly requested CPU fallback");
+				++fallbacks;
+			}
+			TEST_ASSERT(std::abs(energy - cpuEnergy) <= std::max(energy, cpuEnergy) * 0.001, "CPU/GPU decay energy differs by more than 0.1%");
+			TEST_ASSERT(gpu.SyncFieldsToHost(), "Decay reference synchronization failed");
+			const double expected = reference->CalcFastEnergy();
+			const double error = expected > 0 ? std::abs(energy - expected) / expected : std::abs(energy);
+			maxError = std::max(maxError, error);
+			TEST_ASSERT(error < (fp64 ? 1e-12 : 3e-7), "Decay reduction precision exceeded tolerance");
+			peak = std::max(peak, energy);
+			last = energy;
+		}
+		std::cout << "Decay energy " << (fp64 ? "FP64" : "FP32") << " max relative error=" << maxError << " final/peak=" << last / peak << " zero/tiny fallbacks=" << fallbacks << std::endl;
+		TEST_ASSERT(peak > 0 && last < peak * 1e-3, "Energy fixture did not excite and decay");
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_ProbeReadbackCache()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1"});
+	ContinuousStructure* csx = CreateCustomGrid(17, 13, 19);
+	auto* property = new CSPropProbeBox(csx->GetParameterSet());
+	property->SetName("cache_probe");
+	property->SetProbeType(0);
+	auto* box = new CSPrimBox(csx->GetParameterSet(), property);
+	const double bounds[] = {0, 0, 0, 0, -5, 5};
+	for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, bounds[i]);
+	csx->AddProperty(property);
+	fdtd.SetCSX(csx);
+	fdtd.SetGaussExcite(20e9, 10e9);
+	fdtd.SetEnableDumps(false);
+	fdtd.SetNumberOfTimeSteps(64);
+	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Probe cache fixture failed");
+	auto* gpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+	TEST_ASSERT(gpu && gpu->SetProfilingEnabled(true), "Probe cache backend unavailable");
+	ProcessingArray* processing = fdtd.GetProcessings();
+	gpu->RegisterProbes(processing);
+	gpu->SetVolt(2, 8, 6, 9, 0.25f);
+	TEST_ASSERT(gpu->SyncProbesToHost() && fdtd.GetEng()->GetVolt(2, 8, 6, 9) == 0.25f, "On-demand gather missed field edit");
+	const auto initial = gpu->GetProfile();
+	TEST_ASSERT(initial.probeBytes > 0 && initial.downloadedBytes == 0, "Probe sync downloaded full fields");
+	TEST_ASSERT(gpu->SyncProbesToHost() && gpu->GetProfile().submissions == initial.submissions, "Repeated probe sync submitted a gather");
+	TEST_ASSERT(gpu->ClearProfile() && gpu->IterateTS(33) && gpu->SyncProbesToHost(), "Fused gather failed");
+	const auto fused = gpu->GetProfile();
+	TEST_ASSERT(fused.submissions == 2 && fused.probeBytes == initial.probeBytes, "Sample boundary needs a separate gather submission");
+	TEST_ASSERT(gpu->SyncProbesToHost() && gpu->GetProfile().submissions == fused.submissions, "Fused probe result was not cached");
+	TEST_ASSERT(gpu->SyncFieldsToHost(), "Full fields after partial sync failed");
+	TEST_ASSERT(gpu->GetProfile().submissions == fused.submissions + 1 && gpu->GetProfile().downloadedBytes == 24ull * 17u * 13u * 19u,
+	            "Partial sync marked full fields valid or copies were not batched");
+	gpu->SetVolt(2, 8, 6, 9, 0.75f);
+	TEST_ASSERT(gpu->SyncProbesToHost() && fdtd.GetEng()->GetVolt(2, 8, 6, 9) == 0.75f, "Probe cache survived a voltage edit");
+	// Re-registration waits for pending stepping before replacing buffer descriptors.
+	TEST_ASSERT(gpu->IterateTS(5), "Pending probe registration setup failed");
+	for (unsigned int i = 0; i < 20; ++i) gpu->RegisterProbes(processing);
+	TEST_ASSERT(gpu->ClearProfile() && gpu->SyncProbesToHost() && gpu->GetProfile().submissions == 1, "Probe registration did not invalidate cached values");
+	gpu->RegisterProbes(nullptr);
+	TEST_ASSERT(gpu->ClearProfile() && gpu->SyncProbesToHost() && gpu->GetProfile().submissions == 0, "Empty registry gathered probes");
+	gpu->RegisterProbes(processing);
+	TEST_ASSERT(gpu->SetReadbackOptimizationsEnabled(false) && gpu->ClearProfile() && gpu->IterateTS(1) && gpu->SyncProbesToHost(), "Reference gather failed");
+	TEST_ASSERT(gpu->GetProfile().submissions == 2, "Reference mode did not retain separate probe gather");
+	return true;
+#endif
+}
+
+bool Test_Vulkan_EnergyStopping()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	class EnergyTrace : public EngineVulkan {
+	public:
+		EnergyTrace(Operator* op, Engine_Interface_Base* engineInterface) : EngineVulkan(op), reference(engineInterface) {}
+		bool GetFastEnergy(double& energy) override {
+			if (!EngineVulkan::GetFastEnergy(energy)) {
+				if (!SyncFieldsToHost()) return false;
+				energy = reference->CalcFastEnergy();
+			}
+			samples.push_back({GetNumberOfTimesteps(), energy});
+			return true;
+		}
+		std::vector<std::pair<unsigned int, double>> samples;
+	private:
+		std::unique_ptr<Engine_Interface_Base> reference;
+	};
+	auto setup = [](TestFDTDAccess& fdtd, bool sinus, double criterion, unsigned int mode) -> EnergyTrace* {
+		ContinuousStructure* csx = CreateCustomGrid(17, 13, 19);
+		auto* source = new CSPropExcitation(csx->GetParameterSet());
+		source->SetExcitType(0);
+		source->SetExcitation(1.0, 2);
+		auto* box = new CSPrimBox(csx->GetParameterSet(), source);
+		const double bounds[] = {-3, 3, -3, 3, -4, 4};
+		for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, bounds[i]);
+		csx->AddProperty(source);
+		fdtd.SetCSX(csx);
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1", "--exact-endcriteria"});
+		fdtd.SetNumberOfTimeSteps(512);
+		fdtd.SetEndCriteria(criterion);
+		fdtd.SetEnableDumps(false);
+		if (sinus) fdtd.SetSinusExcite(10e9);
+		else fdtd.SetGaussExcite(20e9, 10e9);
+		for (unsigned int i = 0; i < 6; ++i) fdtd.Set_BC_Type(i, 2);
+		if (fdtd.SetupFDTD() != 0) return nullptr;
+		std::unique_ptr<EnergyTrace> gpu(new EnergyTrace(fdtd.GetOp(), fdtd.Interface()));
+		if (!gpu->SetEnergyFloat64Enabled(mode != 2) || !gpu->SetReadbackOptimizationsEnabled(mode != 0) || !gpu->Initialize() || !gpu->SetProfilingEnabled(true)) return nullptr;
+		gpu->RegisterProbes(fdtd.GetProcessings());
+		EnergyTrace* result = gpu.get();
+		fdtd.ReplaceBackend(std::move(gpu));
+		return result;
+	};
+	TestFDTDAccess baseline;
+	EnergyTrace* trace = setup(baseline, false, 0, false);
+	TEST_ASSERT(trace, "Energy schedule fixture failed");
+	baseline.RunFDTD();
+	double peak = 0, threshold = 0;
+	for (const auto& sample : trace->samples) {
+		peak = std::max(peak, sample.second);
+		const double ratio = peak > 0 ? sample.second / peak : 1;
+		if (!threshold && sample.first > 80 && ratio < 0.1 && ratio > 0.001) threshold = ratio;
+	}
+	TEST_ASSERT(threshold > 0, "Stopping fixture did not cross a decay threshold");
+	for (bool sinus : {false, true})
+	for (double criterion : (sinus ? std::vector<double>{0.01} : std::vector<double>{threshold * (1 - 1e-6), threshold * (1 + 1e-6)})) {
+		unsigned int stopped = 0;
+		std::vector<std::pair<unsigned int, double>> reference;
+		for (unsigned int optimized : {0u, 1u, 2u}) {
+			TestFDTDAccess fdtd;
+			EnergyTrace* gpu = setup(fdtd, sinus, criterion, optimized);
+			TEST_ASSERT(gpu, "Stopping comparison setup failed");
+			fdtd.RunFDTD();
+			if (!optimized) { stopped = gpu->GetNumberOfTimesteps(); reference = gpu->samples; }
+			else {
+				TEST_ASSERT(gpu->GetNumberOfTimesteps() == stopped && gpu->samples.size() == reference.size(), "GPU energy changed stopping or sampling schedule");
+				for (size_t i = 0; i < reference.size(); ++i) {
+					TEST_ASSERT(reference[i].first == gpu->samples[i].first, "Energy check timestep changed");
+					const double expected = reference[i].second;
+					TEST_ASSERT(std::abs(expected - gpu->samples[i].second) <= std::max(expected * (optimized == 2 ? 3e-7 : 1e-12), 1e-30), "Energy trace exceeded reduction precision tolerance");
+				}
+				TEST_ASSERT(gpu->GetProfile().downloadedBytes == 24ull * 17u * 13u * 19u, "Energy-only stopping downloaded fields before final sync");
+			}
+			std::cout << "Stopping sinus=" << sinus << " optimized=" << optimized << " criterion=" << criterion << " timestep=" << gpu->GetNumberOfTimesteps() << std::endl;
+		}
+		TEST_ASSERT(stopped < 512, "Stopping fixture reached the fixed timestep limit");
+	}
+	return true;
+#endif
+}
+
 bool Test_Vulkan_FailurePropagation()
 {
 	class FailingVulkan : public EngineVulkan {
@@ -1848,6 +2141,13 @@ int main(int argc, char* argv[])
 	if (argc > 1 && std::string(argv[1]) == "--batching-tests") {
 		RUN_TEST(Test_Vulkan_BatchingAndProfiling);
 		RUN_TEST(Test_Vulkan_FailurePropagation);
+		return tests_failed ? 1 : 0;
+	}
+	if (argc > 1 && std::string(argv[1]) == "--readback-tests") {
+		RUN_TEST(Test_Vulkan_EnergyReduction);
+		RUN_TEST(Test_Vulkan_EnergyDecay);
+		RUN_TEST(Test_Vulkan_ProbeReadbackCache);
+		RUN_TEST(Test_Vulkan_EnergyStopping);
 		return tests_failed ? 1 : 0;
 	}
 	if (argc > 1 && std::string(argv[1]) == "--multigrid-benchmark")
@@ -1910,6 +2210,10 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_Cylinder_Equivalence);
 	RUN_TEST(Test_Vulkan_CheckedDimensionsAndIndices);
 	RUN_TEST(Test_Vulkan_BatchingAndProfiling);
+	RUN_TEST(Test_Vulkan_EnergyReduction);
+	RUN_TEST(Test_Vulkan_EnergyDecay);
+	RUN_TEST(Test_Vulkan_ProbeReadbackCache);
+	RUN_TEST(Test_Vulkan_EnergyStopping);
 	RUN_TEST(Test_Vulkan_FailurePropagation);
 	RUN_TEST(Test_Vulkan_Multigrid_InvalidMetadata);
 	RUN_TEST(Test_Vulkan_Multigrid_ClosedAlpha);

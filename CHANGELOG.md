@@ -19,6 +19,10 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Vulkan energy reduction for the basic Cartesian engine, fused probe gathering,
+  and combined voltage/current field readbacks with cached host memory where
+  available. SSE, cylindrical and multigrid
+  energy checks retain their existing CPU calculation.
 - Vulkan profiling with `--vulkan-profile`, plus a native benchmark matrix
   (`test_backend --vulkan-benchmark`) with batch-size sweeps and CSV output.
 - A scalable Python dipole-array tutorial with 5.5M, 19.4M and 41.8M solver

@@ -76,6 +76,125 @@ bool EngineVulkan::SetBatchSize(unsigned int size)
 	return true;
 }
 
+bool EngineVulkan::SetReadbackOptimizationsEnabled(bool enabled)
+{
+#ifdef ENABLE_VULKAN
+	if (m_device && !Synchronize()) return false;
+	const bool changed = m_readbackOptimizations != enabled;
+#endif
+	m_readbackOptimizations = enabled;
+	m_level->m_probesValid = m_level->m_energyValid = false;
+#ifdef ENABLE_VULKAN
+	if (m_device && changed)
+	{
+		if (!enabled)
+		{
+			// Restore original staging memory/copies for the benchmark reference.
+			DestroyBuffer(m_level->m_bufFieldStaging);
+			if (!CreateBuffer(3ull * m_level->m_grid.numCells * sizeof(float),
+			                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			                  m_level->m_bufFieldStaging))
+			{
+				ProfileOwner().m_runtimeFailed = true;
+				return false;
+			}
+		}
+		if (!AllocateProbeBuffers()) { ProfileOwner().m_runtimeFailed = true; return false; }
+	}
+#endif
+	if (m_level->m_innerGrid && !m_level->m_innerGrid->SetReadbackOptimizationsEnabled(enabled)) return false;
+	return true;
+}
+
+bool EngineVulkan::SetEnergyFloat64Enabled(bool enabled)
+{
+#ifdef ENABLE_VULKAN
+	if (m_device) return false;
+#endif
+	m_enableEnergyFloat64 = enabled;
+	return true;
+}
+
+bool EngineVulkan::SupportsFastEnergy() const
+{
+#ifdef ENABLE_VULKAN
+	// SSE CalcFastEnergy includes padded z lanes and ordered FP32 accumulation.
+	// Retain that implementation, including projected root fields in multigrid.
+	const Engine* engine = m_level->m_op ? m_level->m_op->GetEngine() : nullptr;
+	return m_readbackOptimizations && m_device && engine && engine->GetType() == Engine::BASIC &&
+	       (!m_level->m_energyGroups || (m_level->m_pipelineEnergy && m_level->m_descSetEnergy && m_level->m_bufEnergy.mapped));
+#else
+	return false;
+#endif
+}
+
+bool EngineVulkan::GetFastEnergy(double& energy)
+{
+#ifdef ENABLE_VULKAN
+	if (!SupportsFastEnergy() || ProfileOwner().m_runtimeFailed) return false;
+	if (m_level->m_energyValid) { energy = m_level->m_cachedEnergy; return true; }
+	if (!m_level->m_energyGroups) { energy = 0; return true; }
+	ProfileTimer readbackTimer(ProfileOwner().m_profileEnabled ? &ProfileOwner().m_profile.readbackSeconds : nullptr);
+	if (!SyncHierarchyToDevice() || !WaitForFence()) return false;
+	VkCommandBufferBeginInfo begin = {};
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if (vkBeginCommandBuffer(m_level->m_cmdBuffer, &begin) != VK_SUCCESS) return false;
+	BeginProfileCommands(m_level->m_cmdBuffer);
+	const uint32_t span = BeginGpuSpan(m_level->m_cmdBuffer, ProfileEnergy);
+	VkMemoryBarrier barrier = {};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+	const auto& g = m_level->m_grid;
+	uint32_t pc[] = {g.dimX, g.dimY, g.dimZ, g.numCells, g.dimX - 1u, g.dimY - 1u, g.dimZ - 1u, m_level->m_energyGroups};
+	vkCmdBindPipeline(m_level->m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_level->m_pipelineEnergy);
+	vkCmdBindDescriptorSets(m_level->m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_level->m_pipelineLayoutEnergy,
+	                        0, 1, &m_level->m_descSetEnergy, 0, nullptr);
+	vkCmdPushConstants(m_level->m_cmdBuffer, m_level->m_pipelineLayoutEnergy, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+	VkPhysicalDeviceProperties props = {};
+	vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
+	const uint32_t groupsX = std::min(m_level->m_energyGroups, props.limits.maxComputeWorkGroupCount[0]);
+	Dispatch(m_level->m_cmdBuffer, groupsX, (m_level->m_energyGroups + groupsX - 1u) / groupsX, 1, ProfileEnergy);
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+	vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+	EndGpuSpan(m_level->m_cmdBuffer, span);
+	if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS || !SubmitCommandBuffer()) return false;
+	EngineVulkan& owner = ProfileOwner();
+	owner.m_queriesPending = owner.m_queryCount != 0u;
+	if (!WaitForFence()) return false;
+	if (owner.m_profileEnabled) owner.m_profile.energyBytes += m_level->m_bufEnergy.size;
+	double electric = 0, magnetic = 0;
+	const auto* d = static_cast<const double*>(m_level->m_bufEnergy.mapped);
+	const auto* f = static_cast<const float*>(m_level->m_bufEnergy.mapped);
+	for (uint32_t i = 0; i < m_level->m_energyGroups; ++i) {
+		electric += m_energyFloat64 ? d[2u * i] : static_cast<double>(f[2u * i]);
+		magnetic += m_energyFloat64 ? d[2u * i + 1u] : static_cast<double>(f[2u * i + 1u]);
+	}
+	energy = EPS0 * electric + MUE0 * magnetic;
+	// Preserve the CPU's non-finite/overflow behavior through its existing path.
+	if (!std::isfinite(energy)) return false;
+	// Devices may flush subnormal float products. Their total omitted contribution
+	// is bounded by the number of products times FLT_MIN and the energy weights.
+	const double denormalBound = 3.0 * m_level->m_grid.numCells * std::numeric_limits<float>::min() * (EPS0 + MUE0);
+	if (energy > 0 && energy < denormalBound / (m_energyFloat64 ? 1e-12 : 3e-7)) return false;
+	if (energy == 0 && (!m_level->m_hostFieldsValid ||
+	    std::any_of(m_level->m_hostVolt.begin(), m_level->m_hostVolt.end(), [](float value) { return value != 0; }) ||
+	    std::any_of(m_level->m_hostCurr.begin(), m_level->m_hostCurr.end(), [](float value) { return value != 0; }))) return false;
+	m_level->m_cachedEnergy = energy;
+	m_level->m_energyValid = true;
+	return true;
+#else
+	UNUSED(energy);
+	return false;
+#endif
+}
+
 bool EngineVulkan::SetProfilingEnabled(bool enabled)
 {
 #ifdef ENABLE_VULKAN
@@ -136,7 +255,8 @@ void EngineVulkan::WriteProfile(std::ostream& stream)
 	       << " probe_bytes=" << p.probeBytes << " record_ms=" << p.recordSeconds * 1000
 	       << " submit_ms=" << p.submitSeconds * 1000 << " wait_ms=" << p.waitSeconds * 1000
 	       << " readback_ms=" << p.readbackSeconds * 1000 << " mirror_ms=" << p.mirrorSeconds * 1000;
-	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback"};
+	stream << " energy_bytes=" << p.energyBytes;
+	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback", "energy"};
 	for (unsigned int i = 0; i < ProfileCategoryCount; ++i)
 		stream << " gpu_" << names[i] << "_ms=" << p.gpuSeconds[i] * 1000
 		       << " gpu_" << names[i] << "_samples=" << p.gpuSamples[i];
@@ -152,7 +272,8 @@ std::string EngineVulkan::GetDeviceDescription() const
 		vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
 		return m_deviceName + " vendor=" + std::to_string(props.vendorID) +
 		       " device=" + std::to_string(props.deviceID) + " driver_raw=" + std::to_string(props.driverVersion) +
-		       " api=" + std::to_string(props.apiVersion);
+		       " api=" + std::to_string(props.apiVersion) + " staging_host_cached=" +
+		       std::to_string((m_level->m_bufFieldStaging.memoryProperties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0);
 	}
 #endif
 	return m_deviceName;
@@ -419,6 +540,9 @@ bool EngineVulkan::InitializeLevel()
 		std::cerr << "[openEMS Vulkan] Failed to compile and create compute pipelines." << std::endl;
 		return false;
 	}
+	// Optional capability; unsupported precision/resources retain CPU energy.
+	if (!AllocateEnergyResources())
+		std::cerr << "[openEMS Vulkan] Fast energy unavailable; retaining CPU energy checks." << std::endl;
 
 	if (!AllocateExcitationBuffers())
 	{
@@ -539,13 +663,19 @@ bool EngineVulkan::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkM
 	VkMemoryRequirements memReqs;
 	vkGetBufferMemoryRequirements(m_device, outBuf.buffer, &memReqs);
 
-	uint32_t memTypeIndex = FindMemoryType(memReqs.memoryTypeBits, properties);
+	uint32_t memTypeIndex = UINT32_MAX;
+	if (m_readbackOptimizations && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+		memTypeIndex = FindMemoryType(memReqs.memoryTypeBits, properties | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+	if (memTypeIndex == UINT32_MAX) memTypeIndex = FindMemoryType(memReqs.memoryTypeBits, properties);
 	if (memTypeIndex == UINT32_MAX)
 	{
 		vkDestroyBuffer(m_device, outBuf.buffer, nullptr);
 		outBuf.buffer = VK_NULL_HANDLE;
 		return false;
 	}
+	VkPhysicalDeviceMemoryProperties memoryProperties = {};
+	vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memoryProperties);
+	outBuf.memoryProperties = memoryProperties.memoryTypes[memTypeIndex].propertyFlags;
 
 	VkMemoryAllocateInfo allocInfo = {};
 	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -719,6 +849,11 @@ bool EngineVulkan::InitVulkan()
 	deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 	deviceCreateInfo.queueCreateInfoCount = 1;
 	deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
+	VkPhysicalDeviceFeatures available = {}, enabled = {};
+	vkGetPhysicalDeviceFeatures(m_physicalDevice, &available);
+	enabled.shaderFloat64 = m_enableEnergyFloat64 ? available.shaderFloat64 : VK_FALSE;
+	m_energyFloat64 = enabled.shaderFloat64 != VK_FALSE;
+	deviceCreateInfo.pEnabledFeatures = &enabled;
 
 	if (vkCreateDevice(m_physicalDevice, &deviceCreateInfo, nullptr, &m_device) != VK_SUCCESS)
 	{
@@ -738,6 +873,7 @@ bool EngineVulkan::InitSharedVulkan(EngineVulkan& parent)
 	m_computeQueue = parent.m_computeQueue;
 	m_computeQueueFamily = parent.m_computeQueueFamily;
 	m_deviceName = parent.m_deviceName;
+	m_energyFloat64 = parent.m_energyFloat64;
 	m_ownsVulkanDevice = false;
 	m_deviceOwner = parent.m_deviceOwner ? parent.m_deviceOwner : &parent;
 	return InitCommandResources();
@@ -797,11 +933,13 @@ bool EngineVulkan::AllocateBuffers()
 	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVolt)) return false;
 	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufCurr)) return false;
 
-	// Staging buffer in host memory for transfers
-	if (!CreateBuffer(fieldBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, m_level->m_bufFieldStaging))
+	// Prefer two fields per transfer; retain the smaller staging allocation if needed.
+	const VkBufferUsageFlags stagingUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	const VkMemoryPropertyFlags stagingMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (!CreateBuffer((m_readbackOptimizations ? 2 : 1) * fieldBytes, stagingUsage, stagingMemory, m_level->m_bufFieldStaging))
 	{
-		return false;
+		DestroyBuffer(m_level->m_bufFieldStaging);
+		if (!m_readbackOptimizations || !CreateBuffer(fieldBytes, stagingUsage, stagingMemory, m_level->m_bufFieldStaging)) return false;
 	}
 
 	// Upload initial material coefficient matrices if operator is present
@@ -1609,6 +1747,8 @@ bool EngineVulkan::AllocateExcitationBuffers()
 
 bool EngineVulkan::AllocateProbeBuffers()
 {
+	DestroyBuffer(m_level->m_bufProbePoints);
+	DestroyBuffer(m_level->m_bufProbeValues);
 	if (m_level->m_probePoints.empty()) return true;
 
 	size_t count = m_level->m_probePoints.size();
@@ -1635,7 +1775,7 @@ bool EngineVulkan::AllocateProbeBuffers()
 	dsAlloc.descriptorPool = m_descPool;
 	dsAlloc.descriptorSetCount = 1;
 	dsAlloc.pSetLayouts = &m_descLayoutProbe;
-	if (vkAllocateDescriptorSets(m_device, &dsAlloc, &m_level->m_descSetProbe) != VK_SUCCESS)
+	if (!m_level->m_descSetProbe && vkAllocateDescriptorSets(m_device, &dsAlloc, &m_level->m_descSetProbe) != VK_SUCCESS)
 	{
 		return false;
 	}
@@ -1659,6 +1799,104 @@ bool EngineVulkan::AllocateProbeBuffers()
 	vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
 
 	return true;
+}
+
+bool EngineVulkan::AllocateEnergyResources()
+{
+	const Engine* engine = m_level->m_op ? m_level->m_op->GetEngine() : nullptr;
+	if (!engine || engine->GetType() != Engine::BASIC) return true;
+	const auto& g = m_level->m_grid;
+	const uint64_t cells = uint64_t(g.dimX - 1u) * (g.dimY - 1u) * (g.dimZ - 1u);
+	m_level->m_energyGroups = static_cast<uint32_t>((cells + 255u) / 256u);
+	if (!m_level->m_energyGroups) return true;
+	VkPhysicalDeviceProperties props = {};
+	vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
+	const uint32_t gx = std::min(m_level->m_energyGroups, props.limits.maxComputeWorkGroupCount[0]);
+	if ((m_level->m_energyGroups + gx - 1u) / gx > props.limits.maxComputeWorkGroupCount[1]) return false;
+	const VkDeviceSize bytes = uint64_t(m_level->m_energyGroups) * 2u * (m_energyFloat64 ? sizeof(double) : sizeof(float));
+	if (!CreateBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, m_level->m_bufEnergy)) return false;
+	std::string source(VulkanShaders::kShaderFastEnergy);
+	if (m_energyFloat64) source.insert(source.find('\n') + 1u, "#define USE_FP64\n");
+	const auto spirv = CompileGLSLToSpirv(source, shaderc_glsl_compute_shader, "fast_energy.comp");
+	VkShaderModule module = CreateShaderModule(spirv);
+	if (!module) return false;
+	struct ModuleGuard { VkDevice device; VkShaderModule module; ~ModuleGuard() { vkDestroyShaderModule(device, module, nullptr); } } guard = {m_device, module};
+	VkDescriptorSetLayoutBinding bindings[3] = {};
+	for (uint32_t i = 0; i < 3u; ++i) {
+		bindings[i].binding = i;
+		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+	VkDescriptorSetLayoutCreateInfo layout = {};
+	layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layout.bindingCount = 3;
+	layout.pBindings = bindings;
+	if (vkCreateDescriptorSetLayout(m_device, &layout, nullptr, &m_level->m_descLayoutEnergy) != VK_SUCCESS) return false;
+	VkPushConstantRange range = {};
+	range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	range.size = 8u * sizeof(uint32_t);
+	VkPipelineLayoutCreateInfo pipelineLayout = {};
+	pipelineLayout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayout.setLayoutCount = 1;
+	pipelineLayout.pSetLayouts = &m_level->m_descLayoutEnergy;
+	pipelineLayout.pushConstantRangeCount = 1;
+	pipelineLayout.pPushConstantRanges = &range;
+	if (vkCreatePipelineLayout(m_device, &pipelineLayout, nullptr, &m_level->m_pipelineLayoutEnergy) != VK_SUCCESS) return false;
+	VkComputePipelineCreateInfo pipeline = {};
+	pipeline.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+	pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+	pipeline.stage.module = module;
+	pipeline.stage.pName = "main";
+	pipeline.layout = m_level->m_pipelineLayoutEnergy;
+	if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_level->m_pipelineEnergy) != VK_SUCCESS) return false;
+	VkDescriptorSetAllocateInfo allocate = {};
+	allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocate.descriptorPool = m_descPool;
+	allocate.descriptorSetCount = 1;
+	allocate.pSetLayouts = &m_level->m_descLayoutEnergy;
+	if (vkAllocateDescriptorSets(m_device, &allocate, &m_level->m_descSetEnergy) != VK_SUCCESS) return false;
+	VulkanBuffer* buffers[] = {&m_level->m_bufVolt, &m_level->m_bufCurr, &m_level->m_bufEnergy};
+	VkDescriptorBufferInfo info[3] = {};
+	VkWriteDescriptorSet writes[3] = {};
+	for (uint32_t i = 0; i < 3u; ++i) {
+		info[i].buffer = buffers[i]->buffer;
+		info[i].range = buffers[i]->size;
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = m_level->m_descSetEnergy;
+		writes[i].dstBinding = i;
+		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[i].descriptorCount = 1;
+		writes[i].pBufferInfo = &info[i];
+	}
+	vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+	std::cout << "[openEMS Vulkan] Fast energy uses " << (m_energyFloat64 ? "FP64" : "FP32") << " partial sums and CPU double accumulation." << std::endl;
+	return true;
+}
+
+void EngineVulkan::RecordProbeGather(VkCommandBuffer cmd)
+{
+	const uint32_t count = static_cast<uint32_t>(m_level->m_probePoints.size());
+	const uint32_t span = BeginGpuSpan(cmd, ProfileProbe);
+	VkMemoryBarrier barrier = {};
+	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineProbe);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutProbe, 0, 1, &m_level->m_descSetProbe, 0, nullptr);
+	vkCmdPushConstants(cmd, m_pipelineLayoutProbe, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
+	Dispatch(cmd, (count + 63u) / 64u, 1, 1, ProfileProbe);
+	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+	EndGpuSpan(cmd, span);
+	EngineVulkan& owner = ProfileOwner();
+	if (owner.m_profileEnabled) owner.m_profile.probeBytes += count * sizeof(float);
 }
 
 bool EngineVulkan::AllocateUpmlBuffers()
@@ -3268,9 +3506,18 @@ bool EngineVulkan::AllocateMultigridBuffers()
 
 void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 {
+#ifdef ENABLE_VULKAN
+	if (m_device && !ProfileOwner().Synchronize()) return;
+#endif
+	m_level->m_probesValid = false;
 	m_level->m_pa = pa;
 	m_level->m_probePoints.clear();
-	if (!m_level->m_pa) return;
+	if (!m_level->m_pa) {
+#ifdef ENABLE_VULKAN
+		if (m_device) AllocateProbeBuffers();
+#endif
+		return;
+	}
 
 	for (size_t i = 0; i < m_level->m_pa->GetNumberOfProcessings(); ++i)
 	{
@@ -3418,10 +3665,10 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 	{
 		std::cout << "[openEMS Vulkan] Registered " << m_level->m_probePoints.size()
 		          << " active probe monitoring points for fast on-device extraction." << std::endl;
-#ifdef ENABLE_VULKAN
-		AllocateProbeBuffers();
-#endif
 	}
+#ifdef ENABLE_VULKAN
+	if (m_device && !AllocateProbeBuffers()) ProfileOwner().m_runtimeFailed = true;
+#endif
 }
 
 #ifdef ENABLE_VULKAN
@@ -4073,6 +4320,7 @@ bool EngineVulkan::SyncHierarchyToDevice()
 void EngineVulkan::MarkHierarchyHostInvalid()
 {
 	m_level->m_hostFieldsValid = false;
+	m_level->m_probesValid = m_level->m_energyValid = false;
 	if (m_level->m_innerGrid)
 		m_level->m_innerGrid->MarkHierarchyHostInvalid();
 }
@@ -4131,6 +4379,8 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 			m_sampleDispatches = m_profileEnabled;
 			if (done + count == iterTS) RecordProjectionHierarchy(m_level->m_cmdBuffer);
 			m_sampleDispatches = false;
+			if (m_readbackOptimizations && done + count == iterTS && !m_level->m_probePoints.empty())
+				RecordProbeGather(m_level->m_cmdBuffer);
 			EndGpuSpan(m_level->m_cmdBuffer, batchSpan);
 			if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS)
 			{
@@ -4143,6 +4393,7 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 		if (m_profileEnabled) m_profile.timesteps += count;
 		SetHierarchyTimestep(firstTS + count);
 		MarkHierarchyHostInvalid();
+		m_level->m_probesValid = m_readbackOptimizations && done + count == iterTS && !m_level->m_probePoints.empty();
 		done += count;
 	}
 	return true;
@@ -4158,39 +4409,23 @@ bool EngineVulkan::SyncProbesToHost()
 {
 #ifdef ENABLE_VULKAN
 	if (!m_device || ProfileOwner().m_runtimeFailed) return false;
-	if (m_level->m_probePoints.empty() || !m_level->m_bufProbeValues.mapped) return true;
-
-	uint32_t count = static_cast<uint32_t>(m_level->m_probePoints.size());
-
-	if (!WaitForFence()) return false;
-
-	VkCommandBufferBeginInfo beginInfo = {};
-	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	if (vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo) != VK_SUCCESS) return false;
-	BeginProfileCommands(m_level->m_cmdBuffer);
-	const uint32_t probeSpan = BeginGpuSpan(m_level->m_cmdBuffer, ProfileProbe);
-
-	vkCmdBindPipeline(m_level->m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineProbe);
-	vkCmdBindDescriptorSets(m_level->m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutProbe, 0, 1, &m_level->m_descSetProbe, 0, nullptr);
-	vkCmdPushConstants(m_level->m_cmdBuffer, m_pipelineLayoutProbe, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
-	Dispatch(m_level->m_cmdBuffer, (count + 63) / 64, 1, 1, ProfileProbe);
-
-	// Barrier to host read
-	VkMemoryBarrier hostBarrier = {};
-	hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-	hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-	hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-	vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-	                     0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
-
-	EndGpuSpan(m_level->m_cmdBuffer, probeSpan);
-	if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS) return false;
-	if (!SubmitCommandBuffer()) return false;
-	ProfileOwner().m_queriesPending = ProfileOwner().m_queryCount != 0u;
+	if (m_level->m_probePoints.empty()) return true;
+	if (!m_level->m_bufProbeValues.mapped || !SyncHierarchyToDevice()) return false;
+	if (!m_readbackOptimizations || !m_level->m_probesValid)
+	{
+		if (!WaitForFence()) return false;
+		VkCommandBufferBeginInfo beginInfo = {};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		if (vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo) != VK_SUCCESS) return false;
+		BeginProfileCommands(m_level->m_cmdBuffer);
+		RecordProbeGather(m_level->m_cmdBuffer);
+		if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS || !SubmitCommandBuffer()) return false;
+		ProfileOwner().m_queriesPending = ProfileOwner().m_queryCount != 0u;
+		m_level->m_probesValid = true;
+	}
 	if (!WaitForFence()) return false;
 	EngineVulkan& owner = ProfileOwner();
-	if (owner.m_profileEnabled) owner.m_profile.probeBytes += count * sizeof(float);
 	ProfileTimer mirrorTimer(owner.m_profileEnabled ? &owner.m_profile.mirrorSeconds : nullptr);
 
 	// Direct zero-copy read from host-visible mapped memory!
@@ -4271,7 +4506,7 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 	{
 		size_t fieldBytes = 3 * static_cast<size_t>(m_level->m_grid.numCells) * sizeof(float);
 
-		auto downloadBuffer = [&](VulkanBuffer& srcBuf, std::vector<float>& targetHost) {
+		auto downloadBuffers = [&](unsigned int first, unsigned int count) {
 			if (!WaitForFence())
 				return false;
 
@@ -4292,8 +4527,13 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-			VkBufferCopy copyRegion = { 0, 0, fieldBytes };
-			CopyBuffer(m_level->m_cmdBuffer, srcBuf.buffer, m_level->m_bufFieldStaging.buffer, copyRegion, true);
+			VulkanBuffer* sources[] = {&m_level->m_bufVolt, &m_level->m_bufCurr};
+			for (unsigned int i = 0; i < count; ++i)
+			{
+				VkBufferCopy copyRegion = { 0, i * fieldBytes, fieldBytes };
+				CopyBuffer(m_level->m_cmdBuffer, sources[first + i]->buffer,
+				           m_level->m_bufFieldStaging.buffer, copyRegion, true);
+			}
 			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 			barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
 			vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -4307,12 +4547,15 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 			owner.m_queriesPending = owner.m_queryCount != 0u;
 			if (!WaitForFence()) return false;
 
-			std::memcpy(targetHost.data(), m_level->m_bufFieldStaging.mapped, fieldBytes);
+			std::vector<float>* targets[] = {&m_level->m_hostVolt, &m_level->m_hostCurr};
+			for (unsigned int i = 0; i < count; ++i)
+				std::memcpy(targets[first + i]->data(),
+				            static_cast<const char*>(m_level->m_bufFieldStaging.mapped) + i * fieldBytes, fieldBytes);
 			return true;
 		};
 
-		if (!downloadBuffer(m_level->m_bufVolt, m_level->m_hostVolt) ||
-		    !downloadBuffer(m_level->m_bufCurr, m_level->m_hostCurr))
+		if ((m_readbackOptimizations && m_level->m_bufFieldStaging.size >= 2 * fieldBytes) ? !downloadBuffers(0, 2) :
+		    (!downloadBuffers(0, 1) || !downloadBuffers(1, 1)))
 			return false;
 		m_level->m_hostFieldsDirty = false;
 
@@ -4320,6 +4563,17 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 		Engine* cpuEng = (m_level->m_op ? m_level->m_op->GetEngine() : nullptr);
 		if (cpuEng)
 		{
+			// Basic arrays use the same component-major layout as the GPU fields.
+			if (m_readbackOptimizations && cpuEng->GetType() == Engine::BASIC &&
+			    cpuEng->GetVoltArray() && cpuEng->GetCurrArray() &&
+			    cpuEng->GetVoltArray()->size() == m_level->m_hostVolt.size() &&
+			    cpuEng->GetCurrArray()->size() == m_level->m_hostCurr.size())
+			{
+				std::memcpy(cpuEng->GetVoltArray()->data(), m_level->m_hostVolt.data(), fieldBytes);
+				std::memcpy(cpuEng->GetCurrArray()->data(), m_level->m_hostCurr.data(), fieldBytes);
+				m_level->m_hostFieldsValid = true;
+				return true;
+			}
 			size_t idx = 0;
 			for (unsigned int n = 0; n < 3; ++n)
 			{
@@ -4379,6 +4633,8 @@ void EngineVulkan::SetVolt(unsigned int n, unsigned int x, unsigned int y, unsig
 	if (idx < m_level->m_hostVolt.size())
 	{
 		m_level->m_hostVolt[idx] = val;
+		if (m_level->m_op && m_level->m_op->GetEngine()) m_level->m_op->GetEngine()->SetVolt(n, x, y, z, val);
+		m_level->m_probesValid = m_level->m_energyValid = false;
 		m_level->m_hostFieldsDirty = true;
 	}
 }
@@ -4395,6 +4651,8 @@ void EngineVulkan::SetCurr(unsigned int n, unsigned int x, unsigned int y, unsig
 	if (idx < m_level->m_hostCurr.size())
 	{
 		m_level->m_hostCurr[idx] = val;
+		if (m_level->m_op && m_level->m_op->GetEngine()) m_level->m_op->GetEngine()->SetCurr(n, x, y, z, val);
+		m_level->m_probesValid = m_level->m_energyValid = false;
 		m_level->m_hostFieldsDirty = true;
 	}
 }
@@ -4423,6 +4681,13 @@ void EngineVulkan::Reset()
 		DestroyBuffer(m_level->m_bufExcSignals);
 		DestroyBuffer(m_level->m_bufProbePoints);
 		DestroyBuffer(m_level->m_bufProbeValues);
+		DestroyBuffer(m_level->m_bufEnergy);
+		if (m_level->m_pipelineEnergy) vkDestroyPipeline(m_device, m_level->m_pipelineEnergy, nullptr);
+		if (m_level->m_pipelineLayoutEnergy) vkDestroyPipelineLayout(m_device, m_level->m_pipelineLayoutEnergy, nullptr);
+		if (m_level->m_descLayoutEnergy) vkDestroyDescriptorSetLayout(m_device, m_level->m_descLayoutEnergy, nullptr);
+		m_level->m_pipelineEnergy = VK_NULL_HANDLE;
+		m_level->m_pipelineLayoutEnergy = VK_NULL_HANDLE;
+		m_level->m_descLayoutEnergy = VK_NULL_HANDLE;
 
 		DestroyBuffer(m_level->m_bufUpmlIndices);
 		DestroyBuffer(m_level->m_bufUpmlVoltCoeffs);
@@ -4521,6 +4786,7 @@ void EngineVulkan::Reset()
 #endif
 
 	m_level->m_numTS = 0;
+	m_level->m_probesValid = m_level->m_energyValid = false;
 	m_profile = ProfileStatistics();
 #ifdef ENABLE_VULKAN
 	m_runtimeFailed = m_queriesPending = m_sampleDispatches = false;
@@ -4542,6 +4808,8 @@ void EngineVulkan::Reset()
 	m_level->m_abcCurrSheets.clear();
 	m_level->m_debyeCount = 0;
 	m_level->m_descSetDebye = VK_NULL_HANDLE;
+	m_level->m_descSetProbe = m_level->m_descSetEnergy = VK_NULL_HANDLE;
+	m_level->m_energyGroups = 0;
 	m_level->m_dispVoltCount = 0;
 	m_level->m_dispCurrCount = 0;
 	m_level->m_dispVoltPasses.clear();

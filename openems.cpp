@@ -1517,8 +1517,8 @@ void openEMS::RunFDTD()
 	unsigned int maxExcite = FDTD_Op->GetExcitationSignal()->GetMaxExcitationTimestep();
 	ProcField->AddStep(maxExcite);
 	// --exact-endcriteria: also evaluate on a fixed timestep schedule, independent of the
-	// wall-clock progress report, at the cost of far more (expensive, full-domain) energy
-	// estimates -- default stays wall-clock throttled to keep normal runs fast
+	// wall-clock progress report, at the cost of more full-domain energy estimates.
+	// Vulkan can reduce those fields on-device; the default remains wall-clock throttled.
 	if ((Eng_Ext_SSD==NULL) && m_exactEndCriteria)
 	{
 		unsigned int endCritInterval = FDTD_Op->GetExcitationSignal()->GetNyquistNum();
@@ -1549,6 +1549,14 @@ void openEMS::RunFDTD()
 		step = 1;
 	if ((step<0) || (step>(int)NrTS)) step=NrTS;
 	EngineVulkan* vulkanBackend = dynamic_cast<EngineVulkan*>(m_EngineBackend.get());
+	auto energyEstimate = [&]() {
+		double energy = 0;
+		if (vulkanBackend && vulkanBackend->GetFastEnergy(energy))
+			return energy;
+		if (vulkanBackend && !vulkanBackend->SyncFieldsToHost())
+			throw std::runtime_error("Vulkan energy synchronization failed");
+		return ProcField->CalcTotalEnergyEstimate();
+	};
 	while (((m_EngineBackend ? m_EngineBackend->GetNumberOfTimesteps() : FDTD_Eng->GetNumberOfTimesteps()) < NrTS) && (change>endCrit) && !CheckAbortCond())
 	{
 		if (vulkanBackend)
@@ -1562,34 +1570,16 @@ void openEMS::RunFDTD()
 
 		if (vulkanBackend)
 		{
-			gettimeofday(&currTime, NULL);
-			double timeSincePrev = CalcDiffTime(currTime, prevTime);
-
 			currTS = m_EngineBackend->GetNumberOfTimesteps();
 			unsigned int detectorTS = currTS > 0 ? static_cast<unsigned int>(currTS - 1) : 0;
 
 			bool needFullField = false;
-			if (Eng_Ext_SSD == NULL)
-			{
-				if (ProcField->IsTimestep() || timeSincePrev > 4.0)
-					needFullField = true;
-			}
-			else
-			{
-				// Steady-state detection only requires full fields when evaluating
-				// the completed period's energy via CalcFastEnergy(). On intermediate
-				// timesteps, probe voltages are synced efficiently via SyncProbesToHost().
-				unsigned int p = Eng_Ext_SSD->GetTSPeriod();
-				if (p > 0 && (detectorTS % p == 0) && (detectorTS >= 2 * p))
-					needFullField = true;
-			}
-
 			if (!needFullField && PA)
 			{
 				for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
 				{
 					Processing* p = PA->GetProcessing(i);
-					if ((dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->IsTimestep())
+					if (p != ProcField && (dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->IsTimestep())
 					{
 						needFullField = true;
 						break;
@@ -1609,7 +1599,11 @@ void openEMS::RunFDTD()
 				// update and before incrementing its timestep counter. The Vulkan
 				// backend returns after completing and counting the full step.
 				FDTD_Eng->SetNumberOfTimesteps(detectorTS);
-				Eng_Ext_SSD->Apply2Voltages();
+				const unsigned int period = Eng_Ext_SSD->GetTSPeriod();
+				if (period > 0 && detectorTS % period == 0 && detectorTS >= 2 * period)
+					Eng_Ext_SSD->Apply2VoltagesWithEnergy(energyEstimate());
+				else
+					Eng_Ext_SSD->Apply2Voltages();
 				FDTD_Eng->SetNumberOfTimesteps(static_cast<unsigned int>(currTS));
 			}
 		}
@@ -1622,7 +1616,7 @@ void openEMS::RunFDTD()
 			change = Eng_Ext_SSD->GetLastDiff(); // cheap: extension keeps this up to date itself
 		else if (ProcField->CheckTimestep())
 		{
-			currE = ProcField->CalcTotalEnergyEstimate();
+			currE = energyEstimate();
 			if (currE>maxE)
 				maxE=currE;
 			if (m_exactEndCriteria && maxE)
@@ -1648,7 +1642,7 @@ void openEMS::RunFDTD()
 			{
 				if (!m_exactEndCriteria) // otherwise already kept current above, every Nyquist period
 				{
-					currE = ProcField->CalcTotalEnergyEstimate();
+					currE = energyEstimate();
 					if (currE>maxE)
 						maxE=currE;
 					if (maxE)

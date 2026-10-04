@@ -61,6 +61,10 @@ public:
 	//! Synchronize point probe and line integral values from device to host
 	virtual bool SyncProbesToHost() = 0;
 
+	//! Return the existing fast energy estimate when this backend supports it.
+	//! False requests the caller's synchronized CPU fallback.
+	virtual bool GetFastEnergy(double& energy) { UNUSED(energy); return false; }
+
 	//! Register probe points/integrals for efficient on-device extraction
 	virtual void RegisterProbes(const ProcessingArray* pa) { UNUSED(pa); }
 

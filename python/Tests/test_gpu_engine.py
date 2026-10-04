@@ -794,6 +794,53 @@ class Test_GPUEngine(unittest.TestCase):
     def test_nested_cylindrical_multigrid_equivalence(self):
         self._run_multigrid_pair([12.0, 24.0], 'cyl_mg_nested', field_dumps=True)
 
+    def test_mixed_probe_sampling_equivalence(self):
+        """Fused gathers preserve V/I/E/H samples and derived impedance within 0.1%."""
+        outputs = {}
+        for engine in ('basic', 'vulkan'):
+            csx = ContinuousStructure()
+            grid = csx.GetGrid()
+            grid.SetDeltaUnit(1e-3)
+            for axis, count in zip('xyz', (25, 17, 33)):
+                grid.SetLines(axis, np.linspace(-20, 20, count))
+            exc = csx.AddExcitation('excite', exc_type=0, exc_val=[0, 0, 1])
+            exc.AddBox([-2, -2, -3], [2, 2, 3])
+            for name, kind, sampling, start, stop in (
+                ('voltage', 0, 1, [5, 0, -5], [5, 0, 5]),
+                ('current', 1, 2, [2, -5, 0], [8, 5, 0]),
+                ('electric', 2, 3, [5, 0, 0], [5, 0, 0]),
+                ('magnetic', 3, 4, [5, 0, 0], [5, 0, 0]),
+            ):
+                probe = csx.AddProbe(name, p_type=kind, over_sampling=sampling,
+                                     frequency=[20e9], norm_dir=2)
+                probe.AddBox(start, stop)
+            fdtd = openEMS(NrTS=321, EndCriteria=0, OverSampling=1)
+            fdtd.SetCSX(csx)
+            fdtd.SetGaussExcite(20e9, 10e9)
+            fdtd.SetBoundaryCond(['MUR'] * 6)
+            sdir = self._sim_path('mixed_' + engine)
+            fdtd.Run(sdir, engine=engine, exact_endcriteria=True, numThreads=1, cleanup=False)
+            outputs[engine] = {
+                name: np.atleast_2d(np.loadtxt(os.path.join(sdir, name), comments='%'))
+                for name in ('voltage', 'current', 'electric', 'magnetic')
+            }
+        for name in outputs['basic']:
+            expected, actual = outputs['basic'][name], outputs['vulkan'][name]
+            np.testing.assert_array_equal(expected[:, 0], actual[:, 0])
+            self.assertTrue(np.isfinite(actual).all())
+            peak = np.max(np.abs(expected[:, 1:]))
+            self.assertGreater(peak, 0, name + ' has no signal')
+            self.assertLess(np.max(np.abs(actual[:, 1:] - expected[:, 1:])) / peak, 0.001)
+        # Compare a derived Fourier voltage/current ratio with each sampling interval.
+        impedances = {}
+        for engine, probes in outputs.items():
+            voltage, current = probes['voltage'], probes['current']
+            u = np.sum(voltage[:, 1] * np.exp(-2j * np.pi * 20e9 * voltage[:, 0])) * (voltage[1, 0] - voltage[0, 0])
+            i = np.sum(current[:, 1] * np.exp(-2j * np.pi * 20e9 * current[:, 0])) * (current[1, 0] - current[0, 0])
+            self.assertGreater(abs(i), 0)
+            impedances[engine] = u / i
+        self.assertLess(abs(impedances['vulkan'] - impedances['basic']) / abs(impedances['basic']), 0.001)
+
     def test_vulkan_batch_sizes_preserve_samples(self):
         """Batching preserves probe/dump times and fields within 1e-4 / 0.1%."""
         outputs = {}

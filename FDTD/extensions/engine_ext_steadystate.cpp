@@ -58,6 +58,16 @@ unsigned int Engine_Ext_SteadyState::GetTSPeriod() const
 
 void Engine_Ext_SteadyState::Apply2Voltages()
 {
+	ApplyVoltages(nullptr);
+}
+
+void Engine_Ext_SteadyState::Apply2VoltagesWithEnergy(double energy)
+{
+	ApplyVoltages(&energy);
+}
+
+void Engine_Ext_SteadyState::ApplyVoltages(const double* energy)
+{
 	if (!m_Op_SS || m_Op_SS->GetTSPeriod() == 0 || !m_Eng)
 		return;
 
@@ -70,7 +80,7 @@ void Engine_Ext_SteadyState::Apply2Voltages()
 	{
 		bool no_valid = true;
 		m_last_max_diff = 0;
-		double curr_total_energy = m_Eng_Interface ? m_Eng_Interface->CalcFastEnergy() : 0.0;
+		double curr_total_energy = energy ? *energy : (m_Eng_Interface ? m_Eng_Interface->CalcFastEnergy() : 0.0);
 		if (last_total_energy>0)
 		{
 			m_last_max_diff = std::abs(curr_total_energy-last_total_energy)/last_total_energy;

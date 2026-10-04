@@ -32,6 +32,7 @@ public:
 	virtual ~Engine_Ext_SteadyState();
 
 	virtual void Apply2Voltages();
+	void Apply2VoltagesWithEnergy(double energy);
 	virtual void Apply2Current();
 
 	void SetEngineInterface(Engine_Interface_FDTD* eng_if) {m_Eng_Interface=eng_if;}
@@ -39,6 +40,7 @@ public:
 	unsigned int GetTSPeriod() const;
 
 protected:
+	void ApplyVoltages(const double* energy);
 	Operator_Ext_SteadyState* m_Op_SS;
 	double m_last_max_diff;
 	std::vector<double*> m_E_records;

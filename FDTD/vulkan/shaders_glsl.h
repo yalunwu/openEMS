@@ -201,6 +201,59 @@ void main() {
 }
 )";
 
+// Preserve float field multiplication, then reduce partial sums. CPU applies
+// EPS0/MUE0 in double. SSE energy uses a different ordered float accumulator.
+static const char* kShaderFastEnergy = R"(#version 450
+#ifdef USE_FP64
+#extension GL_ARB_gpu_shader_fp64 : require
+#define ACC double
+#else
+#define ACC float
+#endif
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Voltage { float volt[]; };
+layout(std430, binding = 1) readonly buffer Current { float curr[]; };
+layout(std430, binding = 2) writeonly buffer Partials { ACC sums[]; };
+layout(push_constant) uniform EnergyParams {
+    uint dimX; uint dimY; uint dimZ; uint numCells;
+    uint extentX; uint extentY; uint extentZ; uint groups;
+} pc;
+shared ACC electric[256];
+shared ACC magnetic[256];
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint item = group * 256u + lane;
+    uint count = pc.extentX * pc.extentY * pc.extentZ;
+    precise ACC e = ACC(0), h = ACC(0);
+    if (item < count) {
+        uint z = item % pc.extentZ;
+        uint y = (item / pc.extentZ) % pc.extentY;
+        uint x = item / (pc.extentZ * pc.extentY);
+        uint index = x * pc.dimY * pc.dimZ + y * pc.dimZ + z;
+        for (uint component = 0u; component < 3u; ++component) {
+            uint position = index + component * pc.numCells;
+            precise float ve = volt[position] * volt[position];
+            precise float ih = curr[position] * curr[position];
+            e += ACC(ve); h += ACC(ih);
+        }
+    }
+    electric[lane] = e; magnetic[lane] = h;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            electric[lane] += electric[lane + stride];
+            magnetic[lane] += magnetic[lane + stride];
+        }
+        barrier();
+    }
+    if (lane == 0u && group < pc.groups) {
+        sums[2u * group] = electric[0];
+        sums[2u * group + 1u] = magnetic[0];
+    }
+}
+)";
+
 static const char* kShaderUpmlPre = R"(#version 450
 layout(local_size_x = 256) in;
 

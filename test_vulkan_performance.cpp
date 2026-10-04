@@ -4,6 +4,7 @@
 #include "test_vulkan_performance.h"
 #include "openems.h"
 #include "FDTD/operator.h"
+#include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/vulkan/engine_vulkan.h"
 #include "ContinuousStructure.h"
@@ -33,6 +34,10 @@ class BenchmarkFDTD : public openEMS {
 public:
 	Operator* GetOp() { return FDTD_Op; }
 	EngineVulkan* GPU() { return dynamic_cast<EngineVulkan*>(m_EngineBackend.get()); }
+	double ReferenceEnergy() {
+		std::unique_ptr<Engine_Interface_Base> engineInterface(NewEngineInterface());
+		return engineInterface->CalcFastEnergy();
+	}
 };
 
 struct Case {
@@ -40,7 +45,7 @@ struct Case {
 	int nx, ny, nz;
 	bool cylinder, nonuniform, pml, debye;
 	std::vector<double> splits;
-	unsigned int processing; // 0: stepping, 1: probes, 2: dumps, 3: steady state
+	unsigned int processing; // 0: stepping, 1: probes, 2: dumps, 3: steady state, 4: energy
 };
 
 void Box(ContinuousStructure* csx, CSProperties* property, const double bounds[6])
@@ -186,12 +191,14 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 #else
 	try {
 		unsigned int steps = 256, repeats = 5;
-		bool profile = false;
+		bool profile = false, referenceReadback = false, verifyEnergy = false;
 		std::string selected, csvPath;
 		std::vector<unsigned int> batches = {1, 8, 16, 32, 64};
 		for (int i = 2; i < argc; ++i) {
 			std::string arg(argv[i]);
 			if (arg == "--profile") profile = true;
+			else if (arg == "--reference-readback") referenceReadback = true;
+			else if (arg == "--verify-energy") verifyEnergy = true;
 			else if (arg.find("--case=") == 0) selected = arg.substr(7);
 			else if (arg.find("--steps=") == 0) steps = Number(arg.substr(8), 1000000);
 			else if (arg.find("--repeats=") == 0) repeats = Number(arg.substr(10), 100);
@@ -213,13 +220,14 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 			{"multigrid-5", 41, 129, 17, true, false, false, false, {8.0, 16.0, 24.0, 32.0}, 0},
 			{"probes", 33, 33, 33, false, false, false, false, {}, 1},
 			{"dumps", 33, 33, 33, false, false, false, false, {}, 2},
-			{"steady-state", 17, 17, 17, false, false, false, false, {}, 3}
+			{"steady-state", 17, 17, 17, false, false, false, false, {}, 3},
+			{"energy-large", 171, 171, 171, false, false, false, false, {}, 4}
 		};
 		std::ofstream csv;
 		if (!csvPath.empty()) {
 			csv.open(csvPath);
 			Require(csv.good(), "Could not open benchmark CSV");
-			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s\n";
+			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback\n";
 			csv << std::setprecision(10);
 		}
 		bool found = false, metadata = false;
@@ -233,6 +241,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					fdtd.reset(new BenchmarkFDTD);
 					const auto init = Clock::now();
 					Setup(*fdtd, c, steps, batch, profile);
+					Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
 					initSeconds = Seconds(init);
 					Require(fdtd->GPU()->IterateTS(64) && fdtd->GPU()->Synchronize(), "Warm-up failed");
 				}
@@ -242,6 +251,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 						fdtd.reset(new BenchmarkFDTD);
 						const auto init = Clock::now();
 						Setup(*fdtd, c, steps, batch, profile);
+						Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
 						initSeconds = Seconds(init);
 					}
 					EngineVulkan* gpu = fdtd->GPU();
@@ -256,19 +266,28 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					const double synchronization = Seconds(sync), total = Seconds(begin);
 					if (run == 0u) continue; // warm-up result excluded
 					const auto p = gpu->GetProfile();
-					timings.push_back(total);
 					if (profile) gpu->WriteProfile(std::cout);
+					if (verifyEnergy && !referenceReadback) {
+						double energy = 0;
+						Require(gpu->GetFastEnergy(energy) && gpu->SyncFieldsToHost(), "Energy verification unavailable");
+						const double expected = fdtd->ReferenceEnergy();
+						const double error = expected > 0 ? std::abs(energy - expected) / expected : std::abs(energy);
+						Require(std::isfinite(error) && error < 3e-7, "Large-domain energy precision exceeded tolerance");
+						std::cout << "ENERGY_CHECK stored_nodes=" << Nodes(fdtd->GetOp(), false) << " relative_error=" << error << std::endl;
+					}
+					timings.push_back(total);
 					if (csv) csv << c.name << ',' << batch << ',' << profile << ',' << run << ',' << steps << ','
 					             << Nodes(fdtd->GetOp(), false) << ',' << Nodes(fdtd->GetOp(), true) << ','
 					             << fdtd->GetOp()->GetNumberCells() << ',' << initSeconds << ',' << iteration << ','
 					             << synchronization << ',' << total << ',' << p.submissions << ',' << p.dispatches << ','
 					             << p.uploadedBytes << ',' << p.downloadedBytes << ',' << p.probeBytes << ','
 					             << p.recordSeconds << ',' << p.submitSeconds << ',' << p.waitSeconds << ','
-					             << p.gpuSeconds[EngineVulkan::ProfileBatch] << '\n';
+					             << p.gpuSeconds[EngineVulkan::ProfileBatch] << ',' << p.energyBytes << ',' << referenceReadback << '\n';
 				}
 				std::sort(timings.begin(), timings.end());
 				const double median = (timings[(repeats - 1) / 2] + timings[repeats / 2]) / 2;
 				std::cout << "BENCHMARK case=" << c.name << " batch=" << batch << " profile=" << profile
+				          << " reference_readback=" << referenceReadback
 				          << " steps=" << steps << " repeats=" << repeats << " mode=" << (c.processing ? "solver-output" : "stepping")
 				          << " stored_nodes=" << Nodes(fdtd->GetOp(), false) << " active_voltage_nodes=" << Nodes(fdtd->GetOp(), true)
 				          << " operator_cells=" << fdtd->GetOp()->GetNumberCells() << " initialization_s=" << initSeconds

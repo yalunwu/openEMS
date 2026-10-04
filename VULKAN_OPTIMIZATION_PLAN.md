@@ -1,8 +1,8 @@
 # Vulkan optimization implementation plan
 
-Status: Phases 0 and 1 implemented and validated on Windows / RTX 3070,
-2026-10-03. Phases 2 through 6 remain proposed. See
-`VULKAN_PERFORMANCE.md` for usage and `VULKAN_PHASE01_VALIDATION.md` for results.
+Status: Phases 0, 1 and 2 implemented on Windows / RTX 3070, 2026-10-03.
+Phases 3 through 6 remain proposed. See `VULKAN_PERFORMANCE.md` for usage,
+`VULKAN_PHASE01_VALIDATION.md` and `VULKAN_PHASE02_VALIDATION.md` for results.
 
 ## Objective and scope
 
