@@ -2,7 +2,8 @@
 
 Windows / NVIDIA RTX 3070, driver 591.74, Vulkan 1.2 backend, 2026-10-03/04.
 Release builds use MinGW GCC 16.1.0 and MSVC 19.44.35229. The starting solver
-revision is `a0e67e0` (Phases 0/1); Phase 2 is an uncommitted working-tree change.
+revision is `a0e67e0` (Phases 0/1); Phase 2 was measured as a working-tree change
+and later committed as `33807c7`.
 
 The final cached-memory implementation passes all 56 native backend tests with
 both compilers, CTest 3/3 with each compiler and with Vulkan disabled, all 22

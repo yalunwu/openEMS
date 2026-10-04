@@ -1,7 +1,9 @@
 # Vulkan optimization implementation plan
 
-Status: Phases 0, 1 and 2 implemented on Windows / RTX 3070, 2026-10-03.
-Phases 3 through 6 remain proposed. See `VULKAN_PERFORMANCE.md` for usage,
+Status: Phases 0, 1 and 2 implemented on Windows / RTX 3070, 2026-10-03/04
+(commits `a0e67e0` and `33807c7`).
+Phases 3 and 5 cancelled. Phase 4 and Phases 6a/6b remain proposed.
+See `VULKAN_PERFORMANCE.md` for usage,
 `VULKAN_PHASE01_VALIDATION.md` and `VULKAN_PHASE02_VALIDATION.md` for results.
 
 ## Objective and scope
@@ -34,6 +36,37 @@ cross-vendor validation is required before claiming portable performance gains.
 
 The timings in `VULKAN_MULTIGRID_VALIDATION.md` are historical baselines, not
 predictions. Collect fresh measurements from the actual DLL under test.
+
+## Current baseline after Phase 2
+
+The section above describes the code before this plan. Remaining phases build on
+the following state:
+
+- `IterateTS()` records up to the batch limit (default 32, range 1-64) of
+  complete hierarchy steps per command buffer, reusing one command buffer and
+  fence. Commands are re-recorded for every submission because excitation, TFSF
+  and Mur activation embed the recorded timestep.
+- When probes are registered, the final submission of an interval gathers them
+  after hierarchy projection; cached results are invalidated by stepping, edits,
+  re-registration and reset.
+- Energy-only checks use a GPU reduction for the basic Cartesian engine only.
+  Cylindrical (SSE-based operator), SSE and multigrid energy keep the CPU path
+  and a full-field download. Field dumps still transfer the whole domain.
+- Core update shaders, workgroup shapes and dense coefficient buffers are
+  unchanged.
+
+Measured headroom on the RTX 3070 (`VULKAN_PHASE01_VALIDATION.md`):
+
+- The core updates move at least 60 bytes per node per half-step: 24 of
+  coefficients, 12 field read, 12 field write and 12 of neighbor field. The
+  129^3 case (256 steps, 164.6 ms) therefore sustains about 400 GB/s, roughly
+  89% of the 448 GB/s peak. Large grids are bandwidth bound with near-ideal
+  neighbor reuse; coefficients are 40% of the minimum traffic.
+- Small grids are overhead bound: 25^3 runs at about 13 us per step at batch 32.
+- The five-level multigrid case spends about 12 ms recording commands against
+  about 38 ms of GPU batch time.
+- The Khronos validation layer is not installed on the measurement host, so
+  synchronization validation has not yet been run.
 
 ## Phase 0: measurement and reference results
 
@@ -141,21 +174,17 @@ setting a documented tolerance. Preserve the same sampling phase and schedule.
 Completion: supported energy-only checks transfer scalar/partial results and
 produce validated stopping behavior. Full dumps remain numerically equivalent.
 
-## Phase 3: tune workgroup shapes
+Implemented scope: the reduction covers the basic Cartesian engine. SSE energy
+accumulates padded z lanes in FP32 and cylindrical/multigrid energy uses
+different extents or projected root fields, so those configurations keep the
+CPU estimate and full-field download. Extending the reduction to them is
+deferred and is not part of the remaining roadmap.
 
-Parameterize core shader group dimensions through compile-time definitions
-compatible with Vulkan 1.2. Test a small candidate set such as 32 x 4 x 2,
-32 x 4 x 1, 16 x 4 x 2 and 64 x 2 x 1. Update dispatch rounding and device-limit
-checks together; preserve contiguous physical-z accesses.
+## Phase 3: tune workgroup shapes (cancelled)
 
-Use benchmark results to select conservative variants by device limits and grid
-shape. Initially provide overrides in the benchmark utility, avoiding startup
-autotuning in production. Keep the current shape as the fallback. Evaluate
-extension and multigrid transfer group sizes separately when they are significant.
-
-Validation: dimensions around every candidate group boundary, sub-group-sized
-grids, thin slabs, nonuniform shapes, all physics tests and supported device
-limits. Default selection requires repeatable wins without material regressions.
+Cancelled to avoid device-specific tuning and additional shader variants without
+evidence of a portable benefit. Retain the existing workgroup shapes and device
+limit checks. This work is outside the remaining implementation roadmap.
 
 ## Phase 4: reduce coefficient traffic
 
@@ -174,43 +203,56 @@ Validation: uniform/repeated regions, nonuniform spacing, anisotropy, lossy
 materials, PEC/PMC, PML, dispersive and cylindrical operators; verify exact
 coefficient reconstruction and unchanged field tolerances.
 
-## Phase 5: reduce stencil loads
+## Phase 5: reduce stencil loads (cancelled)
 
-Prototype shared-memory tiling for one half-step on the simple Cartesian path.
-Load the necessary field components and halo, synchronize the whole workgroup,
-then evaluate curls from shared data. Out-of-domain lanes must participate in
-barriers safely. Keep the direct-load shader available and benchmark against
-hardware cache reuse, shared-memory cost and occupancy.
+Cancelled because shared-memory tiling and subgroup variants introduce tile-size,
+barrier and resource tradeoffs whose performance depends on the GPU. Retain the
+direct-load shaders. This work is outside the remaining implementation roadmap.
 
-Evaluate subgroup exchange only as a separate feature-gated variant. Do not
-assume a subgroup size or that subgroup operations cross workgroup boundaries.
-Combine tiling with coefficient compression only after measuring each alone.
-
-Validation: halo faces/edges/corners, arbitrary dimensions and boundaries, long
-decay runs and equivalence with the direct-load implementation. Extend to other
-physics/geometry only after the base variant provides a repeatable benefit.
-
-## Phase 6: streamline extensions and synchronization
+## Phase 6a: audit extension and synchronization dependencies
 
 Build a dependency map for each supported extension phase and multigrid transfer,
-including overlapping points, face ordering and shared state. Measure dispatch
-and barrier costs using Phase 0 instrumentation.
+recording buffer reads/writes, overlapping points, face ordering, extension
+priorities and shared state. Document the execution and memory dependencies each
+barrier satisfies, including dependencies across submissions and host readbacks.
+Measure dispatch and barrier costs using Phase 0 instrumentation.
+
+Validate the existing path with synchronization validation and numerical tests.
+Cover intersecting Mur/PML/absorbing boundaries, multiple TFSF faces, overlapping
+dispersive passes, lumped elements, excitation priority and nested multigrid
+transfers. Record any validation findings and untested configurations.
+
+Completion: a reviewed dependency map, baseline measurements and a short list of
+individually justified optimization candidates. Deliver the audit separately
+before changing execution in Phase 6b.
+
+## Phase 6b: optimize measured extension and synchronization costs
+
+Use the Phase 6a audit and profiles to select one candidate at a time. State its
+expected benefit and required dependencies before implementing it. Prioritize
+removing unnecessary work while preserving the extension architecture.
 
 Combine independent work or fuse selected corrections with compatible kernels
 where ordering permits. Remove redundant barriers only after proving the data
 dependencies remain satisfied. Global memory barriers are not automatically
 slower than buffer barriers; compare valid alternatives on the actual workloads.
+Keep shader combinations limited and retain a reference path for comparisons.
 Do not require synchronization2 or a newer Vulkan version for the base path.
 
-Validation: intersecting Mur/PML/absorbing boundaries, multiple TFSF faces,
-overlapping dispersive passes, lumped elements, excitation priority and nested
-multigrid transfers. Run synchronization validation when the development layer
-is available, alongside numerical tests.
+Validation: require synchronization validation and numerical equivalence on the
+Phase 6a cases before accepting each execution change. Preserve output timestamps,
+stopping schedules and existing numerical tolerances. Measure performance with
+validation and profiling disabled, including representative extension and
+multigrid workloads.
+
+Completion: separately reviewable changes with demonstrated performance benefits
+and documented dependency proofs. Retain the reference path where an optimization
+does not meet the performance acceptance criteria.
 
 ## Later experiments
 
 Temporal blocking across multiple timesteps requires halo expansion, global
-dependencies and extension scheduling. Prototype it separately after Phases 0-6;
+dependencies and extension scheduling. Prototype it separately after Phases 4 and 6;
 a simple voltage/current fusion cannot synchronize independent workgroups.
 
 GPU steady-state histories and period comparisons could remove the remaining
@@ -223,8 +265,25 @@ compatibility checks and a safe cache-miss path.
 
 ## Release and acceptance
 
-Recommended first milestone: Phases 0, 1 and 2a. Next deliver GPU energy estimation
-and workgroup selection; use those profiles to choose the order of Phases 4-6.
+Phases 0-2 are implemented; Phases 3 and 5 are cancelled. The next milestone is:
+
+1. Phase 4 feasibility: count unique coefficient tuples on real tutorial models
+   with smoothed nonuniform meshes, not only uniform synthetic grids. Start from
+   the existing `Operator_SSE_Compressed::CompressOperator()` approach, whose
+   statistics report unique operators. Nonuniform meshes can make most tuples
+   distinct; estimate index/palette traffic and lookup cost before shader work.
+   Compression can save at most the 40% coefficient share of core traffic.
+2. Phase 6a audit, after installing the Vulkan SDK validation layers on the
+   measurement host so synchronization validation can run.
+3. First Phase 6b candidate: remove per-submission command recording by reusing
+   pre-recorded batch command buffers, reading the timestep from device memory
+   instead of recording it. Prototype two command buffers with independent
+   fences only if reuse is not feasible.
+
+Choose between Phase 4 implementation and further Phase 6b work by workload
+class: large grids are bandwidth bound (report effective GB/s against device
+peak), while small and multigrid grids are bound by per-step dispatch, barrier
+and recording overhead.
 Keep each optimization independently selectable in the benchmark harness until
 its default-selection criteria are established.
 

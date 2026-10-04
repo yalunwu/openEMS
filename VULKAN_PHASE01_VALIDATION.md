@@ -3,7 +3,8 @@
 Measured 2026-10-03 on Windows x64 with an NVIDIA GeForce RTX 3070.
 Vulkan reported vendor 4318, device 9348, driver identifier 2480046080 and API
 version 4211013. The benchmark used GCC 16.1.0, Release, revision
-`Vulkan-Test-1-gfdf08cb` plus the uncommitted Phase 0/1 changes, and loaded
+`Vulkan-Test-1-gfdf08cb` plus the then-uncommitted Phase 0/1 changes (later
+committed as `a0e67e0`), and loaded
 `C:\Users\Allen\openEMS-Project\openEMS\build\libopenEMS.dll`.
 
 ## Correctness and configuration coverage
