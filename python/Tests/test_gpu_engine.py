@@ -12,6 +12,8 @@ import os
 import ctypes
 import shutil
 import sys
+import re
+import subprocess
 import unittest
 import uuid
 import xml.etree.ElementTree as ET
@@ -60,6 +62,30 @@ def _make_grid():
     grid.SetLines('y', np.linspace(-50, 50, 11))
     grid.SetLines('z', np.linspace(-5, 5, 5))
     return csx
+
+
+def _run_disabled_output_case(kind, sim_dir, engine='vulkan'):
+    csx = ContinuousStructure()
+    grid = csx.GetGrid()
+    grid.SetDeltaUnit(1e-3)
+    for axis in ('x', 'y', 'z'):
+        grid.SetLines(axis, np.linspace(-2, 2, 5))
+    # An active probe supplies sample boundaries even when dumps are disabled.
+    probe = csx.AddProbe('voltage', p_type=0, over_sampling=2)
+    probe.AddBox([0, 0, -1], [0, 0, 1])
+    if kind != 'none':
+        dump = csx.AddDump('fields', dump_type=10 if kind == 'fd' else 0,
+                           file_type=1)
+        dump.AddBox([-2, -2, -2], [2, 2, 2])
+        if kind == 'fd':
+            dump.AddFrequency(20e9)
+    fdtd = openEMS(NrTS=64, EndCriteria=0)
+    fdtd.SetCSX(csx)
+    fdtd.SetGaussExcite(20e9, 10e9)
+    fdtd.SetBoundaryCond(['PEC'] * 6)
+    fdtd.Run(sim_dir, engine=engine, vulkan_profile=True,
+             vulkan_batch_size=1, numThreads=1,
+             disable_dumps=(kind != 'enabled'), cleanup=False)
 
 
 class Test_GPUEngine(unittest.TestCase):
@@ -841,6 +867,36 @@ class Test_GPUEngine(unittest.TestCase):
             impedances[engine] = u / i
         self.assertLess(abs(impedances['vulkan'] - impedances['basic']) / abs(impedances['basic']), 0.001)
 
+    def test_disabled_dumps_preserve_readback_volume(self):
+        """Disabled TD/FD dumps transfer no more full fields than a probe-only run."""
+        downloads = {}
+        for kind in ('none', 'td', 'fd', 'enabled'):
+            sdir = self._sim_path('disabled_' + kind)
+            # Capture native C++ stdout in a child process on every platform.
+            result = subprocess.run(
+                [sys.executable, os.path.abspath(__file__),
+                 '--disabled-output-case', kind, sdir],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, kind + ': ' + result.stdout + result.stderr)
+            profile = re.search(r'VULKAN_PROFILE .*?downloaded_bytes=(\d+)', result.stdout)
+            self.assertIsNotNone(profile, result.stdout + result.stderr)
+            downloads[kind] = int(profile.group(1))
+            if kind == 'enabled':
+                self.assertTrue(os.path.isfile(os.path.join(sdir, 'fields.h5')))
+            else:
+                self.assertFalse(os.path.exists(os.path.join(sdir, 'fields.h5')))
+        self.assertEqual(downloads['td'], downloads['none'])
+        self.assertEqual(downloads['fd'], downloads['none'])
+        self.assertGreater(downloads['enabled'], downloads['none'])
+        # Disabled FD post-processing also skipped initialization on the CPU.
+        sdir = self._sim_path('disabled_fd_basic')
+        result = subprocess.run(
+            [sys.executable, os.path.abspath(__file__),
+             '--disabled-output-case', 'fd', sdir, 'basic'],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(sdir, 'fields.h5')))
+
     def test_vulkan_batch_sizes_preserve_samples(self):
         """Batching preserves probe/dump times and fields within 1e-4 / 0.1%."""
         outputs = {}
@@ -882,4 +938,7 @@ class Test_GPUEngine(unittest.TestCase):
                     np.testing.assert_allclose(a[...], b[...], rtol=0.001, atol=1e-4)
 
 if __name__ == '__main__':
-    unittest.main()
+    if len(sys.argv) in (4, 5) and sys.argv[1] == '--disabled-output-case':
+        _run_disabled_output_case(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else 'vulkan')
+    else:
+        unittest.main()

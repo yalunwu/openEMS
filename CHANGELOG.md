@@ -140,6 +140,10 @@ number moved up and patch releases now have somewhere to go.
 
 ### Fixed
 
+- Skip Vulkan full-field readbacks for disabled dumps and mode-match probes,
+  and preserve existing probe resources when replacement allocation fails.
+- Skip post-processing of disabled frequency-domain dumps, which could access
+  uninitialized field data at the end of a run.
 - Validate Vulkan probe indices before registration and CPU mirroring, release
   partial optional energy allocations immediately, avoid full-field fallback
   for exact zero energy after stepping, and restore combined field readbacks

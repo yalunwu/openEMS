@@ -69,6 +69,7 @@ public:
 
 private:
 	friend bool Test_Vulkan_OptionalResources();
+	friend bool Test_Vulkan_ProbeAllocationFailure();
 
 	struct GridDimensions {
 		uint32_t dimX = 0;
@@ -328,7 +329,7 @@ private:
 	bool AllocateBuffers();
 	bool AllocateFieldStagingBuffer();
 	bool AllocateExcitationBuffers();
-	bool AllocateProbeBuffers();
+	bool AllocateProbeBuffers(const std::vector<ProbePoint>& points);
 	bool AllocateUpmlBuffers();
 	bool AllocateMurBuffers();
 	bool AllocateTfsfBuffers();

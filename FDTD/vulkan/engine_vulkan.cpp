@@ -89,7 +89,7 @@ bool EngineVulkan::SetReadbackOptimizationsEnabled(bool enabled)
 	if (m_device && changed)
 	{
 		if (!AllocateFieldStagingBuffer()) { ProfileOwner().m_runtimeFailed = true; return false; }
-		if (!AllocateProbeBuffers()) { ProfileOwner().m_runtimeFailed = true; return false; }
+		if (!AllocateProbeBuffers(m_level->m_probePoints)) { ProfileOwner().m_runtimeFailed = true; return false; }
 	}
 #endif
 	if (m_level->m_innerGrid && !m_level->m_innerGrid->SetReadbackOptimizationsEnabled(enabled)) return false;
@@ -1748,27 +1748,32 @@ bool EngineVulkan::AllocateExcitationBuffers()
 	       allocate(m_level->m_currExcPoints, m_level->m_bufCurrExcPoints, m_level->m_bufCurr, m_level->m_descSetCurrExc);
 }
 
-bool EngineVulkan::AllocateProbeBuffers()
+bool EngineVulkan::AllocateProbeBuffers(const std::vector<ProbePoint>& points)
 {
-	DestroyBuffer(m_level->m_bufProbePoints);
-	DestroyBuffer(m_level->m_bufProbeValues);
-	if (m_level->m_probePoints.empty()) return true;
+	if (points.empty())
+	{
+		DestroyBuffer(m_level->m_bufProbePoints);
+		DestroyBuffer(m_level->m_bufProbeValues);
+		// Retain the allocated descriptor set for reuse when probes are added again.
+		return true;
+	}
 
-	size_t count = m_level->m_probePoints.size();
+	VulkanBuffer pointsBuffer, valuesBuffer;
+	size_t count = points.size();
 	size_t pointsBytes = count * sizeof(ProbePoint);
 	size_t valuesBytes = count * sizeof(float);
 
 	// Create and populate probe points buffer
 	if (!CreateBuffer(pointsBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, m_level->m_bufProbePoints))
+	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, pointsBuffer))
 	{
 		return false;
 	}
-	std::memcpy(m_level->m_bufProbePoints.mapped, m_level->m_probePoints.data(), pointsBytes);
+	std::memcpy(pointsBuffer.mapped, points.data(), pointsBytes);
 
 	// Create host-visible probe values buffer (directly mapped for zero-copy readback!)
 	if (!CreateBuffer(valuesBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, m_level->m_bufProbeValues))
+	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, valuesBuffer))
 	{
 		return false;
 	}
@@ -1778,22 +1783,23 @@ bool EngineVulkan::AllocateProbeBuffers()
 	dsAlloc.descriptorPool = m_descPool;
 	dsAlloc.descriptorSetCount = 1;
 	dsAlloc.pSetLayouts = &m_descLayoutProbe;
-	if (!m_level->m_descSetProbe && vkAllocateDescriptorSets(m_device, &dsAlloc, &m_level->m_descSetProbe) != VK_SUCCESS)
+	VkDescriptorSet descriptor = m_level->m_descSetProbe;
+	if (!descriptor && vkAllocateDescriptorSets(m_device, &dsAlloc, &descriptor) != VK_SUCCESS)
 	{
 		return false;
 	}
 
 	VkDescriptorBufferInfo bInfos[4] = {
-		{ m_level->m_bufProbePoints.buffer, 0, pointsBytes },
+		{ pointsBuffer.buffer, 0, pointsBytes },
 		{ m_level->m_bufVolt.buffer, 0, m_level->m_bufVolt.size },
 		{ m_level->m_bufCurr.buffer, 0, m_level->m_bufCurr.size },
-		{ m_level->m_bufProbeValues.buffer, 0, valuesBytes }
+		{ valuesBuffer.buffer, 0, valuesBytes }
 	};
 	VkWriteDescriptorSet writes[4] = {};
 	for (uint32_t i = 0; i < 4; ++i)
 	{
 		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		writes[i].dstSet = m_level->m_descSetProbe;
+		writes[i].dstSet = descriptor;
 		writes[i].dstBinding = i;
 		writes[i].descriptorCount = 1;
 		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1801,6 +1807,10 @@ bool EngineVulkan::AllocateProbeBuffers()
 	}
 	vkUpdateDescriptorSets(m_device, 4, writes, 0, nullptr);
 
+	// Commit only after all allocations succeed; local buffers release the old storage.
+	m_level->m_descSetProbe = descriptor;
+	pointsBuffer.Swap(m_level->m_bufProbePoints);
+	valuesBuffer.Swap(m_level->m_bufProbeValues);
 	return true;
 }
 
@@ -3690,6 +3700,10 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 	points.erase(std::unique(points.begin(), points.end(), [](const ProbePoint& a, const ProbePoint& b) {
 		return a.field_type == b.field_type && a.linear_index == b.linear_index;
 	}), points.end());
+#ifdef ENABLE_VULKAN
+	if (m_device && !AllocateProbeBuffers(points))
+		throw std::runtime_error("[openEMS Vulkan] Probe buffer allocation failed");
+#endif
 	m_level->m_probePoints.swap(points);
 	m_level->m_pa = pa;
 	m_level->m_probesValid = false;
@@ -3699,9 +3713,6 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 		std::cout << "[openEMS Vulkan] Registered " << m_level->m_probePoints.size()
 		          << " active probe monitoring points for fast on-device extraction." << std::endl;
 	}
-#ifdef ENABLE_VULKAN
-	if (m_device && !AllocateProbeBuffers()) ProfileOwner().m_runtimeFailed = true;
-#endif
 }
 
 #ifdef ENABLE_VULKAN

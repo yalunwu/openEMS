@@ -47,6 +47,7 @@
 #include "CSProperties.h"
 #include "CSPropExcitation.h"
 #include "CSPropProbeBox.h"
+#include "CSPropDumpBox.h"
 #include "CSPropLumpedElement.h"
 #include "CSPropAbsorbingBC.h"
 #include "CSPrimBox.h"
@@ -2110,6 +2111,167 @@ bool Test_Vulkan_ProbeReadbackCache()
 #endif
 }
 
+bool Test_Vulkan_ProbeAllocationFailure()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+	ContinuousStructure* csx = CreateCustomGrid(7, 5, 9);
+	for (unsigned int type : {0u, 3u})
+	{
+		auto* property = new CSPropProbeBox(csx->GetParameterSet());
+		property->SetName(type ? "replacement_probe" : "original_probe");
+		property->SetProbeType(type);
+		auto* box = new CSPrimBox(csx->GetParameterSet(), property);
+		const double bounds[] = {0, 0, 0, 0, type ? 0.0 : -5.0, type ? 0.0 : 5.0};
+		for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, bounds[i]);
+		csx->AddProperty(property);
+	}
+	fdtd.SetCSX(csx);
+	fdtd.SetGaussExcite(20e9, 10e9);
+	fdtd.SetEnableDumps(false);
+	fdtd.SetNumberOfTimeSteps(64);
+	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Probe allocation fixture failed");
+	ProcessingArray* processing = fdtd.GetProcessings();
+	Processing* replacement = nullptr;
+	for (size_t i = 0; i < processing->GetNumberOfProcessings(); ++i)
+		if (processing->GetProcessing(i)->GetName() == "replacement_probe") replacement = processing->GetProcessing(i);
+	TEST_ASSERT(replacement, "Replacement probe missing");
+	replacement->SetEnable(false);
+	EngineVulkan gpu(fdtd.GetOp());
+	TEST_ASSERT(gpu.Initialize() && gpu.SetProfilingEnabled(true), "Probe allocation backend failed");
+	VkDescriptorPoolSize size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+	VkDescriptorPoolCreateInfo info = {};
+	info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	info.maxSets = 1;
+	info.poolSizeCount = 1;
+	info.pPoolSizes = &size;
+	VkDescriptorPool pool = VK_NULL_HANDLE;
+	TEST_ASSERT(vkCreateDescriptorPool(gpu.m_device, &info, nullptr, &pool) == VK_SUCCESS, "Probe failure pool creation failed");
+	struct PoolGuard { VkDevice device; VkDescriptorPool pool; ~PoolGuard() { vkDestroyDescriptorPool(device, pool, nullptr); } } poolGuard = {gpu.m_device, pool};
+	VkDescriptorSetAllocateInfo allocation = {};
+	allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocation.descriptorPool = pool;
+	allocation.descriptorSetCount = 1;
+	allocation.pSetLayouts = &gpu.m_descLayoutProbe;
+	VkDescriptorSet occupied = VK_NULL_HANDLE;
+	TEST_ASSERT(vkAllocateDescriptorSets(gpu.m_device, &allocation, &occupied) == VK_SUCCESS, "Probe failure pool exhaustion failed");
+	auto rejectRegistration = [&]() {
+		struct RestorePool { VkDescriptorPool& target; VkDescriptorPool previous; ~RestorePool() { target = previous; } } restore = {gpu.m_descPool, gpu.m_descPool};
+		gpu.m_descPool = pool;
+		try { gpu.RegisterProbes(processing); }
+		catch (const std::runtime_error& error) { return std::string(error.what()).find("Probe buffer allocation failed") != std::string::npos; }
+		return false;
+	};
+	TEST_ASSERT(rejectRegistration(), "Probe allocation failure was not reported");
+	TEST_ASSERT(gpu.m_level->m_probePoints.empty() && !gpu.m_level->m_pa && !gpu.m_level->m_descSetProbe &&
+	            !gpu.m_level->m_bufProbePoints.buffer && !gpu.m_level->m_bufProbePoints.memory && !gpu.m_level->m_bufProbePoints.mapped &&
+	            !gpu.m_level->m_bufProbeValues.buffer && !gpu.m_level->m_bufProbeValues.memory && !gpu.m_level->m_bufProbeValues.mapped &&
+	            !gpu.m_runtimeFailed, "Failed initial registration retained partial resources or disabled stepping");
+	TEST_ASSERT(gpu.IterateTS(1) && gpu.SyncProbesToHost(), "Failed probe registration disabled stepping");
+	gpu.RegisterProbes(processing);
+	gpu.SetVolt(2, 3, 2, 4, 0.25f);
+	TEST_ASSERT(gpu.SyncProbesToHost(), "Probe registration did not recover");
+	const VkDescriptorSet descriptor = gpu.m_level->m_descSetProbe;
+	const VkBuffer pointsBuffer = gpu.m_level->m_bufProbePoints.buffer, valuesBuffer = gpu.m_level->m_bufProbeValues.buffer;
+	const auto originalPoints = gpu.m_level->m_probePoints;
+	replacement->SetEnable(true);
+	// Hide the existing set to inject a failure after both replacement buffers exist.
+	{
+		struct RestoreDescriptor { VkDescriptorSet& target; VkDescriptorSet previous; ~RestoreDescriptor() { target = previous; } } restore = {gpu.m_level->m_descSetProbe, descriptor};
+		gpu.m_level->m_descSetProbe = VK_NULL_HANDLE;
+		TEST_ASSERT(rejectRegistration(), "Replacement probe allocation failure was not reported");
+		TEST_ASSERT(!gpu.m_level->m_descSetProbe && gpu.m_level->m_bufProbePoints.buffer == pointsBuffer &&
+		            gpu.m_level->m_bufProbeValues.buffer == valuesBuffer && gpu.m_level->m_pa == processing &&
+		            gpu.m_level->m_probesValid && !gpu.m_runtimeFailed && gpu.m_level->m_probePoints.size() == originalPoints.size(),
+		            "Failed replacement changed existing probe resources or cache");
+		for (size_t i = 0; i < originalPoints.size(); ++i)
+			TEST_ASSERT(originalPoints[i].linear_index == gpu.m_level->m_probePoints[i].linear_index &&
+			            originalPoints[i].field_type == gpu.m_level->m_probePoints[i].field_type, "Failed replacement changed probe points");
+	}
+	TEST_ASSERT(gpu.ClearProfile() && gpu.SyncProbesToHost() && gpu.GetProfile().submissions == 0 && fdtd.GetEng()->GetVolt(2, 3, 2, 4) == 0.25f,
+	            "Failed replacement invalidated the previous probe result");
+	gpu.RegisterProbes(processing);
+	gpu.SetCurr(0, 3, 2, 4, 0.75f);
+	TEST_ASSERT(gpu.SyncProbesToHost() && fdtd.GetEng()->GetCurr(0, 3, 2, 4) == 0.75f, "Replacement probe values were not gathered after retry");
+	// An exhausted pool must not affect reuse through empty and changing registries.
+	{
+		struct RestorePool { VkDescriptorPool& target; VkDescriptorPool previous; ~RestorePool() { target = previous; } } restore = {gpu.m_descPool, gpu.m_descPool};
+		gpu.m_descPool = pool;
+		for (unsigned int i = 0; i < 20; ++i)
+		{
+			replacement->SetEnable(i % 2 == 0);
+			TEST_ASSERT(gpu.ClearProfile() && gpu.IterateTS(1), "Pending replacement stepping failed");
+			gpu.RegisterProbes(nullptr);
+			TEST_ASSERT(gpu.ClearProfile() && gpu.SyncProbesToHost() && !gpu.m_level->m_bufProbePoints.buffer && !gpu.m_level->m_bufProbeValues.buffer &&
+			            gpu.m_level->m_descSetProbe == descriptor && gpu.GetProfile().probeBytes == 0, "Empty registry lost descriptor reuse or gathered probes");
+			gpu.RegisterProbes(processing);
+			TEST_ASSERT(gpu.SyncProbesToHost() && gpu.m_level->m_descSetProbe == descriptor &&
+			            gpu.GetProfile().probeBytes == (originalPoints.size() + (replacement->GetEnable() ? 3u : 0u)) * sizeof(float),
+			            "Changing probes consumed descriptors or gathered the wrong registry");
+		}
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_DisabledOutputs()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	// 0: no output, 1: TD dump, 2: FD dump, 3: mode matching disabled by invalid geometry.
+	for (unsigned int kind : {0u, 1u, 2u, 3u})
+	{
+		TestFDTDAccess fdtd;
+		ContinuousStructure* csx = CreateCustomGrid(7, 5, 9);
+		if (kind)
+		{
+			CSPropProbeBox* property = nullptr;
+			if (kind == 3)
+			{
+				property = new CSPropProbeBox(csx->GetParameterSet());
+				property->SetProbeType(10);
+				for (unsigned int n = 0; n < 3; ++n) property->SetModeFunction(n, "1");
+			}
+			else
+			{
+				auto* dump = new CSPropDumpBox(csx->GetParameterSet());
+				dump->SetDumpType(kind == 1 ? 0 : 10);
+				dump->AddFDSample(20e9);
+				property = dump;
+			}
+			property->SetName("disabled_output");
+			auto* box = new CSPrimBox(csx->GetParameterSet(), property);
+			const double bounds[] = {-10, 10, -10, 10, -10, 10};
+			for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, bounds[i]);
+			csx->AddProperty(property);
+		}
+		fdtd.SetCSX(csx);
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1", "--exact-endcriteria"});
+		fdtd.SetNumberOfTimeSteps(64);
+		fdtd.SetEndCriteria(0);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetEnableDumps(false);
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Disabled output fixture failed");
+		Processing* output = kind ? fdtd.GetProcessings()->GetProcessing(0) : nullptr;
+		if (output) output->SetProcessInterval(1);
+		std::unique_ptr<EngineVulkan> backend(new EngineVulkan(fdtd.GetOp()));
+		EngineVulkan* gpu = backend.get();
+		TEST_ASSERT(gpu->Initialize() && gpu->SupportsFastEnergy() && gpu->SetProfilingEnabled(true), "Disabled output backend failed");
+		gpu->RegisterProbes(fdtd.GetProcessings());
+		fdtd.ReplaceBackend(std::move(backend));
+		TEST_ASSERT(gpu->ClearProfile(), "Disabled output profile reset failed");
+		fdtd.RunFDTD();
+		TEST_ASSERT(!output || !output->GetEnable(), "Output was not disabled");
+		TEST_ASSERT(gpu->GetProfile().downloadedBytes == 24ull * 7u * 5u * 9u, "Disabled output caused a full-field download before final sync");
+	}
+	return true;
+#endif
+}
+
 bool Test_Vulkan_ProbeValidation()
 {
 #ifndef ENABLE_VULKAN
@@ -2318,6 +2480,8 @@ int main(int argc, char* argv[])
 		RUN_TEST(Test_Vulkan_OptionalResources);
 		RUN_TEST(Test_Vulkan_EnergyDecay);
 		RUN_TEST(Test_Vulkan_ProbeReadbackCache);
+		RUN_TEST(Test_Vulkan_ProbeAllocationFailure);
+		RUN_TEST(Test_Vulkan_DisabledOutputs);
 		RUN_TEST(Test_Vulkan_ProbeValidation);
 		RUN_TEST(Test_Vulkan_EnergyStopping);
 		return tests_failed ? 1 : 0;
@@ -2386,6 +2550,8 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_OptionalResources);
 	RUN_TEST(Test_Vulkan_EnergyDecay);
 	RUN_TEST(Test_Vulkan_ProbeReadbackCache);
+	RUN_TEST(Test_Vulkan_ProbeAllocationFailure);
+	RUN_TEST(Test_Vulkan_DisabledOutputs);
 	RUN_TEST(Test_Vulkan_ProbeValidation);
 	RUN_TEST(Test_Vulkan_EnergyStopping);
 	RUN_TEST(Test_Vulkan_FailurePropagation);

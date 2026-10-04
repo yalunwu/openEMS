@@ -1579,7 +1579,7 @@ void openEMS::RunFDTD()
 				for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
 				{
 					Processing* p = PA->GetProcessing(i);
-					if (p != ProcField && (dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->IsTimestep())
+					if (p != ProcField && p->GetEnable() && (dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->IsTimestep())
 					{
 						needFullField = true;
 						break;

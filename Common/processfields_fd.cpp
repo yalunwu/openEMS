@@ -101,6 +101,7 @@ int ProcessFieldsFD::Process()
 
 void ProcessFieldsFD::PostProcess()
 {
+	if (!Enabled) return;
 	DumpFDData();
 }
 
