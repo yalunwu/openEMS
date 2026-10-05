@@ -15,6 +15,9 @@
 *	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #include "openems.h"
 #include <iomanip>
 #include <iostream>
@@ -284,6 +287,15 @@ void openEMS::collectCommandLineArguments()
 			"vulkan-profile",
 			po::bool_switch()->notifier([&](bool val) { m_vulkanProfile = val; }),
 			"Report Vulkan CPU timings, sampled GPU timings and transfer/submission counts"
+		)
+		(
+			"vulkan-coefficients",
+			po::value<std::string>()->default_value("dense")->notifier([&](const std::string& val) {
+				if (val != "dense" && val != "palette" && val != "analyze")
+					throw std::invalid_argument("vulkan-coefficients must be dense, palette or analyze");
+				m_vulkanCoefficients = val;
+			}),
+			"Vulkan coefficient storage: dense (default), palette, or analyze both layouts"
 		)
 		(
 			"numThreads",
@@ -1401,6 +1413,7 @@ int openEMS::SetupFDTD()
 			std::unique_ptr<EngineVulkan> vulkanBackend(new EngineVulkan(FDTD_Op));
 			vulkanBackend->SetBatchSize(m_vulkanBatchSize);
 			vulkanBackend->SetProfilingEnabled(m_vulkanProfile);
+			vulkanBackend->SetCoefficientMode(m_vulkanCoefficients);
 			if (vulkanBackend->Initialize())
 			{
 				m_EngineBackend = std::move(vulkanBackend);

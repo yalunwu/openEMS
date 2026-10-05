@@ -19,6 +19,9 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Opt-in exact Vulkan coefficient palettes with `--vulkan-coefficients=palette`,
+  dense fallback, and whole-node/per-component storage analysis. The benchmark
+  accepts `--coefficients=dense|palette|analyze`; dense remains the default.
 - Vulkan energy reduction for the basic Cartesian engine, fused probe gathering,
   and combined voltage/current field readbacks with cached host memory where
   available. SSE, cylindrical and multigrid
@@ -215,6 +218,8 @@ number moved up and patch releases now have somewhere to go.
 
 ### Build
 
+- Prevent Windows min/max macros from breaking MSVC compilation of Vulkan
+  timestep batching.
 - Vulkan builds support vcpkg's shaderc CMake target, including its static
   shader compiler dependencies on Windows.
 
@@ -235,6 +240,9 @@ number moved up and patch releases now have somewhere to go.
 
 ### Upgrade notes
 
+- Rebuild the Python extensions against the updated openEMS C++ headers when
+  updating the native library; Vulkan coefficient selection changes the solver's
+  class layout.
 - **Rebuild all components together.** The CSXCAD `CSObject` change alters the
   layout of every class deriving from it. The soname is unchanged and will not
   catch a partial rebuild. This release needs a CSXCAD that provides `CSObject`.

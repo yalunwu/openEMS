@@ -2,7 +2,8 @@
 
 Status: Phases 0, 1 and 2 implemented on Windows / RTX 3070, 2026-10-03/04
 (commits `a0e67e0` and `33807c7`).
-Phases 3 and 5 cancelled. Phase 4 and Phases 6a/6b remain proposed.
+Phase 4 is implemented as an opt-in path with dense fallback; see
+`VULKAN_PHASE04_VALIDATION.md`. Phases 3 and 5 are cancelled. Phases 6a/6b remain proposed.
 See `VULKAN_PERFORMANCE.md` for usage,
 `VULKAN_PHASE01_VALIDATION.md` and `VULKAN_PHASE02_VALIDATION.md` for results.
 
@@ -190,7 +191,13 @@ Cancelled to avoid device-specific tuning and additional shader variants without
 evidence of a portable benefit. Retain the existing workgroup shapes and device
 limit checks. This work is outside the remaining implementation roadmap.
 
-## Phase 4: reduce coefficient traffic
+## Phase 4: reduce coefficient traffic (implemented, opt-in)
+
+Whole-node and per-component counts on smoothed tutorial meshes favored the
+whole-node layout. The exact palette, shader variant, per-level dense fallback,
+benchmark selection and regression tests are implemented. Dense remains the
+default pending broader device/workload evidence. Results and limitations are in
+`VULKAN_PHASE04_VALIDATION.md`.
 
 Measure how often complete coefficient tuples repeat. Build an exact float-bit
 palette and compact index buffer during initialization, with matching shader
@@ -269,14 +276,14 @@ compatibility checks and a safe cache-miss path.
 
 ## Release and acceptance
 
-Phases 0-2 are implemented; Phases 3 and 5 are cancelled. The next milestone is:
+Phases 0-2 and the opt-in Phase 4 path are implemented; Phases 3 and 5 are
+cancelled. Remaining work is:
 
-1. Phase 4 feasibility: count unique coefficient tuples on real tutorial models
-   with smoothed nonuniform meshes, not only uniform synthetic grids. Start from
-   the existing `Operator_SSE_Compressed::CompressOperator()` approach, whose
-   statistics report unique operators. Nonuniform meshes can make most tuples
-   distinct; estimate index/palette traffic and lookup cost before shader work.
-   Compression can save at most the 40% coefficient share of core traffic.
+1. Phase 4 default-selection evidence: measure more GPU vendors and real models
+   before selecting palettes automatically. The current opt-in mode uses exact
+   whole-node tuples and a bounded candidate; dense remains the portable default.
+   Nonuniform meshes can make most tuples distinct. Compression addresses at most
+   the 40% coefficient share of core traffic.
 2. Phase 6a audit, after installing the Vulkan SDK validation layers on the
    measurement host so synchronization validation can run.
 3. First Phase 6b candidate: remove per-submission command recording by reusing
@@ -284,7 +291,7 @@ Phases 0-2 are implemented; Phases 3 and 5 are cancelled. The next milestone is:
    instead of recording it. Prototype two command buffers with independent
    fences only if reuse is not feasible.
 
-Choose between Phase 4 implementation and further Phase 6b work by workload
+Choose between further Phase 4 tuning and Phase 6b work by workload
 class: large grids are bandwidth bound (report effective GB/s against device
 peak), while small and multigrid grids are bound by per-step dispatch, barrier
 and recording overhead.

@@ -94,6 +94,37 @@ resetting statistics. `Reset()` waits before destroying pending GPU resources.
 GPU execution/synchronization errors propagate to the command-line solver or
 Python caller instead of continuing with stale fields.
 
+## Coefficient storage
+
+`--vulkan-coefficients=palette` enables an exact whole-node palette for the four
+operator coefficients in all three directions. Each stored node has one 32-bit
+index into twelve float bit patterns. Geometry, anisotropy, loss and boundary
+corrections come from the final operator values; material IDs are not used.
+Fields and arithmetic retain their existing precision.
+
+Selection is independent at each multigrid level. Dense storage is retained if
+index plus palette bytes do not improve on 48 bytes per node, the palette exceeds
+65,536 tuples (3 MiB of payload), device buffer limits are exceeded, or optional
+host/device allocation fails. Device upload errors still fail initialization.
+The tuple limit bounds dictionary growth and is a resource cap, not a measured
+cache-size threshold. Dense remains the default because storage savings alone do
+not establish a throughput benefit on every device and workload.
+
+`--vulkan-coefficients=analyze` counts both whole-node and per-component tuples
+without the tuple cap and runs the dense reference. It can use substantial host
+memory on mostly unique meshes. Run a short simulation to initialize the backend;
+`--no-simulation` stops before backend initialization. `VULKAN_COEFFICIENTS` reports
+counts, candidate payload bytes, selected storage and coefficient device allocation
+bytes for each hierarchy level. `complete=0` marks an abandoned candidate: its
+unique count and candidate bytes are lower bounds. Component counts are populated
+only in analysis mode. Allocation bytes include Vulkan alignment; they exclude
+field, extension and staging buffers.
+
+Python accepts `vulkan_coefficients='palette'` through `Run()`. MATLAB/Octave
+accepts the same command-line option in the `RunOpenEMS` options string.
+Rebuild Python extensions against the updated C++ headers when updating an
+existing native installation.
+
 ## Benchmark utility
 
 From a directory reserved for benchmark output, run the newly built
@@ -106,6 +137,7 @@ test_backend --vulkan-benchmark --case=large --steps=1024 --repeats=5 --csv=larg
 test_backend --vulkan-benchmark --case=multigrid-5 --batch-size=32 --profile --csv=profile.csv
 test_backend --vulkan-benchmark --case=energy-large --batch-size=32 --verify-energy --csv=energy.csv
 test_backend --vulkan-benchmark --case=energy-large --batch-size=32 --reference-readback --csv=reference.csv
+test_backend --vulkan-benchmark --case=large --batch-size=32 --coefficients=palette --csv=palette.csv
 ```
 
 The default sweep tests batch sizes 1, 8, 16, 32 and 64, with 256 timesteps and
@@ -148,6 +180,13 @@ suites additionally cover supported physics, geometries, probes and dump timing.
 `test_backend --readback-tests` exercises energy precision/overflow/decay,
 SSE fallback, cached probes, re-registration, field edits, staging fallback and
 exact/steady-state stopping. It also forces FP32 on FP64-capable hardware.
+
+`test_backend --coefficient-tests` checks exact reconstruction (including signed
+zeros and NaN payloads), bounded construction, dense fallback, CPU/dense/palette
+field agreement, reset, anisotropic lossy nonuniform meshes, PEC/PMC, PML, Debye
+and cylindrical multigrid. Benchmark CSV coefficient columns describe the root
+level; initialization diagnostics include every level. Phase 4 measurements are
+recorded in `VULKAN_PHASE04_VALIDATION.md`.
 
 ## References
 

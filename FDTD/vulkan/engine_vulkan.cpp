@@ -1,5 +1,6 @@
 #include "engine_vulkan.h"
 #include "shaders_glsl.h"
+#include "coefficient_palette.h"
 
 #include <iostream>
 #include <algorithm>
@@ -74,6 +75,16 @@ bool EngineVulkan::SetBatchSize(unsigned int size)
 {
 	if (size == 0u || size > 64u || GetPendingProbeHistorySteps()) return false;
 	m_batchSize = size;
+	return true;
+}
+
+bool EngineVulkan::SetCoefficientMode(const std::string& mode)
+{
+	if (mode != "dense" && mode != "palette" && mode != "analyze") return false;
+#ifdef ENABLE_VULKAN
+	if (m_device) return false;
+#endif
+	m_coefficientMode = mode;
 	return true;
 }
 
@@ -532,6 +543,7 @@ bool EngineVulkan::InitializeLevel()
 		std::cerr << "[openEMS Vulkan] Failed to compile and create compute pipelines." << std::endl;
 		return false;
 	}
+	if (m_level->m_coefficients.palette && !ProfileOwner().CreatePalettePipelines()) return false;
 	// Optional capability; unsupported precision/resources retain CPU energy.
 	if (!AllocateEnergyResources())
 		std::cerr << "[openEMS Vulkan] Fast energy unavailable; retaining CPU energy checks." << std::endl;
@@ -702,8 +714,9 @@ bool EngineVulkan::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkM
 	return true;
 }
 
-bool EngineVulkan::UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf)
+bool EngineVulkan::UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf, bool* allocationFailed)
 {
+	if (allocationFailed) *allocationFailed = true;
 	if (!data || !size) return false;
 	if (!CreateBuffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 	                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, outBuf))
@@ -713,6 +726,7 @@ bool EngineVulkan::UploadStorageBuffer(const void* data, VkDeviceSize size, Vulk
 	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging))
 		return false;
 	std::memcpy(staging.mapped, data, static_cast<size_t>(size));
+	if (allocationFailed) *allocationFailed = false;
 	bool ok = vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
 	if (ok) ok = vkResetFences(m_device, 1, &m_level->m_fence) == VK_SUCCESS;
 	VkCommandBufferBeginInfo begin = {};
@@ -879,6 +893,7 @@ bool EngineVulkan::InitVulkan()
 
 bool EngineVulkan::InitSharedVulkan(EngineVulkan& parent)
 {
+	m_coefficientMode = parent.m_coefficientMode;
 	m_instance = parent.m_instance;
 	m_physicalDevice = parent.m_physicalDevice;
 	m_device = parent.m_device;
@@ -930,6 +945,33 @@ bool EngineVulkan::InitCommandResources()
 
 bool EngineVulkan::AllocateBuffers()
 {
+	auto& stats = m_level->m_coefficients;
+	stats = CoefficientStatistics();
+	stats.nodes = m_level->m_grid.numCells;
+	stats.denseBytes = stats.storageBytes = 48ull * stats.nodes;
+	VulkanCoefficients::Palette palette;
+	if (m_coefficientMode != "dense" && m_level->m_op) {
+		// Cap dictionary growth and limit the GPU palette payload to 3 MiB.
+		try {
+			palette = VulkanCoefficients::Build(*m_level->m_op, m_coefficientMode == "analyze" ? UINT32_MAX : 65536u);
+		} catch (const std::bad_alloc&) {
+			if (m_coefficientMode == "analyze") throw;
+			palette.complete = false;
+			std::cerr << "[openEMS Vulkan] Palette host allocation failed; retaining dense coefficients." << std::endl;
+		}
+		stats.uniqueNodes = palette.tuples.size();
+		stats.complete = palette.complete;
+		if (m_coefficientMode == "analyze") {
+			stats.uniqueComponents = VulkanCoefficients::CountComponents(*m_level->m_op);
+			stats.componentBytes = 12ull * stats.nodes + 16ull * stats.uniqueComponents;
+		}
+		VkPhysicalDeviceProperties props = {};
+		vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
+		stats.palette = m_coefficientMode == "palette" && palette.complete &&
+		                palette.Bytes() < stats.denseBytes &&
+		                palette.tuples.size() * 48ull <= props.limits.maxStorageBufferRange;
+		if (stats.palette) stats.storageBytes = palette.Bytes();
+	}
 	const size_t totalElements = 3u * static_cast<size_t>(m_level->m_grid.numCells);
 	m_level->m_hostVolt.resize(totalElements, 0.0f);
 	m_level->m_hostCurr.resize(totalElements, 0.0f);
@@ -938,17 +980,46 @@ bool EngineVulkan::AllocateBuffers()
 	VkBufferUsageFlags storageUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	VkMemoryPropertyFlags devLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVv)) return false;
-	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVi)) return false;
-	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufIi)) return false;
-	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufIv)) return false;
+	if (stats.palette) {
+		bool allocationFailed = false;
+		if (!UploadStorageBuffer(palette.tuples.data(), palette.tuples.size() * 48ull, m_level->m_bufVv, &allocationFailed) ||
+		    !UploadStorageBuffer(palette.indices.data(), palette.indices.size() * 4ull, m_level->m_bufVi, &allocationFailed)) {
+			if (!allocationFailed) return false; // Do not retry failed device work.
+			m_level->m_bufVv.Release();
+			m_level->m_bufVi.Release();
+			stats.palette = false;
+			stats.storageBytes = stats.denseBytes;
+			std::cerr << "[openEMS Vulkan] Palette allocation failed; retaining dense coefficients." << std::endl;
+		}
+	}
+	if (!stats.palette) {
+		if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVv)) return false;
+		if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVi)) return false;
+		if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufIi)) return false;
+		if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufIv)) return false;
+	}
+	for (const VulkanBuffer* buffer : {&m_level->m_bufVv, &m_level->m_bufVi, &m_level->m_bufIi, &m_level->m_bufIv}) {
+		if (!buffer->buffer) continue;
+		VkMemoryRequirements requirements = {};
+		vkGetBufferMemoryRequirements(m_device, buffer->buffer, &requirements);
+		stats.allocatedBytes += requirements.size;
+	}
+	if (m_coefficientMode != "dense" && m_level->m_op) {
+		std::cout << "VULKAN_COEFFICIENTS nodes=" << stats.nodes
+		          << " node_unique=" << stats.uniqueNodes << " node_bytes=" << (48ull * stats.uniqueNodes + 4ull * stats.nodes)
+		          << " component_unique=" << stats.uniqueComponents << " component_bytes=" << stats.componentBytes
+		          << " dense_bytes=" << stats.denseBytes << " storage_bytes=" << stats.storageBytes
+		          << " allocated_bytes=" << stats.allocatedBytes
+		          << " complete=" << stats.complete << " selected=" << (stats.palette ? "palette" : "dense") << std::endl;
+	}
+	palette = VulkanCoefficients::Palette();
 	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVolt)) return false;
 	if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufCurr)) return false;
 
 	if (!AllocateFieldStagingBuffer()) return false;
 
 	// Upload initial material coefficient matrices if operator is present
-	if (m_level->m_op)
+	if (m_level->m_op && !stats.palette)
 	{
 		std::cout << "[openEMS Vulkan] Uploading operator material matrices (vv, vi, ii, iv) to GPU..." << std::endl;
 		std::vector<float> hostCoeff(3 * m_level->m_grid.numCells, 0.0f);
@@ -1630,6 +1701,33 @@ bool EngineVulkan::CreatePipelines()
 	return true;
 }
 
+bool EngineVulkan::CreatePalettePipelines()
+{
+	if (m_pipelineVoltPalette && m_pipelineCurrPalette) return true;
+	const char* sources[] = {VulkanShaders::kShaderVoltageUpdate, VulkanShaders::kShaderCurrentUpdate};
+	VkPipeline* pipelines[] = {&m_pipelineVoltPalette, &m_pipelineCurrPalette};
+	for (unsigned int i = 0; i < 2; ++i) {
+		if (*pipelines[i]) continue;
+		std::string source(sources[i]);
+		source.insert(source.find('\n') + 1, "#define COEFFICIENT_PALETTE\n");
+		const auto spirv = CompileGLSLToSpirv(source, shaderc_glsl_compute_shader, "yee_palette.comp");
+		if (spirv.empty()) return false;
+		const VkShaderModule module = CreateShaderModule(spirv);
+		if (!module) return false;
+		VkComputePipelineCreateInfo info = {};
+		info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+		info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+		info.stage.module = module;
+		info.stage.pName = "main";
+		info.layout = m_pipelineLayoutFields;
+		const VkResult result = vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &info, nullptr, pipelines[i]);
+		vkDestroyShaderModule(m_device, module, nullptr);
+		if (result != VK_SUCCESS) return false;
+	}
+	return true;
+}
+
 bool EngineVulkan::AllocateFieldDescriptors()
 {
 	// Allocate and update descriptor set for Fields
@@ -1645,6 +1743,8 @@ bool EngineVulkan::AllocateFieldDescriptors()
 
 	std::vector<VkDescriptorBufferInfo> bufInfos(6);
 	VulkanBuffer* bufs[6] = { &m_level->m_bufVv, &m_level->m_bufVi, &m_level->m_bufIi, &m_level->m_bufIv, &m_level->m_bufVolt, &m_level->m_bufCurr };
+	// Palette shaders only read bindings 0/1; keep the shared six-binding layout.
+	if (m_level->m_coefficients.palette) bufs[2] = bufs[3] = &m_level->m_bufVv;
 	std::vector<VkWriteDescriptorSet> writes(6);
 	for (uint32_t i = 0; i < 6; ++i)
 	{
@@ -3862,7 +3962,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	}
 
 	// 2. Voltage update
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineVolt);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+	                  m_level->m_coefficients.palette ? ProfileOwner().m_pipelineVoltPalette : m_pipelineVolt);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutFields, 0, 1, &m_level->m_descSetFields, 0, nullptr);
 	vkCmdPushConstants(cmd, m_pipelineLayoutFields, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 	Dispatch(cmd, wgZ, wgY, (pc.countX + 1u) / 2u, ProfileVoltage);
@@ -4153,7 +4254,8 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 	}
 
 	// 6. Current update
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineCurr);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+	                  m_level->m_coefficients.palette ? ProfileOwner().m_pipelineCurrPalette : m_pipelineCurr);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutFields, 0, 1, &m_level->m_descSetFields, 0, nullptr);
 	vkCmdPushConstants(cmd, m_pipelineLayoutFields, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 	Dispatch(cmd, wgZ, wgY, (pc.countX + 1u) / 2u, ProfileCurrent);
@@ -4859,6 +4961,8 @@ void EngineVulkan::Reset()
 		DestroyBuffer(m_level->m_bufCylR0);
 		DestroyBuffer(m_level->m_bufMultigridInterpolation);
 
+		if (m_pipelineVoltPalette != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pipelineVoltPalette, nullptr); m_pipelineVoltPalette = VK_NULL_HANDLE; }
+		if (m_pipelineCurrPalette != VK_NULL_HANDLE) { vkDestroyPipeline(m_device, m_pipelineCurrPalette, nullptr); m_pipelineCurrPalette = VK_NULL_HANDLE; }
 		if (m_pipelineVolt != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyPipeline(m_device, m_pipelineVolt, nullptr); m_pipelineVolt = VK_NULL_HANDLE; }
 		if (m_pipelineCurr != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyPipeline(m_device, m_pipelineCurr, nullptr); m_pipelineCurr = VK_NULL_HANDLE; }
 		if (m_pipelineExc  != VK_NULL_HANDLE) { if (m_ownsVulkanDevice) vkDestroyPipeline(m_device, m_pipelineExc, nullptr);  m_pipelineExc  = VK_NULL_HANDLE; }
@@ -4962,6 +5066,7 @@ void EngineVulkan::Reset()
 	m_level->m_hostFieldsValid = true;
 	m_level->m_hostFieldsDirty = true;
 	std::fill(m_level->m_hostVolt.begin(), m_level->m_hostVolt.end(), 0.0f);
+	m_level->m_coefficients = CoefficientStatistics();
 	std::fill(m_level->m_hostCurr.begin(), m_level->m_hostCurr.end(), 0.0f);
 	m_level->m_voltExcPoints.clear();
 	m_level->m_currExcPoints.clear();

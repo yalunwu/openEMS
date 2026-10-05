@@ -15,10 +15,23 @@ layout(push_constant) uniform PushConstants {
 	uint countX;
 } pc;
 
+#ifdef COEFFICIENT_PALETTE
+layout(std430, binding = 0) readonly buffer Palette { float coefficients[]; };
+layout(std430, binding = 1) readonly buffer Indices { uint coefficientIndex[]; };
+#define VV(n) coefficients[coefficientBase + 4u * (n)]
+#define VI(n) coefficients[coefficientBase + 4u * (n) + 1u]
+#define II(n) coefficients[coefficientBase + 4u * (n) + 2u]
+#define IV(n) coefficients[coefficientBase + 4u * (n) + 3u]
+#else
 layout(std430, binding = 0) readonly buffer BufVv { float vv[]; };
 layout(std430, binding = 1) readonly buffer BufVi { float vi[]; };
 layout(std430, binding = 2) readonly buffer BufIi { float ii[]; };
 layout(std430, binding = 3) readonly buffer BufIv { float iv[]; };
+#define VV(n) vv[(n) * nCells + idx]
+#define VI(n) vi[(n) * nCells + idx]
+#define II(n) ii[(n) * nCells + idx]
+#define IV(n) iv[(n) * nCells + idx]
+#endif
 layout(std430, binding = 4) buffer BufVolt { float volt[]; };
 layout(std430, binding = 5) readonly buffer BufCurr { float curr[]; };
 
@@ -38,6 +51,9 @@ void main() {
     uint sliceSize = pc.dimY * pc.dimZ;
     uint idx = x * sliceSize + y * pc.dimZ + z;
     uint nCells = pc.numCells;
+#ifdef COEFFICIENT_PALETTE
+    uint coefficientBase = 12u * coefficientIndex[idx];
+#endif
 
     uint idx_ym1 = (y > 0u) ? (idx - pc.dimZ) : idx;
     uint idx_zm1 = (z > 0u) ? (idx - 1u) : idx;
@@ -46,17 +62,17 @@ void main() {
     // Vx update: vi_x * [ (Iz(x,y,z) - Iz(x,y-1,z)) - (Iy(x,y,z) - Iy(x,y,z-1)) ]
     float curl_x = (curr[2u * nCells + idx] - curr[2u * nCells + idx_ym1])
                  - (curr[1u * nCells + idx] - curr[1u * nCells + idx_zm1]);
-    volt[idx] = vv[idx] * volt[idx] + vi[idx] * curl_x;
+    volt[idx] = VV(0u) * volt[idx] + VI(0u) * curl_x;
 
     // Vy update: vi_y * [ (Ix(x,y,z) - Ix(x,y,z-1)) - (Iz(x,y,z) - Iz(x-1,y,z)) ]
     float curl_y = (curr[idx] - curr[idx_zm1])
                  - (curr[2u * nCells + idx] - curr[2u * nCells + idx_xm1]);
-    volt[nCells + idx] = vv[nCells + idx] * volt[nCells + idx] + vi[nCells + idx] * curl_y;
+    volt[nCells + idx] = VV(1u) * volt[nCells + idx] + VI(1u) * curl_y;
 
     // Vz update: vi_z * [ (Iy(x,y,z) - Iy(x-1,y,z)) - (Ix(x,y,z) - Ix(x,y-1,z)) ]
     float curl_z = (curr[1u * nCells + idx] - curr[1u * nCells + idx_xm1])
                  - (curr[idx] - curr[idx_ym1]);
-    volt[2u * nCells + idx] = vv[2u * nCells + idx] * volt[2u * nCells + idx] + vi[2u * nCells + idx] * curl_z;
+    volt[2u * nCells + idx] = VV(2u) * volt[2u * nCells + idx] + VI(2u) * curl_z;
 }
 )";
 
@@ -72,10 +88,23 @@ layout(push_constant) uniform PushConstants {
 	uint countX;
 } pc;
 
+#ifdef COEFFICIENT_PALETTE
+layout(std430, binding = 0) readonly buffer Palette { float coefficients[]; };
+layout(std430, binding = 1) readonly buffer Indices { uint coefficientIndex[]; };
+#define VV(n) coefficients[coefficientBase + 4u * (n)]
+#define VI(n) coefficients[coefficientBase + 4u * (n) + 1u]
+#define II(n) coefficients[coefficientBase + 4u * (n) + 2u]
+#define IV(n) coefficients[coefficientBase + 4u * (n) + 3u]
+#else
 layout(std430, binding = 0) readonly buffer BufVv { float vv[]; };
 layout(std430, binding = 1) readonly buffer BufVi { float vi[]; };
 layout(std430, binding = 2) readonly buffer BufIi { float ii[]; };
 layout(std430, binding = 3) readonly buffer BufIv { float iv[]; };
+#define VV(n) vv[(n) * nCells + idx]
+#define VI(n) vi[(n) * nCells + idx]
+#define II(n) ii[(n) * nCells + idx]
+#define IV(n) iv[(n) * nCells + idx]
+#endif
 layout(std430, binding = 4) readonly buffer BufVolt { float volt[]; };
 layout(std430, binding = 5) buffer BufCurr { float curr[]; };
 
@@ -95,6 +124,9 @@ void main() {
     uint sliceSize = pc.dimY * pc.dimZ;
     uint idx = x * sliceSize + y * pc.dimZ + z;
     uint nCells = pc.numCells;
+#ifdef COEFFICIENT_PALETTE
+    uint coefficientBase = 12u * coefficientIndex[idx];
+#endif
 
     uint idx_yp1 = idx + pc.dimZ;
     uint idx_zp1 = idx + 1u;
@@ -103,17 +135,17 @@ void main() {
     // Ix update: iv_x * [ (Vz(x,y,z) - Vz(x,y+1,z)) - (Vy(x,y,z) - Vy(x,y,z+1)) ]
     float curl_x = (volt[2u * nCells + idx] - volt[2u * nCells + idx_yp1])
                  - (volt[1u * nCells + idx] - volt[1u * nCells + idx_zp1]);
-    curr[idx] = ii[idx] * curr[idx] + iv[idx] * curl_x;
+    curr[idx] = II(0u) * curr[idx] + IV(0u) * curl_x;
 
     // Iy update: iv_y * [ (Vx(x,y,z) - Vx(x,y,z+1)) - (Vz(x,y,z) - Vz(x+1,y,z)) ]
     float curl_y = (volt[idx] - volt[idx_zp1])
                  - (volt[2u * nCells + idx] - volt[2u * nCells + idx_xp1]);
-    curr[nCells + idx] = ii[nCells + idx] * curr[nCells + idx] + iv[nCells + idx] * curl_y;
+    curr[nCells + idx] = II(1u) * curr[nCells + idx] + IV(1u) * curl_y;
 
     // Iz update: iv_z * [ (Vy(x,y,z) - Vy(x+1,y,z)) - (Vx(x,y,z) - Vx(x,y+1,z)) ]
     float curl_z = (volt[1u * nCells + idx] - volt[1u * nCells + idx_xp1])
                  - (volt[idx] - volt[idx_yp1]);
-    curr[2u * nCells + idx] = ii[2u * nCells + idx] * curr[2u * nCells + idx] + iv[2u * nCells + idx] * curl_z;
+    curr[2u * nCells + idx] = II(2u) * curr[2u * nCells + idx] + IV(2u) * curl_z;
 }
 )";
 

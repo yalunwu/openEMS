@@ -42,6 +42,7 @@
 #include "FDTD/operator_cylinder.h"
 #include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/vulkan/engine_vulkan.h"
+#include "FDTD/vulkan/coefficient_palette.h"
 #include "Common/processing.h"
 #include "ContinuousStructure.h"
 #include "CSProperties.h"
@@ -1565,16 +1566,20 @@ bool Test_Vulkan_Cylinder_Equivalence()
 
 static bool RunMultigridEquivalence(const std::vector<double>& splits, bool openAlpha = false,
                                     bool boundaries = false, bool debye = false, bool reinitialize = false,
-                                    bool benchmark = false)
+                                    bool benchmark = false, const std::string& coefficients = "dense", bool mixedStorage = false)
 {
 #ifndef ENABLE_VULKAN
 	return true;
 #else
-	const int angularLines = benchmark || splits.size() >= 4 ? 129 : 33;
+	const int angularLines = benchmark || mixedStorage || splits.size() >= 4 ? 129 : 33;
 	ContinuousStructure* csx = CreateCylindricalGrid(41, angularLines, 17);
 	CSRectGrid* grid = csx->GetGrid();
 	grid->ClearLines(0);
 	for (int r = 0; r <= 40; ++r) grid->AddDiscLine(0, r);
+	if (mixedStorage) {
+		grid->ClearLines(2);
+		for (int z = 0; z < 35; ++z) grid->AddDiscLine(2, 0.5 * z + 0.05 * z * z);
+	}
 	if (openAlpha)
 	{
 		grid->ClearLines(1);
@@ -1607,7 +1612,7 @@ static bool RunMultigridEquivalence(const std::vector<double>& splits, bool open
 	}
 
 	TestFDTDAccess fdtd;
-	fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1"});
+	fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1", "--vulkan-coefficients=" + coefficients});
 	fdtd.SetCylinderCoords(true);
 	fdtd.SetupCylinderMultiGrid(splits);
 	fdtd.SetNumberOfTimeSteps(160);
@@ -1624,6 +1629,11 @@ static bool RunMultigridEquivalence(const std::vector<double>& splits, bool open
 	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Cylindrical multigrid setup failed");
 	auto* gpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
 	TEST_ASSERT(gpu != nullptr, "Multigrid Vulkan initialization fell back to CPU");
+	if (mixedStorage) {
+		TEST_ASSERT(!gpu->GetCoefficientStatistics().palette && !gpu->GetCoefficientStatistics().complete,
+		            "Mixed hierarchy did not exercise bounded root fallback");
+		TEST_ASSERT(gpu->GetCoefficientStatistics(1).palette, "Mixed hierarchy did not exercise child palette pipelines");
+	}
 	double unsupportedEnergy = 0;
 	TEST_ASSERT(!gpu->SupportsFastEnergy() && !gpu->GetFastEnergy(unsupportedEnergy), "Multigrid SSE energy must retain the CPU calculation");
 	std::vector<Operator*> levels;
@@ -2705,8 +2715,173 @@ bool Benchmark_Vulkan_Multigrid()
 	       RunMultigridEquivalence({8.0, 16.0, 24.0, 32.0}, false, false, false, false, true);
 }
 
+bool Test_CoefficientPalette_Bits()
+{
+	using namespace VulkanCoefficients;
+	// Exercise signed zero, adjacent floats, subnormal bits and distinct NaN
+	// payloads. Equality here is of stored integer bits, not numerical floats.
+	std::vector<Node> nodes(7);
+	nodes[1][0] = 0x80000000u;
+	nodes[2][1] = 0x3f800000u;
+	nodes[3][1] = 0x3f800001u;
+	nodes[4][7] = 1u;
+	nodes[5][11] = 0x7fc00001u;
+	nodes[6][11] = 0x7fc00002u;
+	nodes.push_back(nodes[1]);
+	nodes.push_back(nodes[5]);
+	auto read = [&](uint32_t i) { return nodes[i]; };
+	const auto palette = Build(static_cast<uint32_t>(nodes.size()), read);
+	TEST_ASSERT(palette.complete && palette.tuples.size() == 7u, "Palette merged distinct coefficient bits");
+	for (size_t i = 0; i < nodes.size(); ++i)
+		TEST_ASSERT(palette.tuples.at(palette.indices.at(i)) == nodes[i], "Coefficient reconstruction changed bits");
+	TEST_ASSERT(palette.Bytes() == 7u * 48u + 9u * 4u, "Palette storage accounting changed");
+	const auto bounded = Build(static_cast<uint32_t>(nodes.size()), read, 3);
+	TEST_ASSERT(!bounded.complete && bounded.tuples.size() == 3u, "Unique-tuple limit did not stop construction");
+	const auto empty = Build(0u, read);
+	TEST_ASSERT(empty.complete && empty.Bytes() == 0u, "Empty palette is not empty");
+	return true;
+}
+
+bool Test_Vulkan_CoefficientEquivalence()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (unsigned int fixture = 0; fixture < 5; ++fixture) {
+		const unsigned int nx = 17, ny = 13, nz = 19;
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+		auto* csx = CreateCustomGrid(nx, ny, nz);
+		if (fixture == 1) {
+			for (unsigned int d = 0; d < 3; ++d) {
+				csx->GetGrid()->ClearLines(d);
+				const unsigned int count = d == 0 ? nx : d == 1 ? ny : nz;
+				for (unsigned int i = 0; i < count; ++i) {
+					const double t = double(i) / (count - 1);
+					csx->GetGrid()->AddDiscLine(d, -20 + 20 * (t + t * t));
+				}
+			}
+		}
+		if (fixture == 1 || fixture == 3) {
+			CSPropMaterial* material;
+			if (fixture == 3) {
+				auto* debye = new CSPropDebyeMaterial(csx->GetParameterSet());
+				debye->SetDispersionOrder(2);
+				for (unsigned int pole = 0; pole < 2; ++pole) {
+					debye->SetEpsDelta(pole, 2.0 + pole);
+					debye->SetEpsRelaxTime(pole, 1e-10 / (pole + 1));
+				}
+				material = debye;
+			} else material = new CSPropMaterial(csx->GetParameterSet());
+			material->SetIsotropy(false);
+			for (unsigned int n = 0; n < 3; ++n) {
+				material->SetEpsilon(2.0 + n, n);
+				material->SetMue(1.0 + 0.2 * n, n);
+				material->SetKappa(0.01 * (n + 1), n);
+				material->SetSigma(0.02 * (n + 1), n);
+			}
+			auto* box = new CSPrimBox(csx->GetParameterSet(), material);
+			for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, i % 2 ? 10 : -10);
+			csx->AddProperty(material);
+		}
+		fdtd.SetCSX(csx);
+		fdtd.SetNumberOfTimeSteps(160);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetEnableDumps(false);
+		for (unsigned int face = 0; face < 6; ++face) {
+			if (fixture == 2) fdtd.Set_BC_PML(face, 3);
+			else fdtd.Set_BC_Type(face, face % 2); // PEC/PMC
+		}
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Coefficient fixture setup failed");
+		Operator* op = fdtd.GetOp();
+		if (fixture == 4) {
+			// Every tuple differs, so indices plus palette cost more than dense.
+			for (unsigned int x = 0; x < nx; ++x)
+			for (unsigned int y = 0; y < ny; ++y)
+			for (unsigned int z = 0; z < nz; ++z) {
+				op->SetVV(0, x, y, z, 0.9f + 0.01f * float((x * ny + y) * nz + z) / (nx * ny * nz));
+				// Decoupled decay keeps this deliberately synthetic operator stable.
+				for (unsigned int n = 0; n < 3; ++n) {
+					op->SetVI(n, x, y, z, 0);
+					op->SetIV(n, x, y, z, 0);
+				}
+			}
+		}
+		const auto reconstructed = VulkanCoefficients::Build(*op);
+		for (unsigned int x = 0; x < nx; ++x)
+		for (unsigned int y = 0; y < ny; ++y)
+		for (unsigned int z = 0; z < nz; ++z)
+			TEST_ASSERT(reconstructed.tuples.at(reconstructed.indices.at((x * ny + y) * nz + z)) ==
+			            VulkanCoefficients::ReadNode(*op, x, y, z), "Operator reconstruction changed coefficient bits");
+		EngineVulkan dense(op), palette(op);
+		TEST_ASSERT(!palette.SetCoefficientMode("invalid") && palette.SetCoefficientMode("palette"), "Coefficient mode validation failed");
+		TEST_ASSERT(dense.Initialize() && palette.Initialize(), "Coefficient engines failed to initialize");
+		TEST_ASSERT(!palette.SetCoefficientMode("dense"), "Initialized engine accepted a storage change");
+		const auto stats = palette.GetCoefficientStatistics();
+		TEST_ASSERT(stats.complete && stats.uniqueNodes == reconstructed.tuples.size(), "Palette statistics mismatch");
+		TEST_ASSERT(stats.palette == (reconstructed.Bytes() < stats.denseBytes), "Storage selection mismatch");
+		if (fixture == 4) TEST_ASSERT(!stats.palette, "Unique coefficients must retain dense storage");
+		else if (fixture != 1) TEST_ASSERT(stats.palette, "Repeated-region fixture did not exercise palette shader");
+		fdtd.GetEng()->SetVolt(2, nx / 2, ny / 2, nz / 2, 1.0f);
+		dense.SetVolt(2, nx / 2, ny / 2, nz / 2, 1.0f);
+		palette.SetVolt(2, nx / 2, ny / 2, nz / 2, 1.0f);
+		for (unsigned int steps : {1u, 31u, 33u, 64u}) {
+			TEST_ASSERT(fdtd.GetEng()->IterateTS(steps), "CPU coefficient stepping failed");
+			std::vector<float> reference;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int x = 0; x < nx; ++x)
+			for (unsigned int y = 0; y < ny; ++y)
+			for (unsigned int z = 0; z < nz; ++z) {
+				reference.push_back(fdtd.GetEng()->GetVolt(n, x, y, z));
+				reference.push_back(fdtd.GetEng()->GetCurr(n, x, y, z));
+			}
+			TEST_ASSERT(dense.IterateTS(steps) && palette.IterateTS(steps) && dense.SyncFieldsToHost() && palette.SyncFieldsToHost(),
+			            "GPU coefficient stepping failed");
+			size_t i = 0;
+			float error = 0, paletteError = 0, peak = 0;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int x = 0; x < nx; ++x)
+			for (unsigned int y = 0; y < ny; ++y)
+			for (unsigned int z = 0; z < nz; ++z) {
+				const float actual[] = {palette.GetVolt(n, x, y, z), palette.GetCurr(n, x, y, z)};
+				const float baseline[] = {dense.GetVolt(n, x, y, z), dense.GetCurr(n, x, y, z)};
+				fdtd.GetEng()->SetVolt(n, x, y, z, reference[i]);
+				fdtd.GetEng()->SetCurr(n, x, y, z, reference[i + 1]);
+				for (unsigned int field = 0; field < 2; ++field, ++i) {
+					TEST_ASSERT(std::isfinite(actual[field]), "Palette produced non-finite fields");
+					error = std::max(error, std::abs(actual[field] - reference[i]));
+					paletteError = std::max(paletteError, std::abs(actual[field] - baseline[field]));
+					peak = std::max(peak, std::abs(reference[i]));
+				}
+			}
+			std::cout << "COEFFICIENT_CHECK fixture=" << fixture << " steps=" << steps << " cpu_error=" << error << " dense_error=" << paletteError << std::endl;
+			// Existing CPU/GPU tolerance; the two GPU layouts retain arithmetic.
+			TEST_ASSERT(peak > 0 && error < 1e-4f && error / peak < 0.001f, "Palette exceeded CPU tolerance of 1e-4 / 0.1%");
+			TEST_ASSERT(paletteError <= 1e-7f * peak, "Palette differed from dense GPU fields by more than 1e-7 of peak");
+		}
+		palette.Reset();
+		TEST_ASSERT(palette.SetCoefficientMode("dense") && palette.Initialize(), "Reset did not allow dense reinitialization");
+		TEST_ASSERT(!palette.GetCoefficientStatistics().palette && palette.GetVolt(2, nx / 2, ny / 2, nz / 2) == 0,
+		            "Reset retained palette state or fields");
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_CoefficientMultigrid()
+{
+	return RunMultigridEquivalence({12.0, 24.0}, false, true, true, true, false, "palette") &&
+	       RunMultigridEquivalence({12.0, 24.0}, true, false, false, false, false, "palette", true);
+}
+
 int main(int argc, char* argv[])
 {
+	if (argc > 1 && std::string(argv[1]) == "--coefficient-tests") {
+		RUN_TEST(Test_CoefficientPalette_Bits);
+		RUN_TEST(Test_Vulkan_CoefficientEquivalence);
+		RUN_TEST(Test_Vulkan_CoefficientMultigrid);
+		return tests_failed ? 1 : 0;
+	}
 	if (argc > 1 && std::string(argv[1]) == "--vulkan-benchmark")
 		return RunVulkanPerformanceBenchmarks(argc, argv);
 	if (argc > 1 && std::string(argv[1]) == "--batching-tests") {
@@ -2770,6 +2945,9 @@ int main(int argc, char* argv[])
 	std::cout << "----------------------------------------" << std::endl;
 	std::cout << " Grid Sizes & Corner Cases Tests" << std::endl;
 	std::cout << "----------------------------------------" << std::endl;
+	RUN_TEST(Test_CoefficientPalette_Bits);
+	RUN_TEST(Test_Vulkan_CoefficientEquivalence);
+	RUN_TEST(Test_Vulkan_CoefficientMultigrid);
 	RUN_TEST(Test_Vulkan_SubWarpGrid);
 	RUN_TEST(Test_Vulkan_AsymmetricDimensions);
 	RUN_TEST(Test_Vulkan_ThinPlanarGrid);

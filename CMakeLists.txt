@@ -243,6 +243,9 @@ if(BUILD_TESTING)
   ADD_TEST(NAME vulkan-batch-large COMMAND ${CMAKE_COMMAND}
     "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>" -DBATCH_SIZE=65
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_batch_rejection.cmake)
+  ADD_TEST(NAME vulkan-coefficients-invalid COMMAND ${CMAKE_COMMAND}
+    "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>"
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_coefficient_rejection.cmake)
 endif()
  
 if (WIN32)

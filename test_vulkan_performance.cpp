@@ -55,7 +55,7 @@ void Box(ContinuousStructure* csx, CSProperties* property, const double bounds[6
 	csx->AddProperty(property);
 }
 
-void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int batch, bool profile)
+void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int batch, bool profile, const std::string& coefficients)
 {
 	ContinuousStructure* csx = new ContinuousStructure();
 	CSRectGrid* grid = csx->GetGrid();
@@ -111,7 +111,7 @@ void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int 
 		Box(csx, dump, bounds);
 	}
 	fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1", "--exact-endcriteria",
-	                          "--vulkan-batch-size=" + std::to_string(batch)});
+	                          "--vulkan-batch-size=" + std::to_string(batch), "--vulkan-coefficients=" + coefficients});
 	fdtd.SetNumberOfTimeSteps(steps);
 	fdtd.SetEndCriteria(0.0);
 	if (c.processing == 3u) fdtd.SetSinusExcite(10e9);
@@ -192,13 +192,17 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 	try {
 		unsigned int steps = 256, repeats = 5;
 		bool profile = false, referenceReadback = false, verifyEnergy = false;
-		std::string selected, csvPath;
+		std::string selected, csvPath, coefficients = "dense";
 		std::vector<unsigned int> batches = {1, 8, 16, 32, 64};
 		for (int i = 2; i < argc; ++i) {
 			std::string arg(argv[i]);
 			if (arg == "--profile") profile = true;
 			else if (arg == "--reference-readback") referenceReadback = true;
 			else if (arg == "--verify-energy") verifyEnergy = true;
+			else if (arg.find("--coefficients=") == 0) {
+				coefficients = arg.substr(15);
+				Require(coefficients == "dense" || coefficients == "palette" || coefficients == "analyze", "Invalid coefficient mode");
+			}
 			else if (arg.find("--case=") == 0) selected = arg.substr(7);
 			else if (arg.find("--steps=") == 0) steps = Number(arg.substr(8), 1000000);
 			else if (arg.find("--repeats=") == 0) repeats = Number(arg.substr(10), 100);
@@ -227,7 +231,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 		if (!csvPath.empty()) {
 			csv.open(csvPath);
 			Require(csv.good(), "Could not open benchmark CSV");
-			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback\n";
+			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback,coefficient_mode,root_coefficient_bytes,root_allocated_bytes,root_dense_bytes,root_unique_tuples,root_palette\n";
 			csv << std::setprecision(10);
 		}
 		bool found = false, metadata = false;
@@ -240,7 +244,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 				if (!c.processing) {
 					fdtd.reset(new BenchmarkFDTD);
 					const auto init = Clock::now();
-					Setup(*fdtd, c, steps, batch, profile);
+					Setup(*fdtd, c, steps, batch, profile, coefficients);
 					Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
 					initSeconds = Seconds(init);
 					Require(fdtd->GPU()->IterateTS(64) && fdtd->GPU()->Synchronize(), "Warm-up failed");
@@ -250,7 +254,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					if (c.processing) {
 						fdtd.reset(new BenchmarkFDTD);
 						const auto init = Clock::now();
-						Setup(*fdtd, c, steps, batch, profile);
+						Setup(*fdtd, c, steps, batch, profile, coefficients);
 						Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
 						initSeconds = Seconds(init);
 					}
@@ -266,6 +270,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					const double synchronization = Seconds(sync), total = Seconds(begin);
 					if (run == 0u) continue; // warm-up result excluded
 					const auto p = gpu->GetProfile();
+					const auto coeff = gpu->GetCoefficientStatistics();
 					if (profile) gpu->WriteProfile(std::cout);
 					if (verifyEnergy && !referenceReadback) {
 						double energy = 0;
@@ -282,12 +287,12 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					             << synchronization << ',' << total << ',' << p.submissions << ',' << p.dispatches << ','
 					             << p.uploadedBytes << ',' << p.downloadedBytes << ',' << p.probeBytes << ','
 					             << p.recordSeconds << ',' << p.submitSeconds << ',' << p.waitSeconds << ','
-					             << p.gpuSeconds[EngineVulkan::ProfileBatch] << ',' << p.energyBytes << ',' << referenceReadback << '\n';
+					             << p.gpuSeconds[EngineVulkan::ProfileBatch] << ',' << p.energyBytes << ',' << referenceReadback << ',' << coefficients << ',' << coeff.storageBytes << ',' << coeff.allocatedBytes << ',' << coeff.denseBytes << ',' << coeff.uniqueNodes << ',' << coeff.palette << '\n';
 				}
 				std::sort(timings.begin(), timings.end());
 				const double median = (timings[(repeats - 1) / 2] + timings[repeats / 2]) / 2;
 				std::cout << "BENCHMARK case=" << c.name << " batch=" << batch << " profile=" << profile
-				          << " reference_readback=" << referenceReadback
+				          << " coefficients=" << coefficients << " reference_readback=" << referenceReadback
 				          << " steps=" << steps << " repeats=" << repeats << " mode=" << (c.processing ? "solver-output" : "stepping")
 				          << " stored_nodes=" << Nodes(fdtd->GetOp(), false) << " active_voltage_nodes=" << Nodes(fdtd->GetOp(), true)
 				          << " operator_cells=" << fdtd->GetOp()->GetNumberCells() << " initialization_s=" << initSeconds

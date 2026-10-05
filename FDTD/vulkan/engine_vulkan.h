@@ -70,6 +70,17 @@ public:
 	ProfileStatistics GetProfile(); // collects only available timestamp results
 	void WriteProfile(std::ostream& stream);
 	std::string GetDeviceDescription() const;
+	bool SetCoefficientMode(const std::string& mode); // dense, palette, analyze; before Initialize()
+	struct CoefficientStatistics {
+		uint64_t nodes = 0, uniqueNodes = 0, denseBytes = 0, storageBytes = 0;
+		uint64_t allocatedBytes = 0;
+		uint64_t uniqueComponents = 0, componentBytes = 0;
+		bool palette = false, complete = false;
+	};
+	CoefficientStatistics GetCoefficientStatistics(unsigned int level = 0) const {
+		if (level == 0) return m_level->m_coefficients;
+		return m_level->m_innerGrid ? m_level->m_innerGrid->GetCoefficientStatistics(level - 1) : CoefficientStatistics();
+	}
 
 private:
 	friend bool Test_Vulkan_OptionalResources();
@@ -112,6 +123,7 @@ private:
 	bool m_profileEnabled = false;
 	bool m_readbackOptimizations = true;
 	bool m_enableEnergyFloat64 = true;
+	std::string m_coefficientMode = "dense";
 	unsigned int m_probeHistoryStart = 0, m_probeHistoryCount = 0, m_probeHistoryCursor = 0;
 	ProfileStatistics m_profile;
 	bool IterateTSImpl(unsigned int iterTS, bool history);
@@ -185,6 +197,9 @@ private:
 	VkPipelineLayout m_pipelineLayoutFields = VK_NULL_HANDLE;
 	VkPipeline m_pipelineVolt = VK_NULL_HANDLE;
 	VkPipeline m_pipelineCurr = VK_NULL_HANDLE;
+	VkPipeline m_pipelineVoltPalette = VK_NULL_HANDLE;
+	VkPipeline m_pipelineCurrPalette = VK_NULL_HANDLE;
+	bool CreatePalettePipelines();
 
 	VkDescriptorSetLayout m_descLayoutExc = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutExc = VK_NULL_HANDLE;
@@ -356,7 +371,7 @@ private:
 	bool SyncHierarchyToDevice();
 
 	bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VulkanBuffer& outBuf);
-	bool UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf);
+	bool UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf, bool* allocationFailed = nullptr);
 	void DestroyBuffer(VulkanBuffer& buf);
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
 	VkShaderModule CreateShaderModule(const std::vector<uint32_t>& spirv);
@@ -377,6 +392,7 @@ private:
 		const Operator_CylinderMultiGrid* m_multigridOp = nullptr;
 		const ProcessingArray* m_pa = nullptr;
 		GridDimensions m_grid;
+		CoefficientStatistics m_coefficients;
 		uint32_t m_activeXStart = 0;
 		bool m_dimensionsValid = true;
 		unsigned int m_numTS = 0;

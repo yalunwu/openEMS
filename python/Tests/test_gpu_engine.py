@@ -1032,6 +1032,55 @@ class Test_GPUEngine(unittest.TestCase):
                     np.testing.assert_array_equal(a.attrs['time'], b.attrs['time'])
                     np.testing.assert_allclose(a[...], b[...], rtol=0.001, atol=1e-4)
 
+    def test_vulkan_palette_preserves_outputs(self):
+        """Exact palettes preserve nonuniform/lossy port and dump output (0.1%)."""
+        outputs = {}
+        for mode in ('dense', 'palette'):
+            csx = ContinuousStructure()
+            grid = csx.GetGrid()
+            grid.SetDeltaUnit(1e-3)
+            grid.SetLines('x', [-20, -17, -13, -10, -7, -5, -3, -1,
+                                0, 1, 3, 5, 7, 10, 13, 17, 20])
+            grid.SetLines('y', np.linspace(-20, 20, 17))
+            grid.SetLines('z', np.linspace(-20, 20, 25))
+            material = csx.AddMaterial('lossy', epsilon=[2, 3, 4],
+                                       kappa=[0.01, 0.02, 0.03])
+            material.SetIsotropy(False)
+            material.AddBox([-7, -10, -10], [7, 10, 10])
+            dump = csx.AddDump('fields', dump_type=0, file_type=1)
+            dump.AddBox([-20, -20, 0], [20, 20, 0])
+            fdtd = openEMS(NrTS=129, EndCriteria=0, OverSampling=2)
+            fdtd.SetCSX(csx)
+            fdtd.SetGaussExcite(20e9, 10e9)
+            fdtd.SetBoundaryCond(['MUR', 'PEC', 'PMC', 'PML_4', 'PEC', 'PEC'])
+            port = fdtd.AddLumpedPort(1, 50, [-1, 0, -2], [1, 0, 2],
+                                      'z', excite=1.0)
+            sdir = self._sim_path('coefficients_' + mode)
+            fdtd.Run(sdir, engine='vulkan', vulkan_coefficients=mode,
+                     vulkan_batch_size=32, exact_endcriteria=True,
+                     numThreads=1, cleanup=False)
+            port.CalcPort(sdir, np.array([15e9, 20e9, 25e9]))
+            outputs[mode] = (sdir, port.uf_tot / port.if_tot)
+        reference_dir, reference_impedance = outputs['dense']
+        result_dir, result_impedance = outputs['palette']
+        self.assertTrue(np.all(np.isfinite(reference_impedance)))
+        np.testing.assert_allclose(result_impedance, reference_impedance, rtol=0.001, atol=1e-6)
+        for name in ('port_ut_1', 'port_it_1'):
+            reference = np.loadtxt(os.path.join(reference_dir, name), comments='%')
+            actual = np.loadtxt(os.path.join(result_dir, name), comments='%')
+            np.testing.assert_array_equal(actual[:, 0], reference[:, 0])
+            peak = np.max(np.abs(reference[:, 1]))
+            self.assertGreater(peak, 0)
+            self.assertLessEqual(np.max(np.abs(actual[:, 1] - reference[:, 1])), peak * 0.001)
+        with h5py.File(os.path.join(reference_dir, 'fields.h5')) as reference, \
+                h5py.File(os.path.join(result_dir, 'fields.h5')) as result:
+            self.assertEqual(set(reference['FieldData/TD']), set(result['FieldData/TD']))
+            self.assertGreater(len(reference['FieldData/TD']), 1)
+            for timestep in reference['FieldData/TD']:
+                a, b = reference['FieldData/TD/' + timestep], result['FieldData/TD/' + timestep]
+                np.testing.assert_array_equal(a.attrs['time'], b.attrs['time'])
+                np.testing.assert_allclose(a[...], b[...], rtol=0.001, atol=1e-4)
+
 if __name__ == '__main__':
     if len(sys.argv) in (4, 5) and sys.argv[1] == '--disabled-output-case':
         _run_disabled_output_case(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else 'vulkan')

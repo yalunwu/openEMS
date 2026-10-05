@@ -153,6 +153,7 @@ protected:
 	bool m_exactEndCriteria;
 	unsigned int m_vulkanBatchSize = 32;
 	bool m_vulkanProfile = false;
+	std::string m_vulkanCoefficients = "dense";
 
 	double endCrit;
 	int m_OverSampling;
