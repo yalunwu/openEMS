@@ -43,6 +43,8 @@ public:
 	bool GetFastEnergy(double& energy) override;
 	bool SupportsFastEnergy() const;
 	bool SetReadbackOptimizationsEnabled(bool enabled); // benchmark/reference switch
+	bool SetBarrierCoalescingEnabled(bool enabled); // benchmark/reference switch
+	bool SetDispersivePreFusionEnabled(bool enabled); // benchmark/reference switch
 	bool SetEnergyFloat64Enabled(bool enabled); // before Initialize(); exercise FP32 fallback
 	void RegisterProbes(const ProcessingArray* pa) override;
 	std::string GetBackendName() const override;
@@ -51,11 +53,13 @@ public:
 
 	enum GpuProfileCategory { ProfileBatch, ProfileVoltage, ProfileCurrent,
 	                          ProfileExtension, ProfileMultigrid, ProfileProbe,
-	                          ProfileReadback, ProfileEnergy, ProfileCategoryCount };
+	                          ProfileReadback, ProfileEnergy, ProfileBarrier, ProfileCategoryCount };
 	struct ProfileStatistics {
 		uint64_t submissions = 0, dispatches = 0, timesteps = 0, sampledSteps = 0;
 		uint64_t uploadedBytes = 0, downloadedBytes = 0, probeBytes = 0;
 		uint64_t energyBytes = 0;
+		uint64_t barriers = 0, coalescedBarriers = 0;
+		std::array<uint64_t, ProfileCategoryCount> categoryDispatches = {};
 		double recordSeconds = 0, submitSeconds = 0, waitSeconds = 0;
 		double readbackSeconds = 0, mirrorSeconds = 0;
 		std::array<double, ProfileCategoryCount> gpuSeconds = {};
@@ -87,6 +91,7 @@ private:
 	friend bool Test_Vulkan_ProbeAllocationFailure();
 	friend bool Test_Vulkan_ExtensionIndexValidation();
 	friend bool Test_Vulkan_ProbeHistory();
+	friend bool Test_Vulkan_SynchronizationDependencies(bool);
 
 	struct GridDimensions {
 		uint32_t dimX = 0;
@@ -122,6 +127,8 @@ private:
 	unsigned int m_batchSize = 32;
 	bool m_profileEnabled = false;
 	bool m_readbackOptimizations = true;
+	bool m_coalesceBarriers = false;
+	bool m_fuseDispersivePre = true;
 	bool m_enableEnergyFloat64 = true;
 	std::string m_coefficientMode = "dense";
 	unsigned int m_probeHistoryStart = 0, m_probeHistoryCount = 0, m_probeHistoryCursor = 0;
@@ -134,6 +141,7 @@ private:
 	uint32_t m_profileSpanCount = 0, m_queryCount = 0, m_timestampBits = 0;
 	float m_timestampPeriod = 0;
 	bool m_queriesPending = false, m_sampleDispatches = false, m_runtimeFailed = false;
+	bool m_computeBarrierEmitted = false;
 	EngineVulkan& ProfileOwner();
 	bool InitProfiling();
 	void CollectProfile();
@@ -142,6 +150,8 @@ private:
 	void EndGpuSpan(VkCommandBuffer cmd, uint32_t first);
 	void Dispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z,
 	              GpuProfileCategory category = ProfileExtension);
+	void MemoryBarrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+	                   const VkMemoryBarrier& barrier);
 	void CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst,
 	                const VkBufferCopy& region, bool download = false);
 	bool WaitForFence();
@@ -363,6 +373,8 @@ private:
 	bool AllocateDispersiveBuffers();
 	bool AllocateDebyeBuffers();
 	void RecordDebyePhase(VkCommandBuffer cmd, uint32_t mode);
+	void RecordDispersivePre(VkCommandBuffer cmd, VkDescriptorSet descriptors,
+	                         uint32_t count, const std::vector<TfsfFace>& passes);
 	bool AllocateCylinderBuffers();
 	bool AllocateMultigridBuffers();
 	bool CreatePipelines();
@@ -475,6 +487,7 @@ private:
 		VkDescriptorSet m_descSetAbcCurr = VK_NULL_HANDLE;
 		uint32_t m_dispVoltCount = 0;
 		uint32_t m_dispCurrCount = 0;
+		uint32_t m_dispersivePreMaxGroups = 0;
 		std::vector<TfsfFace> m_dispVoltPasses;
 		std::vector<TfsfFace> m_dispCurrPasses;
 		VulkanBuffer m_bufDispVoltParams;

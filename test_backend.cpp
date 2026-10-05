@@ -1566,7 +1566,8 @@ bool Test_Vulkan_Cylinder_Equivalence()
 
 static bool RunMultigridEquivalence(const std::vector<double>& splits, bool openAlpha = false,
                                     bool boundaries = false, bool debye = false, bool reinitialize = false,
-                                    bool benchmark = false, const std::string& coefficients = "dense", bool mixedStorage = false)
+                                    bool benchmark = false, const std::string& coefficients = "dense", bool mixedStorage = false,
+                                    bool coalesceBarriers = true)
 {
 #ifndef ENABLE_VULKAN
 	return true;
@@ -1629,6 +1630,7 @@ static bool RunMultigridEquivalence(const std::vector<double>& splits, bool open
 	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Cylindrical multigrid setup failed");
 	auto* gpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
 	TEST_ASSERT(gpu != nullptr, "Multigrid Vulkan initialization fell back to CPU");
+	TEST_ASSERT(gpu->SetBarrierCoalescingEnabled(coalesceBarriers), "Could not select multigrid barrier mode");
 	if (mixedStorage) {
 		TEST_ASSERT(!gpu->GetCoefficientStatistics().palette && !gpu->GetCoefficientStatistics().complete,
 		            "Mixed hierarchy did not exercise bounded root fallback");
@@ -1927,7 +1929,9 @@ bool Test_Vulkan_ProbeHistory()
 				TEST_ASSERT(gpu->BeginProbeHistory(count), "Could not start probe history");
 				TEST_ASSERT(gpu->GetNumberOfTimesteps() == completed && fdtd.GetEng()->GetNumberOfTimesteps() == completed, "Future timestep leaked before replay");
 				TEST_ASSERT(!gpu->IterateTS(count + 1) && !gpu->BeginProbeHistory(2), "History allowed advancing beyond its stored frames");
-				TEST_ASSERT(!gpu->SetBatchSize(1) && !gpu->SetReadbackOptimizationsEnabled(false), "History storage mutated during replay");
+				TEST_ASSERT(!gpu->SetBatchSize(1) && !gpu->SetReadbackOptimizationsEnabled(false) &&
+				            !gpu->SetBarrierCoalescingEnabled(false) && !gpu->SetDispersivePreFusionEnabled(false),
+				            "History configuration mutated during replay");
 				bool rejected = false;
 				try { gpu->RegisterProbes(nullptr); } catch (const std::logic_error&) { rejected = true; }
 				TEST_ASSERT(rejected, "Probe registration destroyed pending history");
@@ -2868,14 +2872,184 @@ bool Test_Vulkan_CoefficientEquivalence()
 #endif
 }
 
+bool Test_Vulkan_SynchronizationDependencies(bool dispersive = true)
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	const unsigned int nx = 21, ny = 21, nz = 21;
+	for (unsigned int fixture = 0; fixture < (dispersive ? 3u : 2u); ++fixture) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+		auto* csx = CreateCustomGrid(nx, ny, nz);
+		auto box = [csx](CSProperties* property, const std::array<double, 6>& bounds) {
+			auto* primitive = new CSPrimBox(csx->GetParameterSet(), property);
+			for (unsigned int i = 0; i < 6; ++i) primitive->SetCoord(i, bounds[i]);
+			csx->AddProperty(property);
+		};
+		auto* exc = new CSPropExcitation(csx->GetParameterSet());
+		exc->SetExcitType(fixture == 1 ? 10 : 0);
+		exc->SetExcitation(1.0, 2);
+		if (fixture == 1) {
+			exc->SetPropagationDir(1.0, 0);
+			box(exc, {{-12, 12, -12, 12, -12, 12}});
+		} else box(exc, {{0, 0, 0, 0, -2, 2}});
+		if (fixture == 0) {
+			auto* debye = new CSPropDebyeMaterial(csx->GetParameterSet());
+			debye->SetEpsilon(2.0);
+			debye->SetDispersionOrder(3);
+			for (unsigned int pole = 0; pole < 3; ++pole) {
+				debye->SetEpsDelta(pole, 1.0 + pole);
+				debye->SetEpsRelaxTime(pole, 1e-10 / (pole + 1));
+			}
+			box(debye, {{-10, 10, -10, 10, -10, 10}});
+		}
+		if (fixture == 1) {
+			// Sheets intersect each other, outer Mur faces and the y+ PML slab.
+			for (bool axial : {false, true}) {
+				auto* abc = new CSPropAbsorbingBC(csx->GetParameterSet());
+				abc->SetAbsorbingBoundaryType(CSPropAbsorbingBC::MUR_1ST_SA);
+				abc->SetNormalSignPositive(true);
+				abc->SetPhaseVelocity(3e8);
+				box(abc, axial ? std::array<double, 6>{{-20, 20, -20, 20, 12, 12}} :
+				                 std::array<double, 6>{{12, 12, -20, 20, -20, 20}});
+			}
+		}
+		if (fixture == 2) {
+			auto* lorentz = new CSPropLorentzMaterial(csx->GetParameterSet());
+			lorentz->SetEpsilon(2.0);
+			lorentz->SetDispersionOrder(3);
+			for (unsigned int pole = 0; pole < 3; ++pole) {
+				lorentz->SetEpsPlasmaFreq(pole, 1e9 * (pole + 1));
+				lorentz->SetEpsLorPoleFreq(pole, 0.5e9 * (pole + 1));
+				lorentz->SetEpsRelaxTime(pole, 1e-9);
+				lorentz->SetMuePlasmaFreq(pole, 0.5e9 * (pole + 1));
+				lorentz->SetMueLorPoleFreq(pole, 0.25e9 * (pole + 1));
+				lorentz->SetMueRelaxTime(pole, 1e-9);
+			}
+			box(lorentz, {{-10, 10, -10, 10, -10, 10}});
+			auto* sheet = new CSPropConductingSheet(csx->GetParameterSet());
+			sheet->SetConductivity(1e5);
+			sheet->SetThickness(50e-6);
+			box(sheet, {{-10, 10, -10, 10, 12, 12}});
+		}
+		// A lumped element and excitation at the same edge exercise priority.
+		auto* rlc = new CSPropLumpedElement(csx->GetParameterSet());
+		rlc->SetDirection(2);
+		rlc->SetLEtype(CSPropLumpedElement::PARALLEL);
+		rlc->SetResistance(50);
+		rlc->SetInductance(1e-9);
+		rlc->SetCapacity(1e-12);
+		rlc->SetCaps(false);
+		box(rlc, {{-0.5, 0.5, -0.5, 0.5, -0.5, 2.5}});
+		fdtd.SetCSX(csx);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetNumberOfTimeSteps(160);
+		fdtd.SetEnableDumps(false);
+		for (unsigned int face = 0; face < 6; ++face) fdtd.Set_BC_Type(face, 2);
+		fdtd.Set_BC_PML(3, 4);
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Synchronization fixture setup failed");
+		EngineVulkan reference(fdtd.GetOp()), optimized(fdtd.GetOp()), fused(fdtd.GetOp());
+		TEST_ASSERT(reference.SetBarrierCoalescingEnabled(false), "Could not select reference barriers");
+		TEST_ASSERT(optimized.SetBarrierCoalescingEnabled(true) && reference.SetDispersivePreFusionEnabled(false) &&
+		            optimized.SetDispersivePreFusionEnabled(false), "Could not isolate synchronization candidates");
+		TEST_ASSERT(reference.Initialize() && optimized.Initialize() && fused.Initialize(), "Synchronization engines failed to initialize");
+		TEST_ASSERT(reference.SetProfilingEnabled(true) && optimized.SetProfilingEnabled(true) && fused.SetProfilingEnabled(true),
+		            "Could not profile synchronization");
+		for (EngineBackend* engine : {static_cast<EngineBackend*>(&reference), static_cast<EngineBackend*>(&optimized),
+		                             static_cast<EngineBackend*>(&fused)})
+			engine->SetVolt(2, nx / 2, ny / 2, nz / 2, 0.1f);
+		fdtd.GetEng()->SetVolt(2, nx / 2, ny / 2, nz / 2, 0.1f);
+		unsigned int completed = 0;
+		for (unsigned int steps : {1u, 31u, 33u, 64u}) {
+			// Force optional fused-dispatch capacity fallback after exercising it.
+			if (fixture == 2 && steps == 64u) fused.m_level->m_dispersivePreMaxGroups = 0;
+			TEST_ASSERT(fdtd.GetEng()->IterateTS(steps), "Synchronization CPU stepping failed");
+			std::vector<float> expected;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int x = 0; x < nx; ++x)
+			for (unsigned int y = 0; y < ny; ++y)
+			for (unsigned int z = 0; z < nz; ++z) {
+				expected.push_back(fdtd.GetEng()->GetVolt(n, x, y, z));
+				expected.push_back(fdtd.GetEng()->GetCurr(n, x, y, z));
+			}
+			TEST_ASSERT(reference.IterateTS(steps) && optimized.IterateTS(steps) && fused.IterateTS(steps), "Synchronization GPU stepping failed");
+			TEST_ASSERT(reference.SyncFieldsToHost() && optimized.SyncFieldsToHost() && fused.SyncFieldsToHost(), "Synchronization readback failed");
+			float error = 0, peak = 0, gpuError = 0;
+			size_t index = 0;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int x = 0; x < nx; ++x)
+			for (unsigned int y = 0; y < ny; ++y)
+			for (unsigned int z = 0; z < nz; ++z) {
+				const float ref[] = {reference.GetVolt(n, x, y, z), reference.GetCurr(n, x, y, z)};
+				const float opt[] = {optimized.GetVolt(n, x, y, z), optimized.GetCurr(n, x, y, z)};
+				const float fusion[] = {fused.GetVolt(n, x, y, z), fused.GetCurr(n, x, y, z)};
+				for (unsigned int field = 0; field < 2; ++field) {
+					TEST_ASSERT(std::isfinite(opt[field]) && std::isfinite(ref[field]) && std::isfinite(fusion[field]), "Non-finite synchronization field");
+					peak = std::max(peak, std::abs(expected[index]));
+					error = std::max(error, std::max(std::abs(expected[index] - ref[field]), std::abs(expected[index] - opt[field])));
+					gpuError = std::max(gpuError, std::max(std::abs(ref[field] - opt[field]), std::abs(ref[field] - fusion[field])));
+					// GPU readback fills the operator's CPU mirror. Restore the
+					// independent CPU result before its next continuation step.
+					if (field == 0) fdtd.GetEng()->SetVolt(n, x, y, z, expected[index]);
+					else fdtd.GetEng()->SetCurr(n, x, y, z, expected[index]);
+					++index;
+				}
+			}
+			completed += steps;
+			std::cout << "Synchronization fixture=" << fixture << " steps=" << completed
+			          << " error=" << error << " gpu_error=" << gpuError << " peak=" << peak << std::endl;
+			TEST_ASSERT(peak > 0 && error < 1e-4f && error <= peak * 0.001f, "Synchronization CPU/GPU tolerance exceeded");
+			TEST_ASSERT(gpuError <= peak * 1e-7f, "Barrier coalescing changed GPU fields");
+		}
+		const auto ref = reference.GetProfile(), opt = optimized.GetProfile();
+		TEST_ASSERT(opt.coalescedBarriers > 0 && ref.coalescedBarriers == 0, "Barrier reference was not exercised");
+		TEST_ASSERT(opt.barriers + opt.coalescedBarriers == ref.barriers && opt.dispatches == ref.dispatches,
+		            "Coalescing changed work or removed a nonduplicate barrier");
+		TEST_ASSERT(opt.categoryDispatches[EngineVulkan::ProfileVoltage] == completed &&
+		            opt.categoryDispatches[EngineVulkan::ProfileCurrent] == completed, "Dispatch categories lost core updates");
+		const auto fusion = fused.GetProfile();
+		TEST_ASSERT(fusion.barriers == ref.barriers && fusion.coalescedBarriers == 0, "Pre fusion changed barriers");
+		TEST_ASSERT(fixture == 2 ? fusion.dispatches < ref.dispatches : fusion.dispatches == ref.dispatches,
+		            "Pre fusion did not preserve other work or reduce dispersive dispatches");
+	}
+	return true;
+#endif
+}
+
 bool Test_Vulkan_CoefficientMultigrid()
 {
 	return RunMultigridEquivalence({12.0, 24.0}, false, true, true, true, false, "palette") &&
 	       RunMultigridEquivalence({12.0, 24.0}, true, false, false, false, false, "palette", true);
 }
 
+bool Test_Vulkan_SynchronizationMultigrid()
+{
+	return RunMultigridEquivalence({12.0, 24.0}, false, true, true, true, false, "dense", false, false) &&
+	       RunMultigridEquivalence({12.0, 24.0}, false, true, true, true, false, "palette", false, true);
+}
+
+bool Test_Vulkan_SynchronizationShaderDependencies()
+{
+	// The supplemental shader heuristic sees false WAW conflicts between
+	// independent Lorentz pre passes. The full suite still tests those poles.
+	return Test_Vulkan_SynchronizationDependencies(false);
+}
+
 int main(int argc, char* argv[])
 {
+	if (argc > 1 && (std::string(argv[1]) == "--synchronization-tests" ||
+	                 std::string(argv[1]) == "--synchronization-shader-tests")) {
+		if (std::string(argv[1]) == "--synchronization-shader-tests") {
+			RUN_TEST(Test_Vulkan_SynchronizationShaderDependencies);
+		} else { RUN_TEST(Test_Vulkan_SynchronizationDependencies); }
+		RUN_TEST(Test_Vulkan_ProbeHistory);
+		RUN_TEST(Test_Vulkan_Multigrid_Boundaries);
+		RUN_TEST(Test_Vulkan_Multigrid_Debye);
+		RUN_TEST(Test_Vulkan_CoefficientMultigrid);
+		RUN_TEST(Test_Vulkan_SynchronizationMultigrid);
+		return tests_failed ? 1 : 0;
+	}
 	if (argc > 1 && std::string(argv[1]) == "--coefficient-tests") {
 		RUN_TEST(Test_CoefficientPalette_Bits);
 		RUN_TEST(Test_Vulkan_CoefficientEquivalence);
@@ -2971,6 +3145,8 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_ExtensionIndexValidation);
 	RUN_TEST(Test_Vulkan_ProbeHistory);
 	RUN_TEST(Test_Vulkan_BatchingAndProfiling);
+	RUN_TEST(Test_Vulkan_SynchronizationDependencies);
+	RUN_TEST(Test_Vulkan_SynchronizationMultigrid);
 	RUN_TEST(Test_Vulkan_EnergyReduction);
 	RUN_TEST(Test_Vulkan_OptionalResources);
 	RUN_TEST(Test_Vulkan_EnergyDecay);

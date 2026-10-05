@@ -11,6 +11,10 @@
 #include "CSPropExcitation.h"
 #include "CSPropMaterial.h"
 #include "CSPropDebyeMaterial.h"
+#include "CSPropLorentzMaterial.h"
+#include "CSPropLumpedElement.h"
+#include "CSPropAbsorbingBC.h"
+#include "CSPropConductingSheet.h"
 #include "CSPropProbeBox.h"
 #include "CSPropDumpBox.h"
 #include "CSPrimBox.h"
@@ -69,11 +73,52 @@ void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int 
 			grid->AddDiscLine(d, c.cylinder && d == 1 ? 2 * std::acos(-1.0) * t : 40.0 * t);
 		}
 	CSPropExcitation* exc = new CSPropExcitation(csx->GetParameterSet());
-	exc->SetExcitType(0);
+	const std::string name(c.name);
+	exc->SetExcitType(name == "tfsf" ? 10 : 0);
+	if (name == "tfsf") exc->SetPropagationDir(1.0, 0);
 	exc->SetExcitation(1.0, 2);
 	const double cartSource[] = {18, 22, 18, 22, 18, 22};
 	const double cylSource[] = {1, 36, 0.2, 0.4, 18, 22};
-	Box(csx, exc, c.cylinder ? cylSource : cartSource);
+	const double tfsfSource[] = {10, 30, 10, 30, 10, 30};
+	Box(csx, exc, name == "tfsf" ? tfsfSource : c.cylinder ? cylSource : cartSource);
+	if (name == "lorentz" || name == "lorentz-large") {
+		auto* material = new CSPropLorentzMaterial(csx->GetParameterSet());
+		material->SetEpsilon(2.0);
+		material->SetDispersionOrder(3);
+		for (unsigned int i = 0; i < 3; ++i) {
+			material->SetEpsPlasmaFreq(i, 1e9 * (i + 1));
+			material->SetEpsLorPoleFreq(i, 0.5e9 * (i + 1));
+			material->SetEpsRelaxTime(i, 1e-9);
+		}
+		const double bounds[] = {10, 30, 10, 30, 10, 30};
+		Box(csx, material, bounds);
+	}
+	if (name == "sheet") {
+		auto* sheet = new CSPropConductingSheet(csx->GetParameterSet());
+		sheet->SetConductivity(1e5);
+		sheet->SetThickness(50e-6);
+		const double bounds[] = {10, 30, 10, 30, 20, 20};
+		Box(csx, sheet, bounds);
+	}
+	if (name == "rlc") {
+		auto* element = new CSPropLumpedElement(csx->GetParameterSet());
+		element->SetDirection(2);
+		element->SetLEtype(CSPropLumpedElement::PARALLEL);
+		element->SetResistance(50);
+		element->SetInductance(1e-9);
+		element->SetCapacity(1e-12);
+		element->SetCaps(false);
+		const double bounds[] = {20, 20, 20, 20, 18, 22};
+		Box(csx, element, bounds);
+	}
+	if (name == "absorber") {
+		auto* absorber = new CSPropAbsorbingBC(csx->GetParameterSet());
+		absorber->SetAbsorbingBoundaryType(CSPropAbsorbingBC::MUR_1ST_SA);
+		absorber->SetNormalSignPositive(true);
+		absorber->SetPhaseVelocity(3e8);
+		const double bounds[] = {0, 40, 0, 40, 30, 30};
+		Box(csx, absorber, bounds);
+	}
 	if (c.nonuniform || c.debye)
 	{
 		CSPropMaterial* material;
@@ -122,7 +167,7 @@ void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int 
 	fdtd.SetEnableDumps(c.processing == 2u);
 	for (int i = 0; i < 6; ++i) {
 		if (c.pml) fdtd.Set_BC_PML(i, 4);
-		else fdtd.Set_BC_Type(i, 0);
+		else fdtd.Set_BC_Type(i, name == "mur" || name == "tfsf" || name == "absorber" ? 2 : 0);
 	}
 	Require(fdtd.SetupFDTD() == 0, "Benchmark setup failed");
 	Require(fdtd.GPU() != nullptr, "Benchmark unexpectedly fell back to CPU");
@@ -191,13 +236,16 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 #else
 	try {
 		unsigned int steps = 256, repeats = 5;
-		bool profile = false, referenceReadback = false, verifyEnergy = false;
+		bool profile = false, referenceReadback = false, referenceBarriers = true, referenceDispersive = false, verifyEnergy = false;
 		std::string selected, csvPath, coefficients = "dense";
 		std::vector<unsigned int> batches = {1, 8, 16, 32, 64};
 		for (int i = 2; i < argc; ++i) {
 			std::string arg(argv[i]);
 			if (arg == "--profile") profile = true;
 			else if (arg == "--reference-readback") referenceReadback = true;
+			else if (arg == "--reference-barriers") referenceBarriers = true;
+			else if (arg == "--coalesce-barriers") referenceBarriers = false;
+			else if (arg == "--reference-dispersive-pre") referenceDispersive = true;
 			else if (arg == "--verify-energy") verifyEnergy = true;
 			else if (arg.find("--coefficients=") == 0) {
 				coefficients = arg.substr(15);
@@ -218,6 +266,13 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 			{"lossy-nonuniform", 65, 49, 33, false, true, false, false, {}, 0},
 			{"pml", 65, 65, 65, false, false, true, false, {}, 0},
 			{"debye", 49, 49, 49, false, false, false, true, {}, 0},
+			{"mur", 25, 25, 25, false, false, false, false, {}, 0},
+			{"tfsf", 25, 25, 25, false, false, false, false, {}, 0},
+			{"lorentz", 25, 25, 25, false, false, false, false, {}, 0},
+			{"lorentz-large", 49, 49, 49, false, false, false, false, {}, 0},
+			{"sheet", 25, 25, 25, false, false, false, false, {}, 0},
+			{"rlc", 25, 25, 25, false, false, false, false, {}, 0},
+			{"absorber", 25, 25, 25, false, false, false, false, {}, 0},
 			{"cylinder", 41, 129, 33, true, false, false, false, {}, 0},
 			{"multigrid-1", 41, 129, 17, true, false, false, false, {}, 0},
 			{"multigrid-2", 41, 129, 17, true, false, false, false, {24.0}, 0},
@@ -231,7 +286,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 		if (!csvPath.empty()) {
 			csv.open(csvPath);
 			Require(csv.good(), "Could not open benchmark CSV");
-			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback,coefficient_mode,root_coefficient_bytes,root_allocated_bytes,root_dense_bytes,root_unique_tuples,root_palette\n";
+			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback,coefficient_mode,root_coefficient_bytes,root_allocated_bytes,root_dense_bytes,root_unique_tuples,root_palette,reference_barriers,barriers,coalesced_barriers,voltage_dispatches,current_dispatches,extension_dispatches,multigrid_dispatches,probe_dispatches,gpu_barrier_s,gpu_barrier_samples,reference_dispersive_pre\n";
 			csv << std::setprecision(10);
 		}
 		bool found = false, metadata = false;
@@ -246,6 +301,8 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					const auto init = Clock::now();
 					Setup(*fdtd, c, steps, batch, profile, coefficients);
 					Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
+					Require(fdtd->GPU()->SetBarrierCoalescingEnabled(!referenceBarriers), "Could not configure barrier reference");
+					Require(fdtd->GPU()->SetDispersivePreFusionEnabled(!referenceDispersive), "Could not configure dispersive reference");
 					initSeconds = Seconds(init);
 					Require(fdtd->GPU()->IterateTS(64) && fdtd->GPU()->Synchronize(), "Warm-up failed");
 				}
@@ -256,6 +313,8 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 						const auto init = Clock::now();
 						Setup(*fdtd, c, steps, batch, profile, coefficients);
 						Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
+						Require(fdtd->GPU()->SetBarrierCoalescingEnabled(!referenceBarriers), "Could not configure barrier reference");
+						Require(fdtd->GPU()->SetDispersivePreFusionEnabled(!referenceDispersive), "Could not configure dispersive reference");
 						initSeconds = Seconds(init);
 					}
 					EngineVulkan* gpu = fdtd->GPU();
@@ -287,12 +346,19 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					             << synchronization << ',' << total << ',' << p.submissions << ',' << p.dispatches << ','
 					             << p.uploadedBytes << ',' << p.downloadedBytes << ',' << p.probeBytes << ','
 					             << p.recordSeconds << ',' << p.submitSeconds << ',' << p.waitSeconds << ','
-					             << p.gpuSeconds[EngineVulkan::ProfileBatch] << ',' << p.energyBytes << ',' << referenceReadback << ',' << coefficients << ',' << coeff.storageBytes << ',' << coeff.allocatedBytes << ',' << coeff.denseBytes << ',' << coeff.uniqueNodes << ',' << coeff.palette << '\n';
+					             << p.gpuSeconds[EngineVulkan::ProfileBatch] << ',' << p.energyBytes << ',' << referenceReadback << ',' << coefficients << ',' << coeff.storageBytes << ',' << coeff.allocatedBytes << ',' << coeff.denseBytes << ',' << coeff.uniqueNodes << ',' << coeff.palette
+					             << ',' << referenceBarriers << ',' << p.barriers << ',' << p.coalescedBarriers
+					             << ',' << p.categoryDispatches[EngineVulkan::ProfileVoltage] << ',' << p.categoryDispatches[EngineVulkan::ProfileCurrent]
+					             << ',' << p.categoryDispatches[EngineVulkan::ProfileExtension] << ',' << p.categoryDispatches[EngineVulkan::ProfileMultigrid]
+					             << ',' << p.categoryDispatches[EngineVulkan::ProfileProbe] << ',' << p.gpuSeconds[EngineVulkan::ProfileBarrier]
+					             << ',' << p.gpuSamples[EngineVulkan::ProfileBarrier] << ',' << referenceDispersive << '\n';
 				}
 				std::sort(timings.begin(), timings.end());
 				const double median = (timings[(repeats - 1) / 2] + timings[repeats / 2]) / 2;
 				std::cout << "BENCHMARK case=" << c.name << " batch=" << batch << " profile=" << profile
 				          << " coefficients=" << coefficients << " reference_readback=" << referenceReadback
+				          << " reference_barriers=" << referenceBarriers
+				          << " reference_dispersive_pre=" << referenceDispersive
 				          << " steps=" << steps << " repeats=" << repeats << " mode=" << (c.processing ? "solver-output" : "stepping")
 				          << " stored_nodes=" << Nodes(fdtd->GetOp(), false) << " active_voltage_nodes=" << Nodes(fdtd->GetOp(), true)
 				          << " operator_cells=" << fdtd->GetOp()->GetNumberCells() << " initialization_s=" << initSeconds

@@ -99,6 +99,8 @@ number moved up and patch releases now have somewhere to go.
 
 ### Changed
 
+- Vulkan combines independent Lorentz/conducting-sheet pre passes into one
+  dispatch, with device-limit fallback and unchanged ordered apply passes.
 - Vulkan records up to 32 timesteps per submission. `--vulkan-batch-size=1..64`
   overrides the limit; probe, dump and stopping schedules still bound advancement.
 - **The MPI engine was removed.** It had not compiled for years, as it used
@@ -143,6 +145,9 @@ number moved up and patch releases now have somewhere to go.
 
 ### Fixed
 
+- Order Vulkan probe-history reads before the next timestep's field writes.
+  The synchronization audit also adds opt-in Khronos validation tests and
+  barrier/dispatch profiling for extension and multigrid workloads.
 - Honor excitation delays for step and custom signals on CPU and Vulkan,
   including signals whose first sample is nonzero.
 - Reject out-of-grid Vulkan extension indices and invalid boundary directions

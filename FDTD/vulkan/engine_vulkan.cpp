@@ -118,6 +118,31 @@ bool EngineVulkan::SetEnergyFloat64Enabled(bool enabled)
 	return true;
 }
 
+bool EngineVulkan::SetBarrierCoalescingEnabled(bool enabled)
+{
+	if (GetPendingProbeHistorySteps()) return false;
+#ifdef ENABLE_VULKAN
+	EngineVulkan& owner = ProfileOwner();
+	if (&owner != this) return owner.SetBarrierCoalescingEnabled(enabled);
+	if (m_device && !Synchronize()) return false;
+	m_computeBarrierEmitted = false;
+#endif
+	m_coalesceBarriers = enabled;
+	return true;
+}
+
+bool EngineVulkan::SetDispersivePreFusionEnabled(bool enabled)
+{
+	if (GetPendingProbeHistorySteps()) return false;
+#ifdef ENABLE_VULKAN
+	EngineVulkan& owner = ProfileOwner();
+	if (&owner != this) return owner.SetDispersivePreFusionEnabled(enabled);
+	if (m_device && !Synchronize()) return false;
+#endif
+	m_fuseDispersivePre = enabled;
+	return true;
+}
+
 bool EngineVulkan::SupportsFastEnergy() const
 {
 #ifdef ENABLE_VULKAN
@@ -149,8 +174,8 @@ bool EngineVulkan::GetFastEnergy(double& energy)
 	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+	MemoryBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
 	const auto& g = m_level->m_grid;
 	uint32_t pc[] = {g.dimX, g.dimY, g.dimZ, g.numCells, g.dimX - 1u, g.dimY - 1u, g.dimZ - 1u, m_level->m_energyGroups};
 	vkCmdBindPipeline(m_level->m_cmdBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, m_level->m_pipelineEnergy);
@@ -163,8 +188,8 @@ bool EngineVulkan::GetFastEnergy(double& energy)
 	Dispatch(m_level->m_cmdBuffer, groupsX, (m_level->m_energyGroups + groupsX - 1u) / groupsX, 1, ProfileEnergy);
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-	vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+	MemoryBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	              VK_PIPELINE_STAGE_HOST_BIT, barrier);
 	EndGpuSpan(m_level->m_cmdBuffer, span);
 	if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS || !SubmitCommandBuffer()) return false;
 	EngineVulkan& owner = ProfileOwner();
@@ -254,15 +279,17 @@ void EngineVulkan::WriteProfile(std::ostream& stream)
 	const ProfileStatistics p = GetProfile();
 	stream << "VULKAN_PROFILE timesteps=" << p.timesteps << " submissions=" << p.submissions
 	       << " dispatches=" << p.dispatches << " sampled_steps=" << p.sampledSteps
+	       << " barriers=" << p.barriers << " coalesced_barriers=" << p.coalescedBarriers
 	       << " uploaded_bytes=" << p.uploadedBytes << " downloaded_bytes=" << p.downloadedBytes
 	       << " probe_bytes=" << p.probeBytes << " record_ms=" << p.recordSeconds * 1000
 	       << " submit_ms=" << p.submitSeconds * 1000 << " wait_ms=" << p.waitSeconds * 1000
 	       << " readback_ms=" << p.readbackSeconds * 1000 << " mirror_ms=" << p.mirrorSeconds * 1000;
 	stream << " energy_bytes=" << p.energyBytes;
-	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback", "energy"};
+	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback", "energy", "barrier"};
 	for (unsigned int i = 0; i < ProfileCategoryCount; ++i)
 		stream << " gpu_" << names[i] << "_ms=" << p.gpuSeconds[i] * 1000
-		       << " gpu_" << names[i] << "_samples=" << p.gpuSamples[i];
+		       << " gpu_" << names[i] << "_samples=" << p.gpuSamples[i]
+		       << " " << names[i] << "_dispatches=" << p.categoryDispatches[i];
 	stream << std::endl;
 }
 
@@ -353,6 +380,7 @@ void EngineVulkan::BeginProfileCommands(VkCommandBuffer cmd)
 	EngineVulkan& owner = ProfileOwner();
 	owner.m_queryCount = owner.m_profileSpanCount = 0;
 	owner.m_queriesPending = false;
+	owner.m_computeBarrierEmitted = false;
 	if (owner.m_queryPool)
 		vkCmdResetQueryPool(cmd, owner.m_queryPool, 0, static_cast<uint32_t>(owner.m_profileSpans.size()) * 2u);
 }
@@ -366,10 +394,32 @@ void EngineVulkan::EndGpuSpan(VkCommandBuffer cmd, uint32_t first)
 void EngineVulkan::Dispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z, GpuProfileCategory category)
 {
 	EngineVulkan& owner = ProfileOwner();
+	owner.m_computeBarrierEmitted = false;
 	if (!owner.m_profileEnabled) { vkCmdDispatch(cmd, x, y, z); return; }
 	++owner.m_profile.dispatches;
+	++owner.m_profile.categoryDispatches[category];
 	const uint32_t span = owner.m_sampleDispatches ? BeginGpuSpan(cmd, category) : UINT32_MAX;
 	vkCmdDispatch(cmd, x, y, z);
+	EndGpuSpan(cmd, span);
+}
+
+void EngineVulkan::MemoryBarrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+                                 const VkMemoryBarrier& barrier)
+{
+	EngineVulkan& owner = ProfileOwner();
+	const bool compute = src == VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT && dst == src &&
+	                     barrier.srcAccessMask == VK_ACCESS_SHADER_WRITE_BIT &&
+	                     barrier.dstAccessMask == (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+	// Identical barriers with only bindings/push constants between them have the
+	// same memory scope. Dispatch, copy and command-buffer begin invalidate this.
+	if (compute && owner.m_computeBarrierEmitted && owner.m_coalesceBarriers) {
+		if (owner.m_profileEnabled) ++owner.m_profile.coalescedBarriers;
+		return;
+	}
+	owner.m_computeBarrierEmitted = compute;
+	if (owner.m_profileEnabled) ++owner.m_profile.barriers;
+	const uint32_t span = owner.m_sampleDispatches ? BeginGpuSpan(cmd, ProfileBarrier) : UINT32_MAX;
+	vkCmdPipelineBarrier(cmd, src, dst, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 	EndGpuSpan(cmd, span);
 }
 
@@ -377,6 +427,7 @@ void EngineVulkan::CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst,
                              const VkBufferCopy& region, bool download)
 {
 	EngineVulkan& owner = ProfileOwner();
+	owner.m_computeBarrierEmitted = false;
 	if (owner.m_profileEnabled)
 	{
 		if (download) owner.m_profile.downloadedBytes += region.size;
@@ -598,6 +649,7 @@ bool EngineVulkan::InitializeLevel()
 		return false;
 	}
 	const uint64_t maxGroups = props.limits.maxComputeWorkGroupCount[0];
+	m_level->m_dispersivePreMaxGroups = props.limits.maxComputeWorkGroupCount[0];
 	auto validDispatch = [maxGroups](uint64_t count, uint32_t groupSize) {
 		return (count + groupSize - 1u) / groupSize <= maxGroups;
 	};
@@ -1113,8 +1165,8 @@ bool EngineVulkan::SyncFieldsToDevice()
 		barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-		vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
 		if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS)
 			return false;
 
@@ -2030,8 +2082,8 @@ void EngineVulkan::RecordProbeGather(VkCommandBuffer cmd, unsigned int slot)
 	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+	MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineProbe);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutProbe, 0, 1, &m_level->m_descSetProbe, 0, nullptr);
 	const uint32_t pc[] = {count, slot * count};
@@ -2039,8 +2091,10 @@ void EngineVulkan::RecordProbeGather(VkCommandBuffer cmd, unsigned int slot)
 	Dispatch(cmd, (count + 63u) / 64u, 1, 1, ProfileProbe);
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+	// History gathering reads the fields between timesteps. Besides publishing
+	// probe values to the host, order those reads before the next field writes.
+	MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	              VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
 	EndGpuSpan(cmd, span);
 	EngineVulkan& owner = ProfileOwner();
 	if (owner.m_profileEnabled) owner.m_profile.probeBytes += count * sizeof(float);
@@ -3845,22 +3899,43 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 }
 
 #ifdef ENABLE_VULKAN
+void EngineVulkan::RecordDispersivePre(VkCommandBuffer cmd, VkDescriptorSet descriptors,
+                                      uint32_t count, const std::vector<TfsfFace>& passes)
+{
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineDisp);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutDisp, 0, 1, &descriptors, 0, nullptr);
+	const uint64_t groups = (uint64_t(count) + 255u) / 256u;
+	if (ProfileOwner().m_fuseDispersivePre && groups <= m_level->m_dispersivePreMaxGroups) {
+		// Pre mode only reads the field and writes disjoint per-point state.
+		// Overlapping field positions across poles do not require separate passes.
+		const uint32_t pc[] = {0u, count, 0u};
+		vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+		Dispatch(cmd, static_cast<uint32_t>(groups), 1, 1);
+	} else {
+		for (const auto& pass : passes) {
+			const uint32_t pc[] = {pass.offset, pass.count, 0u};
+			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+			Dispatch(cmd, (pass.count + 255u) / 256u, 1, 1);
+		}
+	}
+}
+
 void EngineVulkan::RecordDebyePhase(VkCommandBuffer cmd, uint32_t mode)
 {
 	if (!m_level->m_debyeCount) return;
 	VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+	MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineDebye);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutDebye,
 	                       0, 1, &m_level->m_descSetDebye, 0, nullptr);
 	uint32_t pc[2] = {m_level->m_debyeCount, mode};
 	vkCmdPushConstants(cmd, m_pipelineLayoutDebye, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
 	Dispatch(cmd, (m_level->m_debyeCount + 255u) / 256u, 1, 1);
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+	MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
 }
 
 void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsigned int timestep)
@@ -3897,8 +3972,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 		vkCmdPushConstants(cmd, m_pipelineLayoutMur, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(murPC), &murPC);
 		Dispatch(cmd, (m_level->m_totalMurPoints + 255) / 256, 1, 1);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 	}
 
 	// Absorbing BC Pre-Voltage Pass
@@ -3910,8 +3985,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 		vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
 		Dispatch(cmd, (m_level->m_abcVoltCount + 255) / 256, 1, 1);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 	}
 
 	// Lumped RLC Pre-Voltage Pass
@@ -3926,8 +4001,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 		vkCmdPushConstants(cmd, m_pipelineLayoutRlc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rlcPC), &rlcPC);
 		Dispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 	}
 
 	RecordDebyePhase(cmd, 0u);
@@ -3935,17 +4010,10 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// Dispersive Media Pre-Voltage Pass
 	if (m_level->m_dispVoltCount > 0 && m_pipelineDisp && m_level->m_descSetDispVolt)
 	{
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineDisp);
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutDisp, 0, 1, &m_level->m_descSetDispVolt, 0, nullptr);
-		for (const auto& pass : m_level->m_dispVoltPasses)
-		{
-			struct { uint32_t offset; uint32_t count; uint32_t mode; } dispPC = { pass.offset, pass.count, 0 };
-			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispPC), &dispPC);
-			Dispatch(cmd, (pass.count + 255) / 256, 1, 1);
-		}
+		RecordDispersivePre(cmd, m_level->m_descSetDispVolt, m_level->m_dispVoltCount, m_level->m_dispVoltPasses);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 	}
 
 	// UPML pre-updates run after lower-priority extensions, as on the CPU.
@@ -3957,8 +4025,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 		vkCmdPushConstants(cmd, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_level->m_numUpmlCells), &m_level->m_numUpmlCells);
 		Dispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 	}
 
 	// 2. Voltage update
@@ -3971,8 +4039,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// 3. UPML Post-Voltage Pass
 	if (m_level->m_numUpmlCells > 0 && m_pipelineUpmlPost && m_level->m_descSetUpmlVolt)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPost);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_level->m_descSetUpmlVolt, 0, nullptr);
@@ -3998,16 +4066,16 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 
 		if (m_level->m_cylR0Included)
 		{
-			vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+			MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 			CylPC r0PC = { m_level->m_grid.dimX, m_level->m_grid.dimY, m_level->m_grid.dimZ, m_level->m_grid.numCells, m_level->m_cylLastALine, 1u, 0u };
 			vkCmdPushConstants(cmd, m_pipelineLayoutCyl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(r0PC), &r0PC);
 			Dispatch(cmd, (m_level->m_grid.dimZ + 255) / 256, 1, 1);
 		}
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		CylPC wrapPC = { m_level->m_grid.dimX, m_level->m_grid.dimY, m_level->m_grid.dimZ, m_level->m_grid.numCells, m_level->m_cylLastALine, m_level->m_cylR0Included ? 1u : 0u, 1u };
 		vkCmdPushConstants(cmd, m_pipelineLayoutCyl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wrapPC), &wrapPC);
@@ -4018,8 +4086,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// extensions, so its entire post-update phase must run first.
 	if (!m_level->m_tfsfVoltFaces.empty() && m_pipelineTfsf && m_level->m_descSetTfsfVolt)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineTfsf);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutTfsf, 0, 1, &m_level->m_descSetTfsfVolt, 0, nullptr);
@@ -4037,8 +4105,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 			Dispatch(cmd, (face.count + 255) / 256, 1, 1);
 
 			if (m_level->m_tfsfVoltFaces.size() > 1)
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+				MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		}
 	}
 
@@ -4048,8 +4116,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// reverse sequence. Local sheets therefore precede Mur boundaries.
 	if (m_level->m_abcVoltCount > 0 && m_pipelineAbcVolt && m_level->m_descSetAbcVolt)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineAbcVolt);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutAbc, 0, 1, &m_level->m_descSetAbcVolt, 0, nullptr);
@@ -4061,8 +4129,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// Mur ABC Post-Voltage Pass (updates storeData += coeff * voltData[shift])
 	if (m_level->m_totalMurPoints > 0 && m_pipelineMurPost && m_level->m_descSetMur)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineMurPost);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutMur, 0, 1, &m_level->m_descSetMur, 0, nullptr);
@@ -4081,8 +4149,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// Absorbing BC Apply Pass
 	if (m_level->m_abcVoltCount > 0 && m_pipelineAbcVolt && m_level->m_descSetAbcVolt)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineAbcVolt);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutAbc, 0, 1, &m_level->m_descSetAbcVolt, 0, nullptr);
@@ -4093,8 +4161,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 			vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
 			Dispatch(cmd, (sheet.count + 255) / 256, 1, 1);
 			if (m_level->m_abcVoltSheets.size() > 1)
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+				MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		}
 	}
 
@@ -4102,8 +4170,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// so every element sees the same pre-RLC Yee voltage.
 	if (m_level->m_rlcCount > 0 && m_pipelineRlc && m_level->m_descSetRlc)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineRlc);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutRlc, 0, 1, &m_level->m_descSetRlc, 0, nullptr);
 		struct {
@@ -4113,8 +4181,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 		vkCmdPushConstants(cmd, m_pipelineLayoutRlc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rlcPC), &rlcPC);
 		Dispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		rlcPC.mode = 2;
 		vkCmdPushConstants(cmd, m_pipelineLayoutRlc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rlcPC), &rlcPC);
 		Dispatch(cmd, (m_level->m_rlcCount + 63) / 64, 1, 1);
@@ -4125,8 +4193,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// Dispersive Media Apply-Voltage Pass
 	if (m_level->m_dispVoltCount > 0 && m_pipelineDisp && m_level->m_descSetDispVolt)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineDisp);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutDisp, 0, 1, &m_level->m_descSetDispVolt, 0, nullptr);
@@ -4136,8 +4204,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispPC), &dispPC);
 			Dispatch(cmd, (pass.count + 255) / 256, 1, 1);
 			if (m_level->m_dispVoltPasses.size() > 1)
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+				MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		}
 	}
 
@@ -4146,8 +4214,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// priority group after Engine reverses its sorted extension list.
 	if (m_level->m_totalMurPoints > 0 && m_pipelineMurApply && m_level->m_descSetMur)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineMurApply);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutMur, 0, 1, &m_level->m_descSetMur, 0, nullptr);
@@ -4167,8 +4235,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 			Dispatch(cmd, (face.count + 255) / 256, 1, 1);
 
 			if (m_level->m_murFaces.size() > 1)
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+				MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		}
 	}
 
@@ -4176,8 +4244,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	// after boundary and lumped-element corrections.
 	if (hasVoltExc && m_pipelineExc && m_level->m_descSetVoltExc)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		uint32_t excPC[2] = {static_cast<uint32_t>(m_level->m_voltExcPoints.size()), timestep};
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineExc);
@@ -4187,8 +4255,8 @@ void EngineVulkan::RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsi
 	}
 
 	// Barrier between voltage and current
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+	MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 }
 
 void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsigned int timestep)
@@ -4220,24 +4288,17 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 		vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
 		Dispatch(cmd, (m_level->m_abcCurrCount + 255) / 256, 1, 1);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 	}
 
 	// Dispersive Media Pre-Current Pass
 	if (m_level->m_dispCurrCount > 0 && m_pipelineDisp && m_level->m_descSetDispCurr)
 	{
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineDisp);
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutDisp, 0, 1, &m_level->m_descSetDispCurr, 0, nullptr);
-		for (const auto& pass : m_level->m_dispCurrPasses)
-		{
-			struct { uint32_t offset; uint32_t count; uint32_t mode; } dispPC = { pass.offset, pass.count, 0 };
-			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispPC), &dispPC);
-			Dispatch(cmd, (pass.count + 255) / 256, 1, 1);
-		}
+		RecordDispersivePre(cmd, m_level->m_descSetDispCurr, m_level->m_dispCurrCount, m_level->m_dispCurrPasses);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 	}
 
 	// UPML pre-updates run after lower-priority extensions, as on the CPU.
@@ -4249,8 +4310,8 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 		vkCmdPushConstants(cmd, m_pipelineLayoutUpml, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(m_level->m_numUpmlCells), &m_level->m_numUpmlCells);
 		Dispatch(cmd, (m_level->m_numUpmlCells + 255) / 256, 1, 1);
 
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 	}
 
 	// 6. Current update
@@ -4263,8 +4324,8 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 	// 7. UPML Post-Current Pass
 	if (m_level->m_numUpmlCells > 0 && m_pipelineUpmlPost && m_level->m_descSetUpmlCurr)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineUpmlPost);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutUpml, 0, 1, &m_level->m_descSetUpmlCurr, 0, nullptr);
@@ -4275,8 +4336,8 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 	// Cylindrical Coordinates Post-Current Pass
 	if (m_level->m_hasCylinder && m_level->m_cylClosedAlpha && m_pipelineCyl && m_level->m_descSetCyl)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineCyl);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutCyl, 0, 1, &m_level->m_descSetCyl, 0, nullptr);
@@ -4299,8 +4360,8 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 	// TFSF post-current updates precede default-priority boundary sheets.
 	if (!m_level->m_tfsfCurrFaces.empty() && m_pipelineTfsf && m_level->m_descSetTfsfCurr)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineTfsf);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutTfsf, 0, 1, &m_level->m_descSetTfsfCurr, 0, nullptr);
@@ -4318,16 +4379,16 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 			Dispatch(cmd, (face.count + 255) / 256, 1, 1);
 
 			if (m_level->m_tfsfCurrFaces.size() > 1)
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+				MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		}
 	}
 
 	// Absorbing BC Post-Current Pass
 	if (m_level->m_abcCurrCount > 0 && m_pipelineAbcCurr && m_level->m_descSetAbcCurr)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineAbcCurr);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutAbc, 0, 1, &m_level->m_descSetAbcCurr, 0, nullptr);
@@ -4339,8 +4400,8 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 	// Absorbing BC Apply Pass
 	if (m_level->m_abcCurrCount > 0 && m_pipelineAbcCurr && m_level->m_descSetAbcCurr)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineAbcCurr);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutAbc, 0, 1, &m_level->m_descSetAbcCurr, 0, nullptr);
@@ -4351,16 +4412,16 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 			vkCmdPushConstants(cmd, m_pipelineLayoutAbc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(abcPC), &abcPC);
 			Dispatch(cmd, (sheet.count + 255) / 256, 1, 1);
 			if (m_level->m_abcCurrSheets.size() > 1)
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+				MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		}
 	}
 
 	// Dispersive Media Apply-Current Pass
 	if (m_level->m_dispCurrCount > 0 && m_pipelineDisp && m_level->m_descSetDispCurr)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineDisp);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutDisp, 0, 1, &m_level->m_descSetDispCurr, 0, nullptr);
@@ -4370,16 +4431,16 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 			vkCmdPushConstants(cmd, m_pipelineLayoutDisp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispPC), &dispPC);
 			Dispatch(cmd, (pass.count + 255) / 256, 1, 1);
 			if (m_level->m_dispCurrPasses.size() > 1)
-				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-				                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+				MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+				              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 		}
 	}
 
 	// 8. Current excitation pass
 	if (hasCurrExc && m_pipelineExc && m_level->m_descSetCurrExc)
 	{
-		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-		                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+		MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 
 		uint32_t excPC[2] = {static_cast<uint32_t>(m_level->m_currExcPoints.size()), timestep};
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineExc);
@@ -4389,8 +4450,8 @@ void EngineVulkan::RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsi
 	}
 
 	// Make this phase visible to the child, interface transfer, and next step.
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+	MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, memBarrier);
 }
 
 void EngineVulkan::RecordMultigridTransfer(VkCommandBuffer cmd, uint32_t mode, uint32_t radialCount)
@@ -4448,9 +4509,8 @@ void EngineVulkan::RecordMultigridTransfer(VkCommandBuffer cmd, uint32_t mode, u
 	barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
-	                     0, nullptr, 0, nullptr);
+	MemoryBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
 }
 
 void EngineVulkan::RecordVoltageHierarchy(VkCommandBuffer cmd, unsigned int timestep)
@@ -4593,9 +4653,8 @@ bool EngineVulkan::IterateTSImpl(unsigned int iterTS, bool history)
 			barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-			vkCmdPipelineBarrier(m_level->m_cmdBuffer,
-			                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+			MemoryBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
 			for (unsigned int step = 0; step < count; ++step)
 			{
 				m_sampleDispatches = m_profileEnabled && step == 0u;
@@ -4765,9 +4824,8 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 			barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
 			barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 			barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			vkCmdPipelineBarrier(m_level->m_cmdBuffer,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+			MemoryBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			              VK_PIPELINE_STAGE_TRANSFER_BIT, barrier);
 
 			VulkanBuffer* sources[] = {&m_level->m_bufVolt, &m_level->m_bufCurr};
 			for (unsigned int i = 0; i < count; ++i)
@@ -4778,8 +4836,8 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 			}
 			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 			barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-			vkCmdPipelineBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+			MemoryBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			              VK_PIPELINE_STAGE_HOST_BIT, barrier);
 
 			EndGpuSpan(m_level->m_cmdBuffer, readbackSpan);
 			if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS)

@@ -4,7 +4,12 @@ Status: Phases 0, 1 and 2 implemented on Windows / RTX 3070, 2026-10-03/04
 (commits `a0e67e0` and `33807c7`).
 Phase 4 remains explicitly opt-in with dense storage as the default; further
 tuning and automatic selection are deferred. See `VULKAN_PHASE04_VALIDATION.md`.
-Phases 3 and 5 are cancelled. Phases 6a/6b and 7-10 remain proposed. The
+Phases 3 and 5 are cancelled. Phase 6a and the first measured Phase 6b delivery
+are implemented locally on 2026-10-05: the dependency audit, probe-history
+synchronization fix, profiling and independent dispersive pre-pass fusion.
+Duplicate-barrier coalescing remains opt-in because throughput results were
+inconsistent. See `VULKAN_PHASE06_AUDIT.md` and `VULKAN_PHASE06_VALIDATION.md`.
+Further Phase 6b candidates and Phases 7-10 remain proposed. The
 2026-10-05 review keeps field accumulation (7) first for the reported workload,
 including NF2FF surface validation formerly listed as 10b. GPU energy (8a)
 remains planned; steady-state (8b), probe spectra (9) and mode matching (10a)
@@ -239,6 +244,10 @@ direct-load shaders. This work is outside the remaining implementation roadmap.
 
 ## Phase 6a: audit extension and synchronization dependencies
 
+Implemented locally, 2026-10-05. The separate dependency map is in
+`VULKAN_PHASE06_AUDIT.md`; baseline findings, numerical/validation coverage and
+dispatch/barrier measurements are in `VULKAN_PHASE06_VALIDATION.md`.
+
 Build a dependency map for each supported extension phase and multigrid transfer,
 recording buffer reads/writes, overlapping points, face ordering, extension
 priorities and shared state. Document the execution and memory dependencies each
@@ -255,6 +264,13 @@ individually justified optimization candidates. Deliver the audit separately
 before changing execution in Phase 6b.
 
 ## Phase 6b: optimize measured extension and synchronization costs
+
+First delivery implemented locally, 2026-10-05. Independent Lorentz/conducting-
+sheet pre passes share one dispatch, retaining ordered apply passes and every
+required dependency. Device-limit fallback and the original recording path are
+tested. Duplicate-barrier coalescing is available for benchmark comparisons but
+disabled by default. Command-buffer reuse and hierarchy projection fusion remain
+separate future candidates; see the Phase 6 audit and measurement record.
 
 Use the Phase 6a audit and profiles to select one candidate at a time. State its
 expected benefit and required dependencies before implementing it. Prioritize
@@ -278,12 +294,6 @@ and documented dependency proofs. Retain the reference path where an optimizatio
 does not meet the performance acceptance criteria.
 
 ## Phase 7: accumulate frequency-domain E/H fields on the GPU (proposed)
-
-Prioritize this phase for a reported RTX 2060 workload of roughly 10 million
-cells at 800 MC/s with frequency-domain E/H dumps. The user needs amplitude and
-phase at selected frequencies after the run, rather than time-domain snapshots.
-These are user-reported observations, not a controlled benchmark; profiles must
-establish how much time full-field readback and CPU accumulation consume.
 
 Keep running complex Fourier sums on the GPU at the existing sample times, then
 download the completed results for the existing CPU file writers. No timestep
@@ -570,9 +580,9 @@ cancelled. Remaining work is:
    GPU integration and spectra. Prioritize by measured costs; mode gathering
    need not wait for GPU probe spectra. Keep time histories and precision.
 5. Phase 10c: extend validated field accumulation to SAR as a separate delivery.
-6. Phase 6a audit, after installing the Vulkan SDK validation layers on the
-   measurement host so synchronization validation can run.
-7. First Phase 6b candidate: remove per-submission command recording by reusing
+6. Phase 6a audit and first Phase 6b delivery completed locally with SDK
+   synchronization validation; independent dispersive pre passes are combined.
+7. Further Phase 6b candidate: remove per-submission command recording by reusing
    pre-recorded batch command buffers, reading the timestep from device memory
    instead of recording it. Prototype two command buffers with independent
    fences only if reuse is not feasible.

@@ -237,6 +237,12 @@ if(BUILD_TESTING)
   ADD_EXECUTABLE( test_backend test_backend.cpp test_vulkan_performance.cpp )
   TARGET_LINK_LIBRARIES( test_backend openEMS ${CSXCAD_LIBRARIES} ${VULKAN_LIBRARIES} )
   ADD_TEST(NAME backend COMMAND test_backend)
+  option(OPENEMS_VULKAN_SYNC_TESTS "Run GPU tests with installed Khronos synchronization validation" OFF)
+  if(ENABLE_VULKAN AND OPENEMS_VULKAN_SYNC_TESTS)
+    ADD_TEST(NAME vulkan-synchronization COMMAND ${CMAKE_COMMAND}
+      "-DBACKEND_EXECUTABLE=$<TARGET_FILE:test_backend>"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_synchronization.cmake)
+  endif()
   ADD_TEST(NAME vulkan-batch-zero COMMAND ${CMAKE_COMMAND}
     "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>" -DBATCH_SIZE=0
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_batch_rejection.cmake)
