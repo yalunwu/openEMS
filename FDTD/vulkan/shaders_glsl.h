@@ -152,7 +152,8 @@ void main() {
         return;
     }
     ExcPoint point = points[idx];
-    uint position = (ep.timestep > point.delay) ? ep.timestep - point.delay : 0u;
+    if (ep.timestep < point.delay) return;
+    uint position = ep.timestep - point.delay;
     if (point.period > 0u) position %= point.period;
     if (position >= point.signalLength) position = 0u;
     float value = point.amplitude * signals[point.signalOffset + position];
@@ -170,6 +171,7 @@ struct ProbePoint {
 
 layout(push_constant) uniform ProbeParams {
     uint count;
+    uint offset;
 } pp;
 
 layout(std430, binding = 0) readonly buffer PointsBuffer {
@@ -194,9 +196,9 @@ void main() {
         return;
     }
     if (points[idx].field_type == 0u) {
-        outValues[idx] = voltData[points[idx].linear_index];
+        outValues[pp.offset + idx] = voltData[points[idx].linear_index];
     } else {
-        outValues[idx] = currData[points[idx].linear_index];
+        outValues[pp.offset + idx] = currData[points[idx].linear_index];
     }
 }
 )";

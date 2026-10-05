@@ -1561,6 +1561,23 @@ void openEMS::RunFDTD()
 	{
 		if (vulkanBackend)
 		{
+			if (!vulkanBackend->GetPendingProbeHistorySteps())
+			{
+				unsigned int horizon = std::min(vulkanBackend->GetBatchSize(), NrTS - vulkanBackend->GetNumberOfTimesteps());
+				// Ordinary probes can replay gathered samples. Full-field consumers and
+				// stopping checks must still observe the physical end of a submission.
+				const int next = PA->GetNextFullFieldInterval();
+				if (next > 0) horizon = std::min(horizon, static_cast<unsigned int>(next));
+				if (Eng_Ext_SSD)
+				{
+					const unsigned int period = Eng_Ext_SSD->GetTSPeriod();
+					const unsigned int ts = vulkanBackend->GetNumberOfTimesteps();
+					horizon = period ? std::min(horizon, 1u + (period - ts % period) % period) : 1u;
+				}
+				if (horizon > static_cast<unsigned int>(step)) vulkanBackend->BeginProbeHistory(horizon);
+			}
+			if (vulkanBackend->GetPendingProbeHistorySteps())
+				step = std::min(step, static_cast<int>(vulkanBackend->GetPendingProbeHistorySteps()));
 			if (!m_EngineBackend->IterateTS(step))
 				throw std::runtime_error("Vulkan timestep execution failed");
 			FDTD_Eng->SetNumberOfTimesteps(m_EngineBackend->GetNumberOfTimesteps());
@@ -1632,7 +1649,7 @@ void openEMS::RunFDTD()
 
 		t_diff = CalcDiffTime(currTime,prevTime);
 
-		if (t_diff>4)
+		if (t_diff>4 && (!vulkanBackend || !vulkanBackend->GetPendingProbeHistorySteps()))
 		{
 			t_run = CalcDiffTime(currTime,startTime);
 			speed = numCells*(currTS-prevTS)/t_diff;
@@ -1666,6 +1683,9 @@ void openEMS::RunFDTD()
 		}
 	}
 	// Complete pending GPU work before reporting successful execution or timing.
+	if (vulkanBackend && vulkanBackend->GetPendingProbeHistorySteps() &&
+	    !vulkanBackend->IterateTS(vulkanBackend->GetPendingProbeHistorySteps()))
+		throw std::runtime_error("Vulkan probe history completion failed");
 	if (vulkanBackend && !vulkanBackend->SyncFieldsToHost())
 		throw std::runtime_error("Vulkan final field synchronization failed");
 	if ((change>endCrit) && (FDTD_Op->GetExcitationSignal()->GetExciteType()==0))

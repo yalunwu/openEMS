@@ -49,6 +49,10 @@ the following state:
 - When probes are registered, the final submission of an interval gathers them
   after hierarchy projection; cached results are invalidated by stepping, edits,
   re-registration and reset.
+- Ordinary V/I/E/H probes now retain intermediate results in a bounded history
+  buffer and replay CPU processing at the original sample times. Full-field
+  consumers and energy/stopping checks still bound submissions; steady-state
+  period comparisons remain on the CPU.
 - Energy-only checks use a GPU reduction for the basic Cartesian engine only.
   Cylindrical (SSE-based operator), SSE and multigrid energy keep the CPU path
   and a full-field download. Field dumps still transfer the whole domain.

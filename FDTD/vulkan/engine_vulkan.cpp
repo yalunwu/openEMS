@@ -72,13 +72,15 @@ private:
 
 bool EngineVulkan::SetBatchSize(unsigned int size)
 {
-	if (size == 0u || size > 64u) return false;
+	if (size == 0u || size > 64u || GetPendingProbeHistorySteps()) return false;
 	m_batchSize = size;
 	return true;
 }
 
 bool EngineVulkan::SetReadbackOptimizationsEnabled(bool enabled)
 {
+	if (GetPendingProbeHistorySteps()) return false;
+	m_probeHistoryCount = m_probeHistoryCursor = 0;
 #ifdef ENABLE_VULKAN
 	if (m_device && !Synchronize()) return false;
 	const bool changed = m_readbackOptimizations != enabled;
@@ -121,7 +123,7 @@ bool EngineVulkan::SupportsFastEnergy() const
 bool EngineVulkan::GetFastEnergy(double& energy)
 {
 #ifdef ENABLE_VULKAN
-	if (!SupportsFastEnergy() || ProfileOwner().m_runtimeFailed) return false;
+	if (GetPendingProbeHistorySteps() || !SupportsFastEnergy() || ProfileOwner().m_runtimeFailed) return false;
 	if (m_level->m_energyValid) { energy = m_level->m_cachedEnergy; return true; }
 	if (!m_level->m_energyGroups) { energy = 0; return true; }
 	ProfileTimer readbackTimer(ProfileOwner().m_profileEnabled ? &ProfileOwner().m_profile.readbackSeconds : nullptr);
@@ -1395,7 +1397,7 @@ bool EngineVulkan::CreatePipelines()
 	}
 
 	pipeLayoutInfo.pSetLayouts = &m_descLayoutProbe;
-	excPcRange.size = sizeof(uint32_t);
+	excPcRange.size = 2u * sizeof(uint32_t);
 	pipeLayoutInfo.pPushConstantRanges = &excPcRange;
 	if (vkCreatePipelineLayout(m_device, &pipeLayoutInfo, nullptr, &m_pipelineLayoutProbe) != VK_SUCCESS)
 	{
@@ -1699,7 +1701,7 @@ bool EngineVulkan::AllocateExcitationBuffers()
 				    !std::isfinite(delay) || delay < 0 || delay > INT32_MAX)
 					return false;
 				const float amplitude = voltage ? excExt->Volt_amp[n] : excExt->Curr_amp[n];
-				points.push_back({static_cast<uint32_t>(GetLinearIndex(direction, x, y, z)),
+				points.push_back({GetCheckedLinearIndex(direction, x, y, z),
 				                  amplitude, static_cast<uint32_t>(delay), offset, length, period});
 			}
 			return true;
@@ -1748,12 +1750,15 @@ bool EngineVulkan::AllocateExcitationBuffers()
 	       allocate(m_level->m_currExcPoints, m_level->m_bufCurrExcPoints, m_level->m_bufCurr, m_level->m_descSetCurrExc);
 }
 
-bool EngineVulkan::AllocateProbeBuffers(const std::vector<ProbePoint>& points)
+bool EngineVulkan::AllocateProbeBuffers(const std::vector<ProbePoint>& points, unsigned int capacity)
 {
+	if (!capacity || capacity > 64u || points.size() > UINT32_MAX / capacity ||
+	    points.size() > std::numeric_limits<size_t>::max() / sizeof(ProbePoint)) return false;
 	if (points.empty())
 	{
 		DestroyBuffer(m_level->m_bufProbePoints);
 		DestroyBuffer(m_level->m_bufProbeValues);
+		m_level->m_probeCapacity = 1;
 		// Retain the allocated descriptor set for reuse when probes are added again.
 		return true;
 	}
@@ -1761,7 +1766,10 @@ bool EngineVulkan::AllocateProbeBuffers(const std::vector<ProbePoint>& points)
 	VulkanBuffer pointsBuffer, valuesBuffer;
 	size_t count = points.size();
 	size_t pointsBytes = count * sizeof(ProbePoint);
-	size_t valuesBytes = count * sizeof(float);
+	VkDeviceSize valuesBytes = VkDeviceSize(count) * capacity * sizeof(float);
+	VkPhysicalDeviceProperties props = {};
+	vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
+	if (pointsBytes > props.limits.maxStorageBufferRange || valuesBytes > props.limits.maxStorageBufferRange) return false;
 
 	// Create and populate probe points buffer
 	if (!CreateBuffer(pointsBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -1811,6 +1819,7 @@ bool EngineVulkan::AllocateProbeBuffers(const std::vector<ProbePoint>& points)
 	m_level->m_descSetProbe = descriptor;
 	pointsBuffer.Swap(m_level->m_bufProbePoints);
 	valuesBuffer.Swap(m_level->m_bufProbeValues);
+	m_level->m_probeCapacity = capacity;
 	return true;
 }
 
@@ -1913,7 +1922,7 @@ void EngineVulkan::DestroyEnergyResources()
 	m_level->m_energyAvailable = m_level->m_energyValid = false;
 }
 
-void EngineVulkan::RecordProbeGather(VkCommandBuffer cmd)
+void EngineVulkan::RecordProbeGather(VkCommandBuffer cmd, unsigned int slot)
 {
 	const uint32_t count = static_cast<uint32_t>(m_level->m_probePoints.size());
 	const uint32_t span = BeginGpuSpan(cmd, ProfileProbe);
@@ -1925,7 +1934,8 @@ void EngineVulkan::RecordProbeGather(VkCommandBuffer cmd)
 	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineProbe);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_pipelineLayoutProbe, 0, 1, &m_level->m_descSetProbe, 0, nullptr);
-	vkCmdPushConstants(cmd, m_pipelineLayoutProbe, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(count), &count);
+	const uint32_t pc[] = {count, slot * count};
+	vkCmdPushConstants(cmd, m_pipelineLayoutProbe, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
 	Dispatch(cmd, (count + 63u) / 64u, 1, 1, ProfileProbe);
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -1934,6 +1944,14 @@ void EngineVulkan::RecordProbeGather(VkCommandBuffer cmd)
 	EndGpuSpan(cmd, span);
 	EngineVulkan& owner = ProfileOwner();
 	if (owner.m_profileEnabled) owner.m_profile.probeBytes += count * sizeof(float);
+}
+
+uint32_t EngineVulkan::GetCheckedLinearIndex(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
+{
+	const size_t index = GetLinearIndex(n, x, y, z);
+	if (index == static_cast<size_t>(-1) || index > UINT32_MAX)
+		throw std::out_of_range("[openEMS Vulkan] Extension index is outside the field grid");
+	return static_cast<uint32_t>(index);
 }
 
 bool EngineVulkan::AllocateUpmlBuffers()
@@ -1958,6 +1976,10 @@ bool EngineVulkan::AllocateUpmlBuffers()
 
 	for (Operator_Ext_UPML* upml : upmlExts)
 	{
+		const unsigned int dims[] = {m_level->m_grid.dimX, m_level->m_grid.dimY, m_level->m_grid.dimZ};
+		for (unsigned int n = 0; n < 3; ++n)
+			if (upml->m_StartPos[n] >= dims[n] || !upml->m_numLines[n] || upml->m_numLines[n] > dims[n] - upml->m_StartPos[n])
+				throw std::out_of_range("[openEMS Vulkan] UPML range is outside the field grid");
 		for (unsigned int comp = 0; comp < 3; ++comp)
 		{
 			for (unsigned int loc_x = 0; loc_x < upml->m_numLines[0]; ++loc_x)
@@ -1969,7 +1991,7 @@ bool EngineVulkan::AllocateUpmlBuffers()
 					for (unsigned int loc_z = 0; loc_z < upml->m_numLines[2]; ++loc_z)
 					{
 						unsigned int posZ = loc_z + upml->m_StartPos[2];
-						uint32_t linFieldIdx = static_cast<uint32_t>(GetLinearIndex(comp, posX, posY, posZ));
+						uint32_t linFieldIdx = GetCheckedLinearIndex(comp, posX, posY, posZ);
 
 						hostIndices.push_back(linFieldIdx);
 
@@ -2118,6 +2140,8 @@ bool EngineVulkan::AllocateMurBuffers()
 	{
 		Operator_Ext_Mur_ABC* mur = dynamic_cast<Operator_Ext_Mur_ABC*>(m_level->m_op->GetExtension(extIdx));
 		if (!mur) continue;
+		if (mur->m_ny < 0 || mur->m_ny > 2 || mur->m_nyP < 0 || mur->m_nyP > 2 || mur->m_nyPP < 0 || mur->m_nyPP > 2)
+			throw std::out_of_range("[openEMS Vulkan] Invalid Mur direction");
 
 		uint32_t start_TS = 0;
 		int maxDelay = -1;
@@ -2159,16 +2183,16 @@ bool EngineVulkan::AllocateMurBuffers()
 
 				// Component nyP
 				GpuMurPoint ptP;
-				ptP.pos_idx = static_cast<uint32_t>(GetLinearIndex(mur->m_nyP, pos[0], pos[1], pos[2]));
-				ptP.shift_idx = static_cast<uint32_t>(GetLinearIndex(mur->m_nyP, pos_shift[0], pos_shift[1], pos_shift[2]));
+				ptP.pos_idx = GetCheckedLinearIndex(mur->m_nyP, pos[0], pos[1], pos[2]);
+				ptP.shift_idx = GetCheckedLinearIndex(mur->m_nyP, pos_shift[0], pos_shift[1], pos_shift[2]);
 				ptP.coeff = static_cast<float>(mur->m_Mur_Coeff_nyP(i, j));
 				ptP.start_TS = start_TS;
 				hostPoints.push_back(ptP);
 
 				// Component nyPP
 				GpuMurPoint ptPP;
-				ptPP.pos_idx = static_cast<uint32_t>(GetLinearIndex(mur->m_nyPP, pos[0], pos[1], pos[2]));
-				ptPP.shift_idx = static_cast<uint32_t>(GetLinearIndex(mur->m_nyPP, pos_shift[0], pos_shift[1], pos_shift[2]));
+				ptPP.pos_idx = GetCheckedLinearIndex(mur->m_nyPP, pos[0], pos[1], pos[2]);
+				ptPP.shift_idx = GetCheckedLinearIndex(mur->m_nyPP, pos_shift[0], pos_shift[1], pos_shift[2]);
 				ptPP.coeff = static_cast<float>(mur->m_Mur_Coeff_nyPP(i, j));
 				ptPP.start_TS = start_TS;
 				hostPoints.push_back(ptPP);
@@ -2318,10 +2342,10 @@ bool EngineVulkan::AllocateTfsfBuffers()
 
 							float delta = static_cast<float>(tfsf->m_VoltDelayDelta[n][l][c][ui_pos]);
 							uint32_t delay = tfsf->m_VoltDelay[n][l][c][ui_pos];
-							size_t linIdx = GetLinearIndex(dir, pos[0], pos[1], pos[2]);
+							const uint32_t linIdx = GetCheckedLinearIndex(dir, pos[0], pos[1], pos[2]);
 
 							GpuTfsfPoint pt;
-							pt.pos_idx = static_cast<uint32_t>(linIdx);
+							pt.pos_idx = linIdx;
 							pt.delay = delay;
 							pt.w0 = (1.0f - delta) * amp;
 							pt.w1 = delta * amp;
@@ -2372,10 +2396,10 @@ bool EngineVulkan::AllocateTfsfBuffers()
 
 							float delta = static_cast<float>(tfsf->m_CurrDelayDelta[n][l][c][ui_pos]);
 							uint32_t delay = tfsf->m_CurrDelay[n][l][c][ui_pos];
-							size_t linIdx = GetLinearIndex(dir, pos[0], pos[1], pos[2]);
+							const uint32_t linIdx = GetCheckedLinearIndex(dir, pos[0], pos[1], pos[2]);
 
 							GpuTfsfPoint pt;
-							pt.pos_idx = static_cast<uint32_t>(linIdx);
+							pt.pos_idx = linIdx;
 							pt.delay = delay;
 							pt.w0 = (1.0f - delta) * amp;
 							pt.w1 = delta * amp;
@@ -2607,7 +2631,7 @@ bool EngineVulkan::AllocateRlcBuffers()
 		uint32_t y = rlc->v_RLC_pos[1][i];
 		uint32_t z = rlc->v_RLC_pos[2][i];
 
-		rlcParams[i].field_index = static_cast<uint32_t>(GetLinearIndex(dir, x, y, z));
+		rlcParams[i].field_index = GetCheckedLinearIndex(dir, x, y, z);
 		rlcParams[i].ilv_i2v = (rlc->v_RLC_ilv && rlc->v_RLC_i2v) ? static_cast<float>(rlc->v_RLC_ilv[i] * rlc->v_RLC_i2v[i]) : 0.0f;
 		rlcParams[i].vvd = static_cast<float>(rlc->v_RLC_vvd[i]);
 		rlcParams[i].vv2 = static_cast<float>(rlc->v_RLC_vv2[i]);
@@ -2767,6 +2791,8 @@ bool EngineVulkan::AllocateAbsorbingBCBuffers()
 		int ny = abc->m_ny;
 		int nyP = abc->m_nyP;
 		int nyPP = abc->m_nyPP;
+		if (ny < 0 || ny > 2 || nyP < 0 || nyP > 2 || nyPP < 0 || nyPP > 2)
+			throw std::out_of_range("[openEMS Vulkan] Invalid absorbing boundary direction");
 		bool normalSignPositive = abc->m_normalSignPositive;
 
 		unsigned int pos[3] = {0, 0, 0};
@@ -2789,16 +2815,16 @@ bool EngineVulkan::AllocateAbsorbingBCBuffers()
 
 				// Direction nyP
 				GpuAbcVoltPoint ptP;
-				ptP.pos_idx = static_cast<uint32_t>(GetLinearIndex(nyP, pos[0], pos[1], pos[2]));
-				ptP.shift_idx = static_cast<uint32_t>(GetLinearIndex(nyP, pos_shift[0], pos_shift[1], pos_shift[2]));
+				ptP.pos_idx = GetCheckedLinearIndex(nyP, pos[0], pos[1], pos[2]);
+				ptP.shift_idx = GetCheckedLinearIndex(nyP, pos_shift[0], pos_shift[1], pos_shift[2]);
 				ptP.k1 = static_cast<float>(abc->m_K1_nyP(i, j));
 				ptP.pad = 0;
 				hostVoltPoints.push_back(ptP);
 
 				// Direction nyPP
 				GpuAbcVoltPoint ptPP;
-				ptPP.pos_idx = static_cast<uint32_t>(GetLinearIndex(nyPP, pos[0], pos[1], pos[2]));
-				ptPP.shift_idx = static_cast<uint32_t>(GetLinearIndex(nyPP, pos_shift[0], pos_shift[1], pos_shift[2]));
+				ptPP.pos_idx = GetCheckedLinearIndex(nyPP, pos[0], pos[1], pos[2]);
+				ptPP.shift_idx = GetCheckedLinearIndex(nyPP, pos_shift[0], pos_shift[1], pos_shift[2]);
 				ptPP.k1 = static_cast<float>(abc->m_K1_nyPP(i, j));
 				ptPP.pad = 0;
 				hostVoltPoints.push_back(ptPP);
@@ -2824,16 +2850,16 @@ bool EngineVulkan::AllocateAbsorbingBCBuffers()
 
 						// Direction nyP
 						GpuAbcCurrPoint ptP;
-						ptP.pos_idx = static_cast<uint32_t>(GetLinearIndex(nyP, pos[0], pos[1], pos[2]));
-						ptP.shift_idx = static_cast<uint32_t>(GetLinearIndex(nyP, pos_shift[0], pos_shift[1], pos_shift[2]));
+						ptP.pos_idx = GetCheckedLinearIndex(nyP, pos[0], pos[1], pos[2]);
+						ptP.shift_idx = GetCheckedLinearIndex(nyP, pos_shift[0], pos_shift[1], pos_shift[2]);
 						ptP.k1 = static_cast<float>(abc->m_K1_nyP(i, j));
 						ptP.k2 = static_cast<float>(abc->m_K2_nyP(i, j));
 						hostCurrPoints.push_back(ptP);
 
 						// Direction nyPP
 						GpuAbcCurrPoint ptPP;
-						ptPP.pos_idx = static_cast<uint32_t>(GetLinearIndex(nyPP, pos[0], pos[1], pos[2]));
-						ptPP.shift_idx = static_cast<uint32_t>(GetLinearIndex(nyPP, pos_shift[0], pos_shift[1], pos_shift[2]));
+						ptPP.pos_idx = GetCheckedLinearIndex(nyPP, pos[0], pos[1], pos[2]);
+						ptPP.shift_idx = GetCheckedLinearIndex(nyPP, pos_shift[0], pos_shift[1], pos_shift[2]);
 						ptPP.k1 = static_cast<float>(abc->m_K1_nyPP(i, j));
 						ptPP.k2 = static_cast<float>(abc->m_K2_nyPP(i, j));
 						hostCurrPoints.push_back(ptPP);
@@ -3031,7 +3057,7 @@ bool EngineVulkan::AllocateDispersiveBuffers()
 						if (v_ext != 0.0f || v_lor != 0.0f || v_int != 1.0f)
 						{
 							GpuDispersivePoint pt;
-							pt.pos_idx = static_cast<uint32_t>(GetLinearIndex(n, x, y, z));
+							pt.pos_idx = GetCheckedLinearIndex(n, x, y, z);
 							pt.int_coeff = v_int;
 							pt.ext_coeff = v_ext;
 							pt.lor_coeff = v_lor;
@@ -3062,7 +3088,7 @@ bool EngineVulkan::AllocateDispersiveBuffers()
 						if (i_ext != 0.0f || i_lor != 0.0f || i_int != 1.0f)
 						{
 							GpuDispersivePoint pt;
-							pt.pos_idx = static_cast<uint32_t>(GetLinearIndex(n, x, y, z));
+							pt.pos_idx = GetCheckedLinearIndex(n, x, y, z);
 							pt.int_coeff = i_int;
 							pt.ext_coeff = i_ext;
 							pt.lor_coeff = i_lor;
@@ -3235,8 +3261,8 @@ bool EngineVulkan::AllocateDebyeBuffers()
 				if (points.size() >= UINT32_MAX || poles.size() > UINT32_MAX - static_cast<uint32_t>(debye->m_PoleCount))
 					return false;
 				GpuDebyePoint point = {
-					static_cast<uint32_t>(GetLinearIndex(n, debye->m_LM_pos[0][0][j],
-					    debye->m_LM_pos[0][1][j], debye->m_LM_pos[0][2][j])),
+					GetCheckedLinearIndex(n, debye->m_LM_pos[0][0][j],
+					    debye->m_LM_pos[0][1][j], debye->m_LM_pos[0][2][j]),
 					static_cast<uint32_t>(poles.size()), static_cast<uint32_t>(debye->m_PoleCount),
 					debye->v_solve_ADE[n][j]
 				};
@@ -3543,6 +3569,8 @@ bool EngineVulkan::AllocateMultigridBuffers()
 
 void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 {
+	if (GetPendingProbeHistorySteps())
+		throw std::logic_error("[openEMS Vulkan] Cannot register probes during history replay");
 #ifdef ENABLE_VULKAN
 	if (m_device && !ProfileOwner().Synchronize()) return;
 #endif
@@ -3705,6 +3733,7 @@ void EngineVulkan::RegisterProbes(const ProcessingArray* pa)
 		throw std::runtime_error("[openEMS Vulkan] Probe buffer allocation failed");
 #endif
 	m_level->m_probePoints.swap(points);
+	m_probeHistoryCount = m_probeHistoryCursor = 0;
 	m_level->m_pa = pa;
 	m_level->m_probesValid = false;
 
@@ -4378,9 +4407,61 @@ void EngineVulkan::SetHierarchyTimestep(unsigned int ts)
 	if (m_level->m_innerGrid)
 		m_level->m_innerGrid->SetHierarchyTimestep(ts);
 }
+
+void EngineVulkan::SetHierarchyHostTimestep(unsigned int ts)
+{
+	Engine* cpuEngine = m_level->m_op ? m_level->m_op->GetEngine() : nullptr;
+	if (cpuEngine) cpuEngine->SetNumberOfTimesteps(ts);
+	if (m_level->m_innerGrid) m_level->m_innerGrid->SetHierarchyHostTimestep(ts);
+}
 #endif
 
 bool EngineVulkan::IterateTS(unsigned int iterTS)
+{
+#ifdef ENABLE_VULKAN
+	if (ProfileOwner().m_runtimeFailed) return false;
+#endif
+	if (iterTS == 0u) return IterateTSImpl(0, false);
+	if (GetPendingProbeHistorySteps())
+	{
+		if (iterTS > GetPendingProbeHistorySteps()) return false;
+		m_probeHistoryCursor += iterTS;
+#ifdef ENABLE_VULKAN
+		SetHierarchyHostTimestep(m_probeHistoryStart + m_probeHistoryCursor);
+#endif
+		return true;
+	}
+	m_probeHistoryCount = m_probeHistoryCursor = 0;
+	return IterateTSImpl(iterTS, false);
+}
+
+unsigned int EngineVulkan::GetPendingProbeHistorySteps() const
+{
+	return m_probeHistoryCount - m_probeHistoryCursor;
+}
+
+bool EngineVulkan::BeginProbeHistory(unsigned int steps)
+{
+#ifdef ENABLE_VULKAN
+	if (!m_device || !m_readbackOptimizations || m_level->m_probePoints.empty() ||
+	    GetPendingProbeHistorySteps() || steps < 2 || steps > m_batchSize ||
+	    steps > std::numeric_limits<unsigned int>::max() - m_level->m_numTS) return false;
+	if (!Synchronize()) return false;
+	if (steps > m_level->m_probeCapacity && !AllocateProbeBuffers(m_level->m_probePoints, steps)) return false;
+	const unsigned int start = m_level->m_numTS;
+	if (!IterateTSImpl(steps, true)) return false;
+	m_probeHistoryStart = start;
+	m_probeHistoryCount = steps;
+	m_probeHistoryCursor = 0;
+	SetHierarchyHostTimestep(start);
+	return true;
+#else
+	(void)steps;
+	return false;
+#endif
+}
+
+bool EngineVulkan::IterateTSImpl(unsigned int iterTS, bool history)
 {
 	if (iterTS > std::numeric_limits<unsigned int>::max() - m_level->m_numTS)
 		return false;
@@ -4419,11 +4500,16 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 				if (m_sampleDispatches) ++m_profile.sampledSteps;
 				RecordVoltageHierarchy(m_level->m_cmdBuffer, firstTS + step);
 				RecordCurrentHierarchy(m_level->m_cmdBuffer, firstTS + step);
+				if (history)
+				{
+					RecordProjectionHierarchy(m_level->m_cmdBuffer);
+					RecordProbeGather(m_level->m_cmdBuffer, step);
+				}
 			}
 			m_sampleDispatches = m_profileEnabled;
-			if (done + count == iterTS) RecordProjectionHierarchy(m_level->m_cmdBuffer);
+			if (!history && done + count == iterTS) RecordProjectionHierarchy(m_level->m_cmdBuffer);
 			m_sampleDispatches = false;
-			if (m_readbackOptimizations && done + count == iterTS && !m_level->m_probePoints.empty())
+			if (!history && m_readbackOptimizations && done + count == iterTS && !m_level->m_probePoints.empty())
 				RecordProbeGather(m_level->m_cmdBuffer);
 			EndGpuSpan(m_level->m_cmdBuffer, batchSpan);
 			if (vkEndCommandBuffer(m_level->m_cmdBuffer) != VK_SUCCESS)
@@ -4442,6 +4528,7 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 	}
 	return true;
 #else
+	(void)history;
 	if (iterTS == 0u) return true;
 	m_level->m_numTS += iterTS;
 	m_level->m_hostFieldsValid = false;
@@ -4452,6 +4539,7 @@ bool EngineVulkan::IterateTS(unsigned int iterTS)
 bool EngineVulkan::SyncProbesToHost()
 {
 #ifdef ENABLE_VULKAN
+	if (GetPendingProbeHistorySteps() && m_probeHistoryCursor == 0) return false;
 	if (!m_device || ProfileOwner().m_runtimeFailed) return false;
 	if (m_level->m_probePoints.empty()) return true;
 	if (!m_level->m_bufProbeValues.mapped || !SyncHierarchyToDevice()) return false;
@@ -4474,6 +4562,8 @@ bool EngineVulkan::SyncProbesToHost()
 
 	// Direct zero-copy read from host-visible mapped memory!
 	const float* values = static_cast<const float*>(m_level->m_bufProbeValues.mapped);
+	if (m_probeHistoryCount && m_probeHistoryCursor)
+		values += size_t(m_probeHistoryCursor - 1u) * m_level->m_probePoints.size();
 	Engine* cpuEng = (m_level->m_op ? m_level->m_op->GetEngine() : nullptr);
 	FDTD_FLOAT* engVolt = (cpuEng && cpuEng->GetVoltArray()) ? cpuEng->GetVoltArray()->data() : nullptr;
 	FDTD_FLOAT* engCurr = (cpuEng && cpuEng->GetCurrArray()) ? cpuEng->GetCurrArray()->data() : nullptr;
@@ -4534,6 +4624,7 @@ bool EngineVulkan::SyncProbesToHost()
 
 bool EngineVulkan::SyncFieldsToHost()
 {
+	if (GetPendingProbeHistorySteps()) return false;
 #ifdef ENABLE_VULKAN
 	if (!SyncLevelFieldsToHost())
 		return false;
@@ -4651,7 +4742,7 @@ bool EngineVulkan::SyncLevelFieldsToHost()
 
 unsigned int EngineVulkan::GetNumberOfTimesteps() const
 {
-	return m_level->m_numTS;
+	return GetPendingProbeHistorySteps() ? m_probeHistoryStart + m_probeHistoryCursor : m_level->m_numTS;
 }
 
 FDTD_FLOAT EngineVulkan::GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
@@ -4682,6 +4773,7 @@ void EngineVulkan::SetVolt(unsigned int n, unsigned int x, unsigned int y, unsig
 	if (idx < m_level->m_hostVolt.size())
 	{
 		m_level->m_hostVolt[idx] = val;
+		m_probeHistoryCount = m_probeHistoryCursor = 0;
 		if (m_level->m_op && m_level->m_op->GetEngine()) m_level->m_op->GetEngine()->SetVolt(n, x, y, z, val);
 		m_level->m_probesValid = m_level->m_energyValid = false;
 		m_level->m_hostFieldsDirty = true;
@@ -4700,6 +4792,7 @@ void EngineVulkan::SetCurr(unsigned int n, unsigned int x, unsigned int y, unsig
 	if (idx < m_level->m_hostCurr.size())
 	{
 		m_level->m_hostCurr[idx] = val;
+		m_probeHistoryCount = m_probeHistoryCursor = 0;
 		if (m_level->m_op && m_level->m_op->GetEngine()) m_level->m_op->GetEngine()->SetCurr(n, x, y, z, val);
 		m_level->m_probesValid = m_level->m_energyValid = false;
 		m_level->m_hostFieldsDirty = true;
@@ -4829,6 +4922,8 @@ void EngineVulkan::Reset()
 #endif
 
 	m_level->m_numTS = 0;
+	m_probeHistoryStart = m_probeHistoryCount = m_probeHistoryCursor = 0;
+	m_level->m_probeCapacity = 1;
 	m_level->m_probesValid = m_level->m_energyValid = false;
 	m_profile = ProfileStatistics();
 #ifdef ENABLE_VULKAN

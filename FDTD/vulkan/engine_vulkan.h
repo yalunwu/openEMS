@@ -27,6 +27,10 @@ public:
 	bool Initialize() override;
 	void Reset() override;
 	bool IterateTS(unsigned int iterTS) override;
+	// Record future probe frames, then advance CPU processing with IterateTS().
+	// Full-field and energy access require replay to reach the batch end.
+	bool BeginProbeHistory(unsigned int steps);
+	unsigned int GetPendingProbeHistorySteps() const;
 	unsigned int GetNumberOfTimesteps() const override;
 
 	FDTD_FLOAT GetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const override;
@@ -70,6 +74,8 @@ public:
 private:
 	friend bool Test_Vulkan_OptionalResources();
 	friend bool Test_Vulkan_ProbeAllocationFailure();
+	friend bool Test_Vulkan_ExtensionIndexValidation();
+	friend bool Test_Vulkan_ProbeHistory();
 
 	struct GridDimensions {
 		uint32_t dimX = 0;
@@ -106,7 +112,9 @@ private:
 	bool m_profileEnabled = false;
 	bool m_readbackOptimizations = true;
 	bool m_enableEnergyFloat64 = true;
+	unsigned int m_probeHistoryStart = 0, m_probeHistoryCount = 0, m_probeHistoryCursor = 0;
 	ProfileStatistics m_profile;
+	bool IterateTSImpl(unsigned int iterTS, bool history);
 #ifdef ENABLE_VULKAN
 	struct ProfileSpan { uint32_t first; GpuProfileCategory category; };
 	VkQueryPool m_queryPool = VK_NULL_HANDLE;
@@ -188,7 +196,7 @@ private:
 	bool m_energyFloat64 = false;
 	bool AllocateEnergyResources();
 	void DestroyEnergyResources();
-	void RecordProbeGather(VkCommandBuffer cmd);
+	void RecordProbeGather(VkCommandBuffer cmd, unsigned int slot = 0);
 
 	VkDescriptorSetLayout m_descLayoutUpml = VK_NULL_HANDLE;
 	VkPipelineLayout m_pipelineLayoutUpml = VK_NULL_HANDLE;
@@ -329,7 +337,9 @@ private:
 	bool AllocateBuffers();
 	bool AllocateFieldStagingBuffer();
 	bool AllocateExcitationBuffers();
-	bool AllocateProbeBuffers(const std::vector<ProbePoint>& points);
+	bool AllocateProbeBuffers(const std::vector<ProbePoint>& points, unsigned int capacity = 1);
+	uint32_t GetCheckedLinearIndex(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const;
+	void SetHierarchyHostTimestep(unsigned int ts);
 	bool AllocateUpmlBuffers();
 	bool AllocateMurBuffers();
 	bool AllocateTfsfBuffers();
@@ -379,6 +389,7 @@ private:
 		std::vector<GpuExcPoint> m_voltExcPoints;
 		std::vector<GpuExcPoint> m_currExcPoints;
 		std::vector<ProbePoint> m_probePoints;
+		unsigned int m_probeCapacity = 1;
 		std::unique_ptr<EngineVulkan> m_innerGrid;
 #ifdef ENABLE_VULKAN
 		VkCommandPool m_cmdPool = VK_NULL_HANDLE;

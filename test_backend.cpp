@@ -103,6 +103,7 @@ class TestProcessing : public Processing
 public:
 	explicit TestProcessing(Engine_Interface_Base* engine) : Processing(engine) {}
 	std::string GetProcessingName() const override { return "test processing"; }
+	int NextInterval(bool futureOnly = false) const { return GetNextInterval(futureOnly); }
 };
 
 static ContinuousStructure* CreateSimpleGrid()
@@ -137,6 +138,24 @@ bool Test_ProcessingTimestepPeekDoesNotConsume()
 	TEST_ASSERT(processing.IsTimestep(), "Peeking must not consume a scheduled timestep");
 	TEST_ASSERT(processing.CheckTimestep(), "Processing should consume the scheduled timestep");
 	TEST_ASSERT(!processing.IsTimestep(), "Consumed timestep must no longer be due");
+	return true;
+}
+
+bool Test_ProcessingFutureInterval()
+{
+	TestEngineInterface* engine = new TestEngineInterface();
+	TestProcessing processing(engine);
+	processing.AddStep(0);
+	processing.AddStep(3);
+	processing.SetProcessInterval(4);
+	TEST_ASSERT(processing.NextInterval() == 0 && processing.NextInterval(true) == 3,
+	            "Current explicit step hid a future consumer");
+	TEST_ASSERT(processing.IsTimestep(), "Future lookahead consumed the current explicit step");
+	TEST_ASSERT(processing.NextInterval() == 0, "Future lookahead changed the processing cursor");
+	engine->timestep = 3;
+	TEST_ASSERT(processing.NextInterval(true) == 1, "Past explicit step hid a periodic consumer");
+	engine->timestep = 4;
+	TEST_ASSERT(processing.NextInterval(true) == 4, "Future lookahead returned the current periodic step");
 	return true;
 }
 
@@ -1733,6 +1752,217 @@ bool Test_Vulkan_Multigrid_Debye() { return RunMultigridEquivalence({12.0, 24.0}
 bool Test_Vulkan_Multigrid_Reset() { return RunMultigridEquivalence({12.0, 24.0}, false, false, false, true); }
 bool Test_Vulkan_Multigrid_FiveLevels() { return RunMultigridEquivalence({8.0, 16.0, 24.0, 32.0}); }
 
+bool Test_DelayedExcitation()
+{
+	const unsigned int delay = 4;
+	for (bool custom : {false, true})
+	for (unsigned int type : {0u, 1u, 2u, 3u})
+	{
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+		ContinuousStructure* csx = CreateCustomGrid(9, 7, 11);
+		auto* source = new CSPropExcitation(csx->GetParameterSet());
+		source->SetExcitType(type);
+		source->SetExcitation(1.0, 2);
+		// Use a fractional delay to avoid rounding below the intended integer step.
+		source->SetDelay((delay + 0.25) * 1e-12);
+		auto* box = new CSPrimBox(csx->GetParameterSet(), source);
+		const double bounds[] = {-5, 5, -7, 7, -4, 4};
+		for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, bounds[i]);
+		csx->AddProperty(source);
+		fdtd.SetCSX(csx);
+		fdtd.SetTimeStep(1e-12);
+		fdtd.SetNumberOfTimeSteps(12);
+		fdtd.SetEnableDumps(false);
+		if (custom) fdtd.SetCustomExcite("1", 0, 20e9);
+		else fdtd.SetStepExcite(20e9);
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Delayed excitation setup failed");
+#ifdef ENABLE_VULKAN
+		EngineVulkan gpu(fdtd.GetOp());
+		TEST_ASSERT(gpu.Initialize(), "Delayed excitation GPU setup failed");
+#endif
+		for (unsigned int ts = 0; ts < 12; ++ts)
+		{
+			TEST_ASSERT(fdtd.GetEng()->IterateTS(1), "Delayed CPU iteration failed");
+			std::vector<float> reference;
+			float peak = 0;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int x = 0; x < 9; ++x)
+			for (unsigned int y = 0; y < 7; ++y)
+			for (unsigned int z = 0; z < 11; ++z)
+				for (float value : {fdtd.GetEng()->GetVolt(n, x, y, z), fdtd.GetEng()->GetCurr(n, x, y, z)}) {
+					reference.push_back(value);
+					peak = std::max(peak, std::abs(value));
+				}
+			TEST_ASSERT(ts >= delay || peak == 0, "CPU injected excitation before its delay");
+			if (ts == delay) TEST_ASSERT(peak > 0, "CPU did not inject excitation at its delay");
+#ifdef ENABLE_VULKAN
+			TEST_ASSERT(gpu.IterateTS(1) && gpu.SyncFieldsToHost(), "Delayed GPU iteration failed");
+			size_t index = 0;
+			float gpuPeak = 0, error = 0;
+			for (unsigned int n = 0; n < 3; ++n)
+			for (unsigned int x = 0; x < 9; ++x)
+			for (unsigned int y = 0; y < 7; ++y)
+			for (unsigned int z = 0; z < 11; ++z)
+				for (float value : {gpu.GetVolt(n, x, y, z), gpu.GetCurr(n, x, y, z)}) {
+					TEST_ASSERT(std::isfinite(value), "Delayed excitation produced non-finite fields");
+					gpuPeak = std::max(gpuPeak, std::abs(value));
+					error = std::max(error, std::abs(value - reference[index++]));
+				}
+			TEST_ASSERT(ts >= delay || gpuPeak == 0, "GPU injected excitation before its delay");
+			if (ts == delay) TEST_ASSERT(gpuPeak > 0, "GPU did not inject excitation at its delay");
+			TEST_ASSERT(error < 1e-4f && error <= peak * 0.001f, "Delayed fields differ by more than 1e-4 / 0.1%");
+#endif
+		}
+	}
+	return true;
+}
+
+bool Test_Vulkan_ExtensionIndexValidation()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+	fdtd.SetCSX(CreateCustomGrid(9, 7, 11));
+	fdtd.SetGaussExcite(20e9, 10e9);
+	fdtd.SetEnableDumps(false);
+	fdtd.Set_BC_PML(0, 2);
+	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Extension validation fixture failed");
+	Operator_Ext_UPML* upml = nullptr;
+	for (size_t i = 0; i < fdtd.GetOp()->GetNumberOfExtentions(); ++i)
+		if (auto* extension = dynamic_cast<Operator_Ext_UPML*>(fdtd.GetOp()->GetExtension(i))) upml = extension;
+	TEST_ASSERT(upml, "UPML fixture has no extension");
+	EngineVulkan gpu(fdtd.GetOp());
+	const unsigned int validStart[] = {0, 0, 0}, validStop[] = {2, 6, 10};
+	for (unsigned int invalid : {9u, UINT32_MAX}) {
+		const unsigned int start[] = {invalid, 0, 0}, stop[] = {invalid, 6, 10};
+		upml->SetRange(start, stop);
+		TEST_ASSERT(!gpu.Initialize() && gpu.GetNumberOfTimesteps() == 0, "Invalid UPML start was uploaded");
+	}
+	for (unsigned int invalid : {9u, UINT32_MAX}) {
+		const unsigned int stop[] = {invalid, 6, 10};
+		upml->SetRange(validStart, stop);
+		TEST_ASSERT(!gpu.Initialize(), "Out-of-grid or wrapped UPML stop was uploaded");
+	}
+	upml->SetRange(validStart, validStop);
+	TEST_ASSERT(gpu.Initialize() && gpu.IterateTS(2) && gpu.Synchronize(), "Valid UPML could not recover after rejection");
+	for (const auto& point : std::vector<std::array<unsigned int, 4>>{{{3, 0, 0, 0}}, {{0, 9, 0, 0}}, {{1, 0, UINT32_MAX, 0}}, {{2, 0, 0, 11}}}) {
+		bool rejected = false;
+		try { gpu.GetCheckedLinearIndex(point[0], point[1], point[2], point[3]); }
+		catch (const std::out_of_range&) { rejected = true; }
+		TEST_ASSERT(rejected, "Checked extension index accepted an invalid component or coordinate");
+	}
+	class MalformedMur : public Operator_Ext_Mur_ABC {
+	public:
+		MalformedMur(Operator* op) : Operator_Ext_Mur_ABC(op) {}
+		void SetShift(int shift) { m_LineNr_Shift = shift; }
+		void SetNormal(int normal) { m_ny = normal; }
+	};
+	auto* mur = new MalformedMur(fdtd.GetOp());
+	mur->SetDirection(1, false);
+	TEST_ASSERT(mur->BuildExtension(), "Mur validation fixture failed");
+	fdtd.GetOp()->AddExtension(mur);
+	mur->SetShift(-1);
+	TEST_ASSERT(!gpu.Initialize(), "Negative Mur neighbour wrapped into a GPU index");
+	mur->SetShift(7);
+	TEST_ASSERT(!gpu.Initialize(), "Out-of-grid Mur neighbour was uploaded");
+	mur->SetShift(1);
+	mur->SetNormal(-1);
+	TEST_ASSERT(!gpu.Initialize(), "Invalid Mur normal indexed excitation metadata");
+	mur->SetNormal(1);
+	TEST_ASSERT(gpu.Initialize() && gpu.IterateTS(2) && gpu.Synchronize(), "Valid Mur could not recover after rejection");
+	return true;
+#endif
+}
+
+bool Test_Vulkan_ProbeHistory()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	auto setup = [](TestFDTDAccess& fdtd, bool vulkan) {
+		fdtd.SetLibraryArguments({vulkan ? "--engine=vulkan" : "--engine=basic", "--numThreads=1"});
+		ContinuousStructure* csx = CreateCustomGrid(9, 7, 11);
+		for (unsigned int type = 0; type < 4; ++type) {
+			auto* property = new CSPropProbeBox(csx->GetParameterSet());
+			property->SetName("history_probe_" + std::to_string(type));
+			property->SetProbeType(type);
+			auto* box = new CSPrimBox(csx->GetParameterSet(), property);
+			const double voltage[] = {0, 0, 0, 0, -4, 4}, current[] = {-5, 5, -7, 7, 0, 0};
+			for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, type == 0 ? voltage[i] : (type == 1 ? current[i] : 0));
+			csx->AddProperty(property);
+		}
+		fdtd.SetCSX(csx);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetEnableDumps(false);
+		fdtd.SetNumberOfTimeSteps(97);
+		return fdtd.SetupFDTD() == 0;
+	};
+	for (unsigned int batch : {8u, 32u, 64u}) {
+		TestFDTDAccess reference, fdtd;
+		TEST_ASSERT(setup(reference, false) && setup(fdtd, true), "Probe history fixture failed");
+		auto* gpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+		TEST_ASSERT(gpu && gpu->SetBatchSize(batch) && gpu->SetProfilingEnabled(true), "Probe history backend unavailable");
+		gpu->RegisterProbes(fdtd.GetProcessings());
+		TEST_ASSERT(!gpu->m_level->m_probePoints.empty(), "Probe history registry is empty");
+		reference.GetEng()->SetVolt(2, 4, 3, 5, 1);
+		gpu->SetVolt(2, 4, 3, 5, 1);
+		TEST_ASSERT(gpu->SyncProbesToHost() && gpu->ClearProfile(), "Probe history initial upload failed");
+		unsigned int completed = 0;
+		while (completed < 97) {
+			const unsigned int count = std::min(batch, 97u - completed);
+			if (count > 1) {
+				TEST_ASSERT(gpu->BeginProbeHistory(count), "Could not start probe history");
+				TEST_ASSERT(gpu->GetNumberOfTimesteps() == completed && fdtd.GetEng()->GetNumberOfTimesteps() == completed, "Future timestep leaked before replay");
+				TEST_ASSERT(!gpu->IterateTS(count + 1) && !gpu->BeginProbeHistory(2), "History allowed advancing beyond its stored frames");
+				TEST_ASSERT(!gpu->SetBatchSize(1) && !gpu->SetReadbackOptimizationsEnabled(false), "History storage mutated during replay");
+				bool rejected = false;
+				try { gpu->RegisterProbes(nullptr); } catch (const std::logic_error&) { rejected = true; }
+				TEST_ASSERT(rejected, "Probe registration destroyed pending history");
+				double energy = 0;
+				TEST_ASSERT(!gpu->SyncFieldsToHost() && !gpu->GetFastEnergy(energy), "Physical future fields were exposed during replay");
+			}
+			for (unsigned int frame = 0; frame < count; ++frame) {
+				TEST_ASSERT(reference.GetEng()->IterateTS(1) && gpu->IterateTS(1) && gpu->SyncProbesToHost(), "Probe history frame failed");
+				++completed;
+				TEST_ASSERT(gpu->GetNumberOfTimesteps() == completed && fdtd.GetEng()->GetNumberOfTimesteps() == completed, "History frame has the wrong timestep");
+				float error = 0, peak = 0;
+				for (const auto& point : gpu->m_level->m_probePoints) {
+					const unsigned int n = point.linear_index / (9u * 7u * 11u);
+					const unsigned int rem = point.linear_index % (9u * 7u * 11u);
+					const unsigned int x = rem / 77u, y = (rem % 77u) / 11u, z = rem % 11u;
+					const float expected = point.field_type ? reference.GetEng()->GetCurr(n, x, y, z) : reference.GetEng()->GetVolt(n, x, y, z);
+					const float actual = point.field_type ? fdtd.GetEng()->GetCurr(n, x, y, z) : fdtd.GetEng()->GetVolt(n, x, y, z);
+					TEST_ASSERT(std::isfinite(actual), "Non-finite probe history value");
+					peak = std::max(peak, std::abs(expected));
+					error = std::max(error, std::abs(actual - expected));
+				}
+				TEST_ASSERT(error < 1e-4f && error <= peak * 0.001f, "Probe history differs from CPU by more than 1e-4 / 0.1%");
+				const auto submissions = gpu->GetProfile().submissions;
+				TEST_ASSERT(gpu->SyncProbesToHost() && gpu->GetProfile().submissions == submissions, "Reading a history frame resubmitted a gather");
+			}
+		}
+		const auto profile = gpu->GetProfile();
+		TEST_ASSERT(profile.timesteps == 97 && profile.submissions == (97u + batch - 1u) / batch, "Probe history fell back to one-step submissions");
+		TEST_ASSERT(gpu->IterateTS(0) && gpu->SyncProbesToHost(), "Zero-step call invalidated completed history");
+		TEST_ASSERT(std::abs(fdtd.GetEng()->GetVolt(2, 4, 3, 5) - reference.GetEng()->GetVolt(2, 4, 3, 5)) < 1e-4f, "Zero-step call replayed the first history frame");
+		TEST_ASSERT(profile.downloadedBytes == 0 && profile.probeBytes == 97u * gpu->m_level->m_probePoints.size() * sizeof(float), "Probe history transferred full fields or omitted a frame");
+		TEST_ASSERT(gpu->SyncFieldsToHost(), "Final probe history field synchronization failed");
+		TEST_ASSERT(std::abs(gpu->GetVolt(2, 4, 3, 5) - reference.GetEng()->GetVolt(2, 4, 3, 5)) < 1e-4f, "History final fields differ from CPU");
+		gpu->SetVolt(2, 4, 3, 5, 0.25f);
+		TEST_ASSERT(gpu->SyncProbesToHost() && fdtd.GetEng()->GetVolt(2, 4, 3, 5) == 0.25f, "Completed history survived a field edit");
+		TEST_ASSERT(gpu->SetReadbackOptimizationsEnabled(false) && gpu->SyncProbesToHost(), "Completed history prevented reference readback");
+		TEST_ASSERT(fdtd.GetEng()->GetVolt(2, 4, 3, 5) == 0.25f && gpu->SetReadbackOptimizationsEnabled(true), "Reference readback used a stale history offset");
+		TEST_ASSERT(gpu->BeginProbeHistory(2), "Pending history reset fixture failed");
+		gpu->Reset();
+		TEST_ASSERT(gpu->Initialize() && !gpu->GetPendingProbeHistorySteps() && gpu->GetNumberOfTimesteps() == 0, "Reset retained future history");
+	}
+	return true;
+#endif
+}
+
 bool Test_Vulkan_BatchingAndProfiling()
 {
 #ifndef ENABLE_VULKAN
@@ -2377,6 +2607,13 @@ bool Test_Vulkan_EnergyStopping()
 		const double bounds[] = {-3, 3, -3, 3, -4, 4};
 		for (unsigned int i = 0; i < 6; ++i) box->SetCoord(i, bounds[i]);
 		csx->AddProperty(source);
+		auto* probe = new CSPropProbeBox(csx->GetParameterSet());
+		probe->SetName("energy_stopping_probe");
+		probe->SetProbeType(0);
+		auto* probeBox = new CSPrimBox(csx->GetParameterSet(), probe);
+		const double probeBounds[] = {0, 0, 0, 0, -4, 4};
+		for (unsigned int i = 0; i < 6; ++i) probeBox->SetCoord(i, probeBounds[i]);
+		csx->AddProperty(probe);
 		fdtd.SetCSX(csx);
 		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1", "--exact-endcriteria"});
 		fdtd.SetNumberOfTimeSteps(512);
@@ -2386,6 +2623,8 @@ bool Test_Vulkan_EnergyStopping()
 		else fdtd.SetGaussExcite(20e9, 10e9);
 		for (unsigned int i = 0; i < 6; ++i) fdtd.Set_BC_Type(i, 2);
 		if (fdtd.SetupFDTD() != 0) return nullptr;
+		for (size_t i = 0; i < fdtd.GetProcessings()->GetNumberOfProcessings(); ++i)
+			fdtd.GetProcessings()->GetProcessing(i)->SetProcessInterval(1);
 		std::unique_ptr<EnergyTrace> gpu(new EnergyTrace(fdtd.GetOp(), fdtd.Interface()));
 		if (!gpu->SetEnergyFloat64Enabled(mode != 2) || !gpu->SetReadbackOptimizationsEnabled(mode != 0) || !gpu->Initialize() || !gpu->SetProfilingEnabled(true)) return nullptr;
 		gpu->RegisterProbes(fdtd.GetProcessings());
@@ -2471,6 +2710,10 @@ int main(int argc, char* argv[])
 	if (argc > 1 && std::string(argv[1]) == "--vulkan-benchmark")
 		return RunVulkanPerformanceBenchmarks(argc, argv);
 	if (argc > 1 && std::string(argv[1]) == "--batching-tests") {
+		RUN_TEST(Test_ProcessingFutureInterval);
+		RUN_TEST(Test_DelayedExcitation);
+		RUN_TEST(Test_Vulkan_ExtensionIndexValidation);
+		RUN_TEST(Test_Vulkan_ProbeHistory);
 		RUN_TEST(Test_Vulkan_BatchingAndProfiling);
 		RUN_TEST(Test_Vulkan_FailurePropagation);
 		return tests_failed ? 1 : 0;
@@ -2497,6 +2740,7 @@ int main(int argc, char* argv[])
 
 	RUN_TEST(Test_BackendInterface_NullOp);
 	RUN_TEST(Test_ProcessingTimestepPeekDoesNotConsume);
+	RUN_TEST(Test_ProcessingFutureInterval);
 	RUN_TEST(Test_CapabilityScanner_StandardModel);
 	RUN_TEST(Test_CapabilityScanner_EngineExtensionFallback);
 	RUN_TEST(Test_CapabilityScanner_UnknownDispersiveFallback);
@@ -2545,6 +2789,9 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_ConductingSheet_Equivalence);
 	RUN_TEST(Test_Vulkan_Cylinder_Equivalence);
 	RUN_TEST(Test_Vulkan_CheckedDimensionsAndIndices);
+	RUN_TEST(Test_DelayedExcitation);
+	RUN_TEST(Test_Vulkan_ExtensionIndexValidation);
+	RUN_TEST(Test_Vulkan_ProbeHistory);
 	RUN_TEST(Test_Vulkan_BatchingAndProfiling);
 	RUN_TEST(Test_Vulkan_EnergyReduction);
 	RUN_TEST(Test_Vulkan_OptionalResources);

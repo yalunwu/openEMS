@@ -40,6 +40,7 @@ class Operator_Base;
 
 class OPENEMS_EXPORT Processing
 {
+	friend class ProcessingArray;
 public:
 	virtual ~Processing();
 
@@ -138,6 +139,7 @@ protected:
 	bool Enabled;
 
 	int GetNextInterval() const;
+	int GetNextInterval(bool futureOnly) const;
 	unsigned int ProcessInterval;
 
 	size_t m_PS_pos; //! current position in list of processing steps
@@ -206,6 +208,9 @@ public:
 
 	//! Invoke Process() on all Processings. Will return the smallest next iteration interval.
 	int Process();
+
+	//! Next boundary for consumers that cannot replay ordinary probe values.
+	int GetNextFullFieldInterval() const;
 
 	//! Invoke PostProcess() on all Processings.
 	void PostProcess();

@@ -88,6 +88,30 @@ def _run_disabled_output_case(kind, sim_dir, engine='vulkan'):
              disable_dumps=(kind != 'enabled'), cleanup=False)
 
 
+def _run_probe_history_case(engine, batch, sim_dir):
+    csx = ContinuousStructure()
+    grid = csx.GetGrid()
+    grid.SetDeltaUnit(1e-3)
+    for axis in 'xyz':
+        grid.SetLines(axis, np.linspace(-2, 2, 5))
+    exc = csx.AddExcitation('excite', exc_type=0, exc_val=[0, 0, 1])
+    exc.AddBox([0, 0, -1], [0, 0, 1])
+    for name, kind, start, stop in (
+            ('voltage', 0, [1, 0, -1], [1, 0, 1]),
+            ('current', 1, [-1, -1, 0], [1, 1, 0]),
+            ('electric', 2, [1, 0, 0], [1, 0, 0]),
+            ('magnetic', 3, [1, 0, 0], [1, 0, 0])):
+        probe = csx.AddProbe(name, p_type=kind, over_sampling=100,
+                             frequency=[20e9], norm_dir=2)
+        probe.AddBox(start, stop)
+    fdtd = openEMS(NrTS=97, EndCriteria=0)
+    fdtd.SetCSX(csx)
+    fdtd.SetGaussExcite(20e9, 10e9)
+    fdtd.SetBoundaryCond(['PEC'] * 6)
+    fdtd.Run(sim_dir, engine=engine, vulkan_profile=True,
+             vulkan_batch_size=batch, numThreads=1, cleanup=False)
+
+
 class Test_GPUEngine(unittest.TestCase):
     def setUp(self):
         temp_root = os.environ.get('OPENEMS_TEST_TMPDIR', os.path.join(repo_root, 'build'))
@@ -820,6 +844,77 @@ class Test_GPUEngine(unittest.TestCase):
     def test_nested_cylindrical_multigrid_equivalence(self):
         self._run_multigrid_pair([12.0, 24.0], 'cyl_mg_nested', field_dumps=True)
 
+    def test_delayed_step_and_constant_excitation(self):
+        """E/H excitation is exactly zero before delay, then agrees within 0.1%."""
+        timestep, delay_steps = 1e-12, 8
+        for signal in ('step', 'constant'):
+            for exc_type, probe_type in ((0, 2), (2, 3)):
+                outputs = {}
+                for engine in ('basic', 'vulkan'):
+                    with self.subTest(signal=signal, exc_type=exc_type, engine=engine):
+                        csx = ContinuousStructure()
+                        grid = csx.GetGrid()
+                        grid.SetDeltaUnit(1e-3)
+                        for axis in 'xyz':
+                            grid.SetLines(axis, np.linspace(-2, 2, 5))
+                        exc = csx.AddExcitation('excite', exc_type=exc_type,
+                                               exc_val=[0, 0, 1])
+                        exc.SetDelay((delay_steps + 0.25) * timestep)
+                        exc.AddBox([-1, -1, -1], [1, 1, 1])
+                        probe = csx.AddProbe('field', p_type=probe_type, over_sampling=100)
+                        probe.AddBox([0, 0, 0], [0, 0, 0])
+                        fdtd = openEMS(NrTS=24, EndCriteria=0, TimeStep=timestep)
+                        fdtd.SetCSX(csx)
+                        if signal == 'step':
+                            fdtd.SetStepExcite(20e9)
+                        else:
+                            fdtd.SetCustomExcite('1', 20e9, 20e9)
+                        fdtd.SetBoundaryCond(['PEC'] * 6)
+                        sdir = self._sim_path('delay_{}_{}_{}'.format(signal, exc_type, engine))
+                        fdtd.Run(sdir, engine=engine, vulkan_batch_size=16,
+                                 numThreads=1, cleanup=False)
+                        values = np.atleast_2d(np.loadtxt(os.path.join(sdir, 'field'), comments='%'))
+                        outputs[engine] = values
+                        self.assertEqual(len(values), 25)
+                        # Row zero is the initial field; rows 1..8 precede injection.
+                        np.testing.assert_array_equal(values[:delay_steps + 1, 1:], 0)
+                        self.assertGreater(np.max(np.abs(values[delay_steps + 1, 1:])), 0)
+                        self.assertTrue(np.isfinite(values).all())
+                expected, actual = outputs['basic'], outputs['vulkan']
+                np.testing.assert_array_equal(actual[:, 0], expected[:, 0])
+                peak = np.max(np.abs(expected[:, 1:]))
+                self.assertLess(np.max(np.abs(actual[:, 1:] - expected[:, 1:])), peak * 0.001)
+
+    def test_every_step_probes_use_batched_submissions(self):
+        """Every V/I/E/H sample survives batching, with fewer GPU submissions."""
+        outputs, submissions = {}, {}
+        for engine, batch in (('basic', 1), ('vulkan', 1), ('vulkan', 32), ('vulkan', 64)):
+            sdir = self._sim_path('history_{}_{}'.format(engine, batch))
+            result = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), '--probe-history-case',
+                 engine, str(batch), sdir], capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            if engine == 'vulkan':
+                self.assertIn('Activated Vulkan', result.stdout)
+                profile = re.search(r'VULKAN_PROFILE .*?submissions=(\d+)', result.stdout)
+                self.assertIsNotNone(profile, result.stdout + result.stderr)
+                submissions[batch] = int(profile.group(1))
+            outputs[(engine, batch)] = {
+                name: np.atleast_2d(np.loadtxt(os.path.join(sdir, name), comments='%'))
+                for name in ('voltage', 'current', 'electric', 'magnetic')}
+        for probes in outputs.values():
+            for name, actual in probes.items():
+                expected = outputs[('basic', 1)][name]
+                self.assertEqual(len(actual), 98, name)
+                np.testing.assert_array_equal(actual[:, 0], expected[:, 0])
+                self.assertTrue(np.isfinite(actual).all())
+                peak = np.max(np.abs(expected[:, 1:]))
+                self.assertGreater(peak, 0, name)
+                self.assertLessEqual(np.max(np.abs(actual[:, 1:] - expected[:, 1:])), peak * 0.001)
+        self.assertGreaterEqual(submissions[1], 97)
+        for batch in (32, 64):
+            self.assertLess(submissions[batch], submissions[1] // 4)
+
     def test_mixed_probe_sampling_equivalence(self):
         """Fused gathers preserve V/I/E/H samples and derived impedance within 0.1%."""
         outputs = {}
@@ -940,5 +1035,7 @@ class Test_GPUEngine(unittest.TestCase):
 if __name__ == '__main__':
     if len(sys.argv) in (4, 5) and sys.argv[1] == '--disabled-output-case':
         _run_disabled_output_case(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else 'vulkan')
+    elif len(sys.argv) == 5 and sys.argv[1] == '--probe-history-case':
+        _run_probe_history_case(sys.argv[2], int(sys.argv[3]), sys.argv[4])
     else:
         unittest.main()

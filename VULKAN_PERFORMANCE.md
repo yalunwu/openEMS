@@ -1,17 +1,23 @@
 # Vulkan batching, readbacks and profiling
 
 The Vulkan backend records up to 32 timesteps per queue submission by default.
-The limit controls submission size; the processing scheduler still determines
-when probes, dumps and end-criteria checks must run. Steady-state detection keeps
-its existing one-step sampling interval. Multigrid projects fields at the end of
-the requested iteration interval, rather than at every internal submission.
+The limit controls submission size. Ordinary V/I/E/H probes can keep their sample
+intervals while the GPU records several steps: a mapped buffer retains each
+intermediate result, then the CPU replays processing at the original timestep.
+Submissions end at the next full-field consumer or energy/stopping check.
+Steady-state detection also retains its one-step samples and period checks.
+Every-step full-field output or stopping checks still require one-step submissions.
 
-Probe gathering runs at the end of that interval in the final timestep submission,
-after multigrid projection. Repeated probe syncs reuse the completed result.
+During history recording, probe gathering and multigrid projection run after each
+step. Direct `IterateTS()` calls project and gather at the end of the requested
+interval. Repeated probe syncs reuse the completed result.
 Field edits, stepping, probe registration and reset invalidate cached results;
 standalone probe synchronization can still gather on demand. Partial probe updates
 do not mark the entire CPU field mirror current. Interpolation and integration
 remain in the existing CPU processing code.
+History storage grows lazily, up to 64 frames of registered probe values;
+allocation failure retains ordinary stepping and the previous probe resources.
+Full fields are available only after replay reaches the recorded batch end.
 
 Energy-only checks use a GPU reduction for the basic Cartesian engine. It squares
 the stored float fields over the same interior cells as `CalcFastEnergy()`, sums

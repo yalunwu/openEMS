@@ -20,6 +20,9 @@
 #include "Common/operator_base.h"
 #include <algorithm>
 #include "processing.h"
+#include "processvoltage.h"
+#include "processcurrent.h"
+#include "processfieldprobe.h"
 #include <climits>
 
 using namespace std;
@@ -116,12 +119,22 @@ bool Processing::IsTimestep() const
 
 int Processing::GetNextInterval() const
 {
+	return GetNextInterval(false);
+}
+
+int Processing::GetNextInterval(bool futureOnly) const
+{
 	if (Enabled==false) return -1;
 	int next=INT_MAX;
 	int ts = (int)m_Eng_Interface->GetNumberOfTimesteps();
 	if (m_ProcessSteps.size()>m_PS_pos)
 	{
-		next = (int)m_ProcessSteps.at(m_PS_pos)-ts;
+		// Lookahead must not let an unconsumed current/past explicit step
+		// hide the next periodic field or energy consumer.
+		size_t pos = m_PS_pos;
+		if (futureOnly)
+			while (pos < m_ProcessSteps.size() && m_ProcessSteps[pos] <= static_cast<unsigned int>(ts)) ++pos;
+		if (pos < m_ProcessSteps.size()) next = (int)m_ProcessSteps[pos]-ts;
 	}
 	if (ProcessInterval!=0)
 	{
@@ -383,6 +396,19 @@ int ProcessingArray::Process()
 			nextProcess=step;
 	}
 	return nextProcess;
+}
+
+int ProcessingArray::GetNextFullFieldInterval() const
+{
+	int next = INT_MAX;
+	for (Processing* processing : ProcessArray)
+	{
+		if (!processing->GetEnable() || dynamic_cast<ProcessVoltage*>(processing) ||
+		    dynamic_cast<ProcessCurrent*>(processing) || dynamic_cast<ProcessFieldProbe*>(processing)) continue;
+		const int interval = processing->GetNextInterval(true);
+		if (interval > 0) next = std::min(next, interval);
+	}
+	return next;
 }
 
 void ProcessingArray::PostProcess()

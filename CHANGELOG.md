@@ -140,6 +140,13 @@ number moved up and patch releases now have somewhere to go.
 
 ### Fixed
 
+- Honor excitation delays for step and custom signals on CPU and Vulkan,
+  including signals whose first sample is nonzero.
+- Reject out-of-grid Vulkan extension indices and invalid boundary directions
+  before packing field accesses for the GPU.
+- Preserve intermediate Vulkan probe samples within timestep submissions, so
+  every-step V/I/E/H sampling no longer forces one-step submissions. Field dumps
+  and stopping checks still bound each submission.
 - Skip Vulkan full-field readbacks for disabled dumps and mode-match probes,
   and preserve existing probe resources when replacement allocation fails.
 - Skip post-processing of disabled frequency-domain dumps, which could access
