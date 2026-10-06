@@ -392,7 +392,7 @@ int ProcessingArray::Process()
 	for (size_t i=0; i<ProcessArray.size(); ++i)
 	{
 		int step = ProcessArray.at(i)->Process();
-		if ((step>0) && (step<nextProcess))
+		if (!ProcessArray.at(i)->UsesDeviceFields() && (step>0) && (step<nextProcess))
 			nextProcess=step;
 	}
 	return nextProcess;
@@ -403,7 +403,7 @@ int ProcessingArray::GetNextFullFieldInterval() const
 	int next = INT_MAX;
 	for (Processing* processing : ProcessArray)
 	{
-		if (!processing->GetEnable() || dynamic_cast<ProcessVoltage*>(processing) ||
+		if (!processing->GetEnable() || processing->UsesDeviceFields() || dynamic_cast<ProcessVoltage*>(processing) ||
 		    dynamic_cast<ProcessCurrent*>(processing) || dynamic_cast<ProcessFieldProbe*>(processing)) continue;
 		const int interval = processing->GetNextInterval(true);
 		if (interval > 0) next = std::min(next, interval);

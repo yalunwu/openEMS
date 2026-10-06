@@ -26,6 +26,7 @@
 #include "FDTD/engine_cpu.h"
 #include "FDTD/engine.h"
 #include "FDTD/engine_interface_fdtd.h"
+#include "Common/processfields_fd.h"
 #include "FDTD/operator.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/extensions/operator_ext_upml.h"
@@ -56,6 +57,9 @@
 #include "CSPropDebyeMaterial.h"
 #include "CSPropConductingSheet.h"
 #include <cmath>
+#ifdef ENABLE_VULKAN
+#include <shaderc/shaderc.hpp>
+#endif
 
 int tests_passed = 0;
 int tests_failed = 0;
@@ -3036,8 +3040,316 @@ bool Test_Vulkan_SynchronizationShaderDependencies()
 	return Test_Vulkan_SynchronizationDependencies(false);
 }
 
+class TestFDDump {
+public:
+	static std::vector<std::complex<float>> Values(const ProcessFieldsFD* dump, size_t frequency) {
+		const auto* field=dump->m_FD_Fields.at(frequency);
+		return {field->data(),field->data()+field->size()};
+	}
+};
+
+bool Test_Vulkan_FieldAccumulation()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+	auto* csx=CreateCustomGrid(11,9,7);
+	auto* excitation=new CSPropExcitation(csx->GetParameterSet());
+	excitation->SetExcitType(0); excitation->SetExcitation(1,2);
+	auto* primitive=new CSPrimBox(csx->GetParameterSet(),excitation);
+	const double source[]={0,0,0,0,-6,6};
+	for (unsigned int i=0; i<6; ++i) primitive->SetCoord(i,source[i]);
+	csx->AddProperty(excitation); fdtd.SetCSX(csx);
+	fdtd.SetGaussExcite(20e9,10e9); fdtd.SetNumberOfTimeSteps(129); fdtd.SetEnableDumps(false);
+	TEST_ASSERT(fdtd.SetupFDTD()==0,"FD fixture setup failed");
+	EngineVulkan reference(fdtd.GetOp()), gpu(fdtd.GetOp());
+	TEST_ASSERT(reference.Initialize() && gpu.Initialize(),"FD engines failed to initialize");
+	TEST_ASSERT(gpu.SetBatchSize(64),"Could not set FD submission size");
+	auto seed=[](EngineVulkan& engine) {
+		engine.SetVolt(2,5,4,3,0.125f); engine.SetCurr(1,5,4,3,0.01f);
+	};
+	seed(reference); seed(gpu);
+	ProcessingArray cpuProcessing(100), deviceProcessing(100);
+	std::vector<ProcessFieldsFD*> cpuDumps, gpuDumps;
+	for (ProcessingArray* array : {&cpuProcessing,&deviceProcessing})
+	for (unsigned int mode=0; mode<3; ++mode)
+	for (unsigned int field=0; field<2; ++field) {
+		auto* dump=new ProcessFieldsFD(fdtd.Interface());
+		dump->SetName(field ? "fd_test_h" : "fd_test_e");
+		dump->SetFileName((array==&cpuProcessing ? "fd_reference_" : "fd_gpu_")+std::to_string(mode)+(field ? "_h" : "_e"));
+		dump->SetFileType(ProcessFields::HDF5_FILETYPE);
+		dump->SetDumpType(field ? ProcessFields::H_FIELD_DUMP : ProcessFields::E_FIELD_DUMP);
+		dump->SetDualMesh(field!=0); dump->SetDualTime(field!=0);
+		dump->SetDumpMode(static_cast<Engine_Interface_Base::InterpolationType>(mode));
+		dump->SetFDOverSampling(100); dump->AddFrequency(10e9); dump->AddFrequency(20e9);
+		const double dt=fdtd.GetOp()->GetTimestep(); dump->SetProcessStartStopTime(mode ? 3.5*dt : 0,(mode ? 90.5 : 129)*dt);
+		double start[]={-20,-20,-20}, stop[]={20,20,20}; dump->DefineStartStopCoord(start,stop);
+		array->AddProcessing(dump);
+		(array==&cpuProcessing ? cpuDumps : gpuDumps).push_back(dump);
+	}
+	cpuProcessing.InitAll(); deviceProcessing.InitAll();
+	TEST_ASSERT(reference.SyncFieldsToHost(),"FD initial reference synchronization failed");
+	fdtd.GetEng()->SetNumberOfTimesteps(0); cpuProcessing.Process();
+	for (unsigned int ts=1; ts<=129; ++ts) {
+		TEST_ASSERT(reference.IterateTS(1) && reference.SyncFieldsToHost(),"FD reference stepping failed");
+		fdtd.GetEng()->SetNumberOfTimesteps(ts); cpuProcessing.Process();
+	}
+	TEST_ASSERT(gpu.SetProfilingEnabled(true),"Could not profile FD accumulation");
+	gpu.m_fdChunkBytes=4096;
+	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,true),"FD registration failed");
+	for (auto* dump : gpuDumps) TEST_ASSERT(dump->UsesDeviceFields(),"FD unexpectedly fell back to CPU");
+	if (gpu.m_queryPool) TEST_ASSERT(gpu.GetProfile().gpuSamples[EngineVulkan::ProfileFD]>0,"FD initial timestamps were not collected");
+	for (unsigned int batch : {1u,31u,33u,64u}) TEST_ASSERT(gpu.IterateTS(batch),"FD batch failed");
+	TEST_ASSERT(gpu.FinalizeFieldDumps(),"FD finalization failed");
+	for (unsigned int field=0; field<gpuDumps.size(); ++field) {
+		const unsigned int expectedCount=field<2 ? 130 : 89;
+		TEST_ASSERT(cpuDumps[field]->GetFDSampleCount()==expectedCount && gpuDumps[field]->GetFDSampleCount()==expectedCount,"FD sample counts differ");
+		for (unsigned int frequency=0; frequency<2; ++frequency) {
+			const auto expected=TestFDDump::Values(cpuDumps[field],frequency), actual=TestFDDump::Values(gpuDumps[field],frequency);
+			float peak=0,error=0;
+			for (size_t i=0; i<expected.size(); ++i) { peak=std::max(peak,std::abs(expected[i])); error=std::max(error,std::abs(expected[i]-actual[i])); }
+			std::cout << "FD field=" << field << " frequency=" << frequency << " peak=" << peak << " error=" << error << std::endl;
+			TEST_ASSERT(peak>0 && error<=peak*0.001f+1e-18f,"FD complex tolerance exceeded");
+		}
+	}
+	const auto statistics=gpu.GetProfile();
+	TEST_ASSERT(statistics.fdSamples>0 && statistics.fdDownloadBytes>0 && statistics.downloadedBytes==0,"FD downloaded full fields or missed results");
+	TEST_ASSERT(gpu.ClearProfile(),"FD profile reset failed");
+	const auto cleared=gpu.GetProfile();
+	TEST_ASSERT(cleared.fdSamples==0 && cleared.fdDownloadBytes==0 && cleared.fdAccumulatorBytes==statistics.fdAccumulatorBytes &&
+	            cleared.fdMappingBytes==statistics.fdMappingBytes,"FD profile reset lost live storage sizes");
+	TEST_ASSERT(!gpu.RegisterFieldDumps(&deviceProcessing,false),"FD registration discarded an accumulated prefix");
+	gpu.Reset();
+	for (auto* dump : gpuDumps) {
+		TEST_ASSERT(!dump->UsesDeviceFields() && dump->GetFDSampleCount()==0,"FD reset retained counters");
+		for (const auto value : TestFDDump::Values(dump,0)) TEST_ASSERT(value==std::complex<float>(),"FD reset retained sums");
+	}
+	TEST_ASSERT(gpu.Initialize(),"FD engine reuse initialization failed");
+	seed(gpu);
+	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,true),"FD engine reuse failed");
+	TEST_ASSERT(gpu.IterateTS(129) && gpu.FinalizeFieldDumps(),"FD reused run failed");
+	for (unsigned int field=0; field<gpuDumps.size(); ++field) {
+		const auto expected=TestFDDump::Values(cpuDumps[field],0), actual=TestFDDump::Values(gpuDumps[field],0);
+		float peak=0,error=0;
+		for (size_t i=0; i<expected.size(); ++i) { peak=std::max(peak,std::abs(expected[i])); error=std::max(error,std::abs(expected[i]-actual[i])); }
+		TEST_ASSERT(error<=peak*0.001f+1e-18f,"FD reused run differs from fresh run");
+	}
+	deviceProcessing.InitAll();
+	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,false),"FD disable after explicit reset failed");
+	TEST_ASSERT(gpu.GetProfile().fdAccumulatorBytes==0 && gpu.GetProfile().fdMappingBytes==0,"FD profile retained released storage");
+	gpu.Reset();
+	TEST_ASSERT(gpu.Initialize(),"FD fallback engine initialization failed");
+	seed(gpu);
+	deviceProcessing.InitAll(); gpu.m_fdMemoryLimit=0;
+	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,true) && !gpuDumps[0]->UsesDeviceFields(),"FD allocation fallback failed");
+	TEST_ASSERT(gpu.SyncFieldsToHost(),"FD initial fallback synchronization failed");
+	fdtd.GetEng()->SetNumberOfTimesteps(0); deviceProcessing.Process();
+	for(unsigned int ts=1;ts<=129;++ts) {
+		TEST_ASSERT(gpu.IterateTS(1) && gpu.SyncFieldsToHost(),"FD CPU fallback stepping failed");
+		fdtd.GetEng()->SetNumberOfTimesteps(ts); deviceProcessing.Process();
+	}
+	for(unsigned int field=0;field<gpuDumps.size();++field) {
+		TEST_ASSERT(!gpuDumps[field]->UsesDeviceFields() && gpuDumps[field]->GetFDSampleCount()==cpuDumps[field]->GetFDSampleCount(),"FD fallback sample counts differ");
+		const auto expected=TestFDDump::Values(cpuDumps[field],0), actual=TestFDDump::Values(gpuDumps[field],0);
+		TEST_ASSERT(expected==actual,"FD allocation fallback changed CPU accumulation");
+	}
+	deviceProcessing.InitAll(); gpu.m_fdMemoryLimit=UINT64_MAX;
+	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,true),"FD mutation fixture failed");
+	gpuDumps[0]->AddFrequency(30e9);
+	bool rejected=false;
+	try { gpu.IterateTS(1); } catch(const std::runtime_error&) { rejected=true; }
+	TEST_ASSERT(rejected && gpu.GetNumberOfTimesteps()==129,"FD frequency mutation silently changed a registered spectrum");
+	cpuProcessing.DeleteAll(); deviceProcessing.DeleteAll();
+	return true;
+#endif
+}
+
+bool Test_Vulkan_FDInterruption()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	class AbortProcessing : public ProcessFields {
+	public:
+		AbortProcessing(TestFDTDAccess& fdtd) : ProcessFields(fdtd.Interface()), simulation(fdtd) { SetProcessInterval(37); }
+		int Process() override {
+			if(m_Eng_Interface->GetNumberOfTimesteps()>=37) simulation.SetAbort(true);
+			return GetNextInterval();
+		}
+		TestFDTDAccess& simulation;
+	};
+	std::vector<std::complex<float>> reference[2];
+	for(const std::string mode : {"cpu","gpu"}) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=vulkan","--numThreads=1","--vulkan-batch-size=64","--vulkan-fd="+mode});
+		auto* csx=CreateCustomGrid(9,9,9);
+		auto* excitation=new CSPropExcitation(csx->GetParameterSet());
+		excitation->SetExcitType(0); excitation->SetExcitation(1,2);
+		auto* box=new CSPrimBox(csx->GetParameterSet(),excitation);
+		const double bounds[]={0,0,0,0,-5,5};
+		for(unsigned int i=0;i<6;++i) box->SetCoord(i,bounds[i]);
+		csx->AddProperty(excitation); fdtd.SetCSX(csx);
+		fdtd.SetGaussExcite(20e9,10e9); fdtd.SetNumberOfTimeSteps(129); fdtd.SetEndCriteria(0);
+		TEST_ASSERT(fdtd.SetupFDTD()==0,"Interruption fixture failed");
+		ProcessFieldsFD* dumps[2];
+		for(unsigned int field=0;field<2;++field) {
+			auto* dump=new ProcessFieldsFD(fdtd.Interface()); dumps[field]=dump;
+			dump->SetFileName("fd_abort_"+mode+std::to_string(field)); dump->SetFileType(ProcessFields::HDF5_FILETYPE);
+			dump->SetDumpType(field ? ProcessFields::H_FIELD_DUMP : ProcessFields::E_FIELD_DUMP);
+			dump->SetDualTime(field!=0); dump->SetDualMesh(field!=0); dump->SetFDOverSampling(100); dump->AddFrequency(20e9);
+			double start[]={-20,-20,-20},stop[]={20,20,20}; dump->DefineStartStopCoord(start,stop);
+			fdtd.GetProcessings()->AddProcessing(dump);
+		}
+		fdtd.GetProcessings()->AddProcessing(new AbortProcessing(fdtd));
+		fdtd.RunFDTD();
+		TEST_ASSERT(fdtd.GetBackend()->GetNumberOfTimesteps()==37,"Graceful abort changed the field boundary");
+		for(unsigned int field=0;field<2;++field) {
+			TEST_ASSERT(dumps[field]->GetFDSampleCount()==38,"Graceful abort lost FD samples");
+			const auto actual=TestFDDump::Values(dumps[field],0);
+			if(mode=="cpu") reference[field]=actual;
+			else {
+				float peak=0,error=0;
+				for(size_t i=0;i<actual.size();++i) { peak=std::max(peak,std::abs(reference[field][i])); error=std::max(error,std::abs(actual[i]-reference[field][i])); }
+				TEST_ASSERT(peak>0 && error<=peak*0.001f+1e-18f,"Graceful abort spectra differ");
+			}
+		}
+	}
+	return true;
+#endif
+}
+
+// Experimental batched GPU phase generation; deliberately outside the runtime path.
+bool Test_Vulkan_FDPhaseCandidate()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+	auto* csx=CreateCustomGrid(11,9,7);
+	auto* excitation=new CSPropExcitation(csx->GetParameterSet());
+	excitation->SetExcitType(0); excitation->SetExcitation(1,2);
+	auto* box=new CSPrimBox(csx->GetParameterSet(),excitation);
+	const double bounds[]={0,0,0,0,-10,10};
+	for(unsigned int i=0;i<6;++i) box->SetCoord(i,bounds[i]);
+	csx->AddProperty(excitation); fdtd.SetCSX(csx);
+	fdtd.SetGaussExcite(20e9,10e9); fdtd.SetNumberOfTimeSteps(64); fdtd.SetEnableDumps(false);
+	TEST_ASSERT(fdtd.SetupFDTD()==0,"Phase fixture failed");
+	EngineVulkan gpu(fdtd.GetOp());
+	TEST_ASSERT(gpu.Initialize(),"Phase engine failed");
+	shaderc::Compiler compiler; shaderc::CompileOptions options;
+	options.SetTargetEnvironment(shaderc_target_env_vulkan,shaderc_env_version_vulkan_1_2);
+	options.SetOptimizationLevel(shaderc_optimization_level_performance);
+	const char* source=R"(#version 450
+layout(local_size_x=256) in;
+layout(std430,binding=0) readonly buffer Input { vec2 angleWeight[]; };
+layout(std430,binding=1) writeonly buffer Output { vec2 phase[]; };
+layout(push_constant) uniform Parameters { uint count; } pc;
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    if(i<pc.count) phase[i]=vec2(cos(angleWeight[i].x),sin(angleWeight[i].x))*angleWeight[i].y;
+})";
+	const auto compiled=compiler.CompileGlslToSpv(source,shaderc_glsl_compute_shader,"fd_phase_candidate.comp",options);
+	TEST_ASSERT(compiled.GetCompilationStatus()==shaderc_compilation_status_success,"Phase shader failed");
+	struct Resources {
+		VkDevice device;
+		VkShaderModule module=VK_NULL_HANDLE; VkDescriptorSetLayout descriptors=VK_NULL_HANDLE;
+		VkPipelineLayout layout=VK_NULL_HANDLE; VkPipeline pipeline=VK_NULL_HANDLE; VkDescriptorPool pool=VK_NULL_HANDLE;
+		~Resources() {
+			if(pool) vkDestroyDescriptorPool(device,pool,nullptr);
+			if(pipeline) vkDestroyPipeline(device,pipeline,nullptr);
+			if(layout) vkDestroyPipelineLayout(device,layout,nullptr);
+			if(descriptors) vkDestroyDescriptorSetLayout(device,descriptors,nullptr);
+			if(module) vkDestroyShaderModule(device,module,nullptr);
+		}
+	} resources;
+	resources.device=gpu.m_device;
+	resources.module=gpu.CreateShaderModule({compiled.begin(),compiled.end()});
+	TEST_ASSERT(resources.module,"Phase module failed");
+	VkDescriptorSetLayoutBinding bindings[2]={};
+	for(uint32_t i=0;i<2;++i) { bindings[i]={i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}; }
+	VkDescriptorSetLayoutCreateInfo descriptors={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+	descriptors.bindingCount=2; descriptors.pBindings=bindings;
+	TEST_ASSERT(vkCreateDescriptorSetLayout(gpu.m_device,&descriptors,nullptr,&resources.descriptors)==VK_SUCCESS,"Phase descriptor layout failed");
+	VkPushConstantRange range={VK_SHADER_STAGE_COMPUTE_BIT,0,4};
+	VkPipelineLayoutCreateInfo layout={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+	layout.setLayoutCount=1; layout.pSetLayouts=&resources.descriptors; layout.pushConstantRangeCount=1; layout.pPushConstantRanges=&range;
+	TEST_ASSERT(vkCreatePipelineLayout(gpu.m_device,&layout,nullptr,&resources.layout)==VK_SUCCESS,"Phase layout failed");
+	VkComputePipelineCreateInfo pipeline={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+	pipeline.layout=resources.layout; pipeline.stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	pipeline.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT; pipeline.stage.module=resources.module; pipeline.stage.pName="main";
+	TEST_ASSERT(vkCreateComputePipelines(gpu.m_device,VK_NULL_HANDLE,1,&pipeline,nullptr,&resources.pipeline)==VK_SUCCESS,"Phase pipeline failed");
+	VkDescriptorPoolSize poolSize={VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2};
+	VkDescriptorPoolCreateInfo pool={VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pool.maxSets=1; pool.poolSizeCount=1; pool.pPoolSizes=&poolSize;
+	TEST_ASSERT(vkCreateDescriptorPool(gpu.m_device,&pool,nullptr,&resources.pool)==VK_SUCCESS,"Phase descriptor pool failed");
+	EngineVulkan::VulkanBuffer input,output;
+	const auto memory=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	TEST_ASSERT(gpu.CreateBuffer(320*8,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,memory,input) &&
+	            gpu.CreateBuffer(320*8,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,memory,output),"Phase buffers failed");
+	VkDescriptorSet set=VK_NULL_HANDLE; VkDescriptorSetAllocateInfo allocate={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+	allocate.descriptorPool=resources.pool; allocate.descriptorSetCount=1; allocate.pSetLayouts=&resources.descriptors;
+	TEST_ASSERT(vkAllocateDescriptorSets(gpu.m_device,&allocate,&set)==VK_SUCCESS,"Phase set failed");
+	VkDescriptorBufferInfo infos[2]={{input.buffer,0,input.size},{output.buffer,0,output.size}};
+	VkWriteDescriptorSet writes[2]={};
+	for(uint32_t i=0;i<2;++i) { writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet=set;
+		writes[i].dstBinding=i; writes[i].descriptorCount=1; writes[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[i].pBufferInfo=&infos[i]; }
+	vkUpdateDescriptorSets(gpu.m_device,2,writes,0,nullptr);
+	const double dt=fdtd.GetOp()->GetTimestep();
+	for(uint32_t frequencies : {1u,5u})
+	for(uint32_t firstTS : {0u,100000u,100000000u}) {
+		const uint32_t count=64*frequencies;
+		std::vector<std::complex<float>> expected(count);
+		auto* angles=static_cast<float*>(input.mapped);
+		for(uint32_t i=0;i<count;++i) {
+			const double time=(double(firstTS+i/frequencies)+0.5)*dt;
+			const float angle=static_cast<float>(-2*PI*(10e9+3e9*(i%frequencies))*time);
+			angles[2*i]=angle; angles[2*i+1]=static_cast<float>(2*dt);
+			expected[i]=std::exp(std::complex<float>(0,angle)); expected[i]*=2; expected[i]*=dt;
+		}
+		TEST_ASSERT(gpu.WaitForFence(),"Phase fence failed");
+		VkCommandBufferBeginInfo begin={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		TEST_ASSERT(vkBeginCommandBuffer(gpu.m_level->m_cmdBuffer,&begin)==VK_SUCCESS,"Phase commands failed");
+		vkCmdBindPipeline(gpu.m_level->m_cmdBuffer,VK_PIPELINE_BIND_POINT_COMPUTE,resources.pipeline);
+		vkCmdBindDescriptorSets(gpu.m_level->m_cmdBuffer,VK_PIPELINE_BIND_POINT_COMPUTE,resources.layout,0,1,&set,0,nullptr);
+		vkCmdPushConstants(gpu.m_level->m_cmdBuffer,resources.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&count);
+		const unsigned int repeats=4096;
+		const auto recordStart=std::chrono::steady_clock::now();
+		for(unsigned int repeat=0;repeat<repeats;++repeat) {
+			vkCmdDispatch(gpu.m_level->m_cmdBuffer,(count+255)/256,1,1);
+			VkMemoryBarrier barrier={VK_STRUCTURE_TYPE_MEMORY_BARRIER}; barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+			vkCmdPipelineBarrier(gpu.m_level->m_cmdBuffer,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+		}
+		VkMemoryBarrier barrier={VK_STRUCTURE_TYPE_MEMORY_BARRIER}; barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+		vkCmdPipelineBarrier(gpu.m_level->m_cmdBuffer,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+		TEST_ASSERT(vkEndCommandBuffer(gpu.m_level->m_cmdBuffer)==VK_SUCCESS && gpu.SubmitCommandBuffer() && gpu.WaitForFence(),"Phase execution failed");
+		const double gpuSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-recordStart).count();
+		float error=0; const auto* actual=static_cast<const std::complex<float>*>(output.mapped);
+		for(uint32_t i=0;i<count;++i) error=std::max(error,std::abs(expected[i]-actual[i])/static_cast<float>(2*dt));
+		volatile float sink=0; const auto cpuStart=std::chrono::steady_clock::now();
+		for(unsigned int repeat=0;repeat<repeats;++repeat)
+			for(uint32_t i=0;i<count;++i) { auto phase=std::exp(std::complex<float>(0,angles[2*i])); phase*=2; phase*=dt; sink+=phase.real(); }
+		const double cpuSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-cpuStart).count();
+		std::cout << "FD_PHASE_CANDIDATE frequencies=" << frequencies << " first_ts=" << firstTS << " repeats=" << repeats
+		          << " relative_error=" << error << " cpu_s=" << cpuSeconds << " gpu_record_execute_s=" << gpuSeconds << std::endl;
+		TEST_ASSERT(std::isfinite(error) && std::isfinite(sink),"Phase candidate produced non-finite output");
+	}
+	return true;
+#endif
+}
+
 int main(int argc, char* argv[])
 {
+	if (argc>1 && std::string(argv[1])=="--fd-phase-benchmark") {
+		RUN_TEST(Test_Vulkan_FDPhaseCandidate);
+		return tests_failed ? 1 : 0;
+	}
+	if (argc>1 && std::string(argv[1])=="--field-accumulation-tests") {
+		RUN_TEST(Test_Vulkan_FieldAccumulation);
+		RUN_TEST(Test_Vulkan_FDInterruption);
+		return tests_failed ? 1 : 0;
+	}
 	if (argc > 1 && (std::string(argv[1]) == "--synchronization-tests" ||
 	                 std::string(argv[1]) == "--synchronization-shader-tests")) {
 		if (std::string(argv[1]) == "--synchronization-shader-tests") {
@@ -3146,6 +3458,8 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_ProbeHistory);
 	RUN_TEST(Test_Vulkan_BatchingAndProfiling);
 	RUN_TEST(Test_Vulkan_SynchronizationDependencies);
+	RUN_TEST(Test_Vulkan_FieldAccumulation);
+	RUN_TEST(Test_Vulkan_FDInterruption);
 	RUN_TEST(Test_Vulkan_SynchronizationMultigrid);
 	RUN_TEST(Test_Vulkan_EnergyReduction);
 	RUN_TEST(Test_Vulkan_OptionalResources);

@@ -20,9 +20,12 @@
 
 #include "processfields.h"
 #include "tools/arraylib/array_nijk.h"
+#include <memory>
 
-class ProcessFieldsFD : public ProcessFields
+class OPENEMS_EXPORT ProcessFieldsFD : public ProcessFields
 {
+	friend class EngineVulkan;
+	friend class TestFDDump;
 public:
 	ProcessFieldsFD(Engine_Interface_Base* eng_if);
 	virtual ~ProcessFieldsFD();
@@ -33,12 +36,16 @@ public:
 
 	virtual int Process();
 	virtual void PostProcess();
+	void Reset() override;
+	bool UsesDeviceFields() const override {return *m_deviceAccumulation;}
+	unsigned int GetFDSampleCount() const {return m_FD_SampleCount;}
 
 protected:
 	virtual void DumpFDData();
 
 	//! frequency domain field storage
 	std::vector<ArrayLib::ArrayNIJK<std::complex<float>>*> m_FD_Fields;
+	std::shared_ptr<bool> m_deviceAccumulation = std::make_shared<bool>(false);
 };
 
 #endif // PROCESSFIELDS_FD_H

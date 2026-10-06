@@ -679,6 +679,8 @@ cdef class openEMS:
           from 1 to 64 (default 32); processing intervals still limit advancement
         * vulkan_profile (bool) - report CPU timings, sampled GPU timings and
           submission/transfer counts; disabled by default
+        * vulkan_fd ('cpu' or 'gpu') - frequency-domain E/H field accumulation;
+          'cpu' is the default reference, 'gpu' enables supported dump regions
         """
         # a relative sim_path would be resolved against itself after the chdir below
         sim_path = os.path.abspath(sim_path)

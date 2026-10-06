@@ -103,6 +103,93 @@ resetting statistics. `Reset()` waits before destroying pending GPU resources.
 GPU execution/synchronization errors propagate to the command-line solver or
 Python caller instead of continuing with stale fields.
 
+## Frequency-domain fields
+
+`--vulkan-fd=gpu` opts into GPU E/H Fourier accumulation on the basic Cartesian
+engine. `--vulkan-fd=cpu` is the default and the explicit reference. Python uses
+`fdtd.Run(sim_path, engine='vulkan', vulkan_fd='gpu')`; MATLAB/Octave passes
+`--engine=vulkan --vulkan-fd=gpu` in the `RunOpenEMS` options string.
+No XML property or output format changes are needed.
+
+Supported consumers are frequency-domain E/H dumps (`DumpType` 10/11), including
+planar FD NF2FF recordings, with native (0), node (1) or cell (2) sampling.
+They use the resolved output mesh, including subsampling and `OptResolution`.
+Nonuniform edge scaling and boundary interpolation match the existing interface.
+Cylindrical/multigrid/SSE operators, custom interfaces/processings, other field types and SAR
+retain CPU accumulation. TD output retains its existing sampling and readbacks.
+The angular NF2FF transform still runs in the standalone CPU postprocessor.
+
+Eligible samples accumulate after each complete timestep within a submission.
+They retain the start/stop window, FD oversampling, negative Fourier phase,
+staggered H time and `2*dt*FD_interval` weight. Complex FP32 sums have the same
+precision as CPU FD storage. The CPU prepares a small batch of phase factors
+once per frequency/sample using the reference `std::exp` arithmetic; all output
+points reuse those factors. It introduces no wait per sample. Supported FD
+samples stop forcing full-field downloads or batch boundaries. CPU consumers,
+ordinary probe replay and stopping checks still determine their own boundaries.
+Completion, convergence and graceful abort download sums before the existing
+HDF5/legacy HDF5 or VTK writers run. The existing final CPU field sync remains.
+
+Each dump needs 24 bytes per output point per frequency for its sums, plus a
+compact separable axis mapping and 64 phase slots per frequency. E and H over
+10 million points need 480 MB per frequency, or 2.4 GB for five frequencies,
+in addition to the solver's existing allocations. `VULKAN_FD` reports each
+dump's choice, sample interval, estimated bytes, actual sum allocation bytes,
+mapping bytes, chunk count and accumulator read/write traffic (`2B/I` bytes
+per timestep). The output point count can differ between E and H.
+The existing CPU FD arrays remain allocated for finalization and file writers,
+so GPU accumulation adds device storage rather than reducing host memory.
+
+Memory selection uses `VK_EXT_memory_budget` when available, otherwise a
+conservative quarter of device-local heap capacity. Each dump's estimate must
+fit within 75% of the available allowance. Allocation failure selects CPU
+accumulation for that dump before its first sample. Size, storage-buffer,
+allocation-count and dispatch limits are checked; sums are partitioned where
+needed. A shared 16 MiB readback buffer bounds final staging. Partitioning does
+not reduce the total sum storage. An accumulated prefix is never discarded to
+fall back during a run; GPU submission/upload/readback failures remain errors.
+This is an opt-in resource policy, not an automatic performance selector.
+Changing registered frequencies or interpolation requires reset and
+reinitialization; stepping rejects an inconsistent registration. Reset also
+clears FD sums and sample counters. Re-registration refuses to discard live sums.
+
+Profiling adds `fd_samples` (sum of per-dump samples), `fd_dispatches`,
+`fd_accumulator_bytes`, `fd_mapping_bytes`, `fd_phase_bytes` (mapped host writes),
+`fd_phase_ms` (CPU preparation), `fd_download_bytes` and `fd_download_ms`
+(bounded final readback, waits and copying). FD download bytes are separate from
+`downloaded_bytes`, which continues to count full fields. Storage byte gauges
+describe live registered resources even when timing is disabled. `gpu_fd_ms`
+samples dispatches from the first eligible FD timestep in each submission, plus
+the initial sample, within the bounded timestamp pool. It is not the total
+accumulation time. Final file-writing time is included
+in the benchmark's solver-output runtime, outside GPU timestamps.
+
+Explicit benchmark cases are `fd-volume`, `fd-surface`, `fd-line` (65 cubed),
+`fd-large` (129 cubed), `fd-10m` (217 cubed, 10,218,313 stored nodes) and `fd-none`
+(65 cubed, diagnostic no-dump bound). They are excluded from the default matrix.
+Use matching regions/frequencies/steps for CPU and GPU comparisons:
+
+```text
+test_backend --vulkan-benchmark --case=fd-volume --fd=cpu --fd-frequencies=5 --fd-over-sampling=32 --steps=257 --batch-size=64 --repeats=3 --csv=cpu.csv
+test_backend --vulkan-benchmark --case=fd-volume --fd=gpu --fd-frequencies=5 --fd-over-sampling=32 --steps=257 --batch-size=64 --repeats=3 --csv=gpu.csv
+```
+
+`--fd-dump-mode=0|1|2` selects interpolation. Outputs use the
+`vulkan_benchmark_fd_cpu_*` and `vulkan_benchmark_fd_gpu_*` prefixes. Run in a
+scratch directory and compare complex files before interpreting timings.
+`--field-accumulation-tests` covers partitioning, reset/reuse, allocation fallback
+and graceful interruption. The Python and Octave tests exercise scripting and
+file/NF2FF compatibility. The independent synchronization check is:
+
+```text
+cmake -DBACKEND_EXECUTABLE=/absolute/path/to/test_backend -DTEST_ARGUMENT=--field-accumulation-tests -DSHADER_HEURISTIC=1 -P cmake/tests/check_vulkan_synchronization.cmake
+```
+
+`--fd-phase-benchmark` evaluates an experimental batched GLSL sine/cosine
+generator against the CPU factors, including large timestep offsets. It does
+not select a runtime implementation. See `VULKAN_PHASE07_VALIDATION.md` for
+accuracy, phase-generation and end-to-end measurements and their limits.
+
 ## Coefficient storage
 
 `--vulkan-coefficients=palette` enables an exact whole-node palette for the four

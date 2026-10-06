@@ -298,6 +298,15 @@ void openEMS::collectCommandLineArguments()
 			"Vulkan coefficient storage: dense (default), palette, or analyze both layouts"
 		)
 		(
+			"vulkan-fd",
+			po::value<std::string>()->default_value("cpu")->notifier([&](const std::string& val) {
+				if (val != "cpu" && val != "gpu")
+					throw std::invalid_argument("vulkan-fd must be cpu or gpu");
+				m_vulkanFD = val;
+			}),
+			"Frequency-domain E/H accumulation: cpu (default reference), or opt-in gpu"
+		)
+		(
 			"numThreads",
 			po::value<int>()->default_value(0)->notifier(
 				[&](int val)
@@ -1525,6 +1534,9 @@ void openEMS::RunFDTD()
 
 	//init processings
 	PA->InitAll();
+	EngineVulkan* vulkanBackend = dynamic_cast<EngineVulkan*>(m_EngineBackend.get());
+	if (vulkanBackend && !vulkanBackend->RegisterFieldDumps(PA, m_vulkanFD == "gpu"))
+		throw std::runtime_error("Vulkan frequency-domain registration failed");
 
 	//add all timesteps to end-crit field processing with max excite amplitude
 	unsigned int maxExcite = FDTD_Op->GetExcitationSignal()->GetMaxExcitationTimestep();
@@ -1561,7 +1573,6 @@ void openEMS::RunFDTD()
 	if (Eng_Ext_SSD != NULL && step > 1)
 		step = 1;
 	if ((step<0) || (step>(int)NrTS)) step=NrTS;
-	EngineVulkan* vulkanBackend = dynamic_cast<EngineVulkan*>(m_EngineBackend.get());
 	auto energyEstimate = [&]() {
 		double energy = 0;
 		if (vulkanBackend && vulkanBackend->GetFastEnergy(energy))
@@ -1609,7 +1620,7 @@ void openEMS::RunFDTD()
 				for (size_t i = 0; i < PA->GetNumberOfProcessings(); ++i)
 				{
 					Processing* p = PA->GetProcessing(i);
-					if (p != ProcField && p->GetEnable() && (dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->IsTimestep())
+					if (p != ProcField && p->GetEnable() && !p->UsesDeviceFields() && (dynamic_cast<ProcessFields*>(p) || dynamic_cast<ProcessModeMatch*>(p)) && p->IsTimestep())
 					{
 						needFullField = true;
 						break;
@@ -1718,6 +1729,8 @@ void openEMS::RunFDTD()
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
 
 	//*************** postproc ************//
+	if (vulkanBackend && !vulkanBackend->FinalizeFieldDumps())
+		throw std::runtime_error("Vulkan frequency-domain finalization failed");
 	PA->PostProcess();
 	if (vulkanBackend && vulkanBackend->IsProfilingEnabled())
 		vulkanBackend->WriteProfile(cout);

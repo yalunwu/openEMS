@@ -4,6 +4,7 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_backend.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_cpu.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/engine_vulkan.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/field_accumulator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_multithread.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_cylinder.cpp

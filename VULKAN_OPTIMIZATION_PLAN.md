@@ -9,7 +9,9 @@ are implemented locally on 2026-10-05: the dependency audit, probe-history
 synchronization fix, profiling and independent dispersive pre-pass fusion.
 Duplicate-barrier coalescing remains opt-in because throughput results were
 inconsistent. See `VULKAN_PHASE06_AUDIT.md` and `VULKAN_PHASE06_VALIDATION.md`.
-Further Phase 6b candidates and Phases 7-10 remain proposed. The
+Phase 7 is implemented locally, opt-in, with native/node/cell Cartesian E/H
+accumulation and FD NF2FF validation; see `VULKAN_PHASE07_VALIDATION.md`.
+Further Phase 6b candidates and Phases 8-10 remain proposed. The
 2026-10-05 review keeps field accumulation (7) first for the reported workload,
 including NF2FF surface validation formerly listed as 10b. GPU energy (8a)
 remains planned; steady-state (8b), probe spectra (9) and mode matching (10a)
@@ -293,7 +295,7 @@ Completion: separately reviewable changes with demonstrated performance benefits
 and documented dependency proofs. Retain the reference path where an optimization
 does not meet the performance acceptance criteria.
 
-## Phase 7: accumulate frequency-domain E/H fields on the GPU (proposed)
+## Phase 7: accumulate frequency-domain E/H fields on the GPU (implemented, opt-in)
 
 Keep running complex Fourier sums on the GPU at the existing sample times, then
 download the completed results for the existing CPU file writers. No timestep
@@ -564,13 +566,13 @@ compatibility checks and a safe cache-miss path.
 
 ## Release and acceptance
 
-Phases 0-2 and the opt-in Phase 4 path are implemented; Phases 3 and 5 are
-cancelled. Remaining work is:
+Phases 0-2 and the opt-in Phase 4 and 7 paths are implemented; Phases 3 and 5 are
+cancelled. Delivery status and remaining work are:
 
-1. Phase 7: profile the E/H FD workload and implement opt-in GPU accumulation,
-   native then interpolated, with per-dump memory budgeting and CPU fallback.
-   Include NF2FF surface/far-field validation. This remains first for the
-   reported output-heavy large-grid workload.
+1. Phase 7 delivered: opt-in native/node/cell Cartesian E/H accumulation,
+   per-dump memory budgeting and CPU fallback, with NF2FF surface/far-field
+   validation. Further devices and automatic performance selection remain
+   measurements to collect; see `VULKAN_PHASE07_VALIDATION.md`.
 2. Phase 8a: retain GPU cylindrical/multigrid energy as planned work; measure
    default, exact-endcriteria and steady-state check costs and preserve the
    existing projected-root metric and stopping decisions.
@@ -587,7 +589,7 @@ cancelled. Remaining work is:
    instead of recording it. Prototype two command buffers with independent
    fences only if reuse is not feasible.
 
-Phase 7 leads for the current workload. Phase 8a and the profiling/comparisons
+Following Phase 7, Phase 8a and the profiling/comparisons
 in 8b/9/10a can proceed independently; any steady-state implementation needs the
 appropriate validated energy path. SAR follows validated field accumulation.
 Phases 7-10 do not depend on Phase 6b, but each execution change requires its own

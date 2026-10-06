@@ -15,6 +15,7 @@
 #endif
 
 class Excitation;
+class ProcessFieldsFD;
 class Operator_Ext_Absorbing_BC;
 class Operator_CylinderMultiGrid;
 
@@ -48,20 +49,25 @@ public:
 	bool SetEnergyFloat64Enabled(bool enabled); // before Initialize(); exercise FP32 fallback
 	void RegisterProbes(const ProcessingArray* pa) override;
 	std::string GetBackendName() const override;
+	bool RegisterFieldDumps(ProcessingArray* pa, bool enabled);
+	bool FinalizeFieldDumps();
 
 	static bool CheckModelSupport(const Operator* op, const ContinuousStructure* csx, std::string& unsupportedReason);
 
 	enum GpuProfileCategory { ProfileBatch, ProfileVoltage, ProfileCurrent,
 	                          ProfileExtension, ProfileMultigrid, ProfileProbe,
-	                          ProfileReadback, ProfileEnergy, ProfileBarrier, ProfileCategoryCount };
+	                          ProfileReadback, ProfileEnergy, ProfileBarrier, ProfileFD, ProfileCategoryCount };
 	struct ProfileStatistics {
 		uint64_t submissions = 0, dispatches = 0, timesteps = 0, sampledSteps = 0;
 		uint64_t uploadedBytes = 0, downloadedBytes = 0, probeBytes = 0;
 		uint64_t energyBytes = 0;
 		uint64_t barriers = 0, coalescedBarriers = 0;
+		uint64_t fdSamples = 0, fdDownloadBytes = 0, fdPhaseBytes = 0;
+		uint64_t fdAccumulatorBytes = 0, fdMappingBytes = 0;
 		std::array<uint64_t, ProfileCategoryCount> categoryDispatches = {};
 		double recordSeconds = 0, submitSeconds = 0, waitSeconds = 0;
 		double readbackSeconds = 0, mirrorSeconds = 0;
+		double fdPhaseSeconds = 0, fdDownloadSeconds = 0;
 		std::array<double, ProfileCategoryCount> gpuSeconds = {};
 		std::array<uint64_t, ProfileCategoryCount> gpuSamples = {};
 	};
@@ -91,6 +97,8 @@ private:
 	friend bool Test_Vulkan_ProbeAllocationFailure();
 	friend bool Test_Vulkan_ExtensionIndexValidation();
 	friend bool Test_Vulkan_ProbeHistory();
+	friend bool Test_Vulkan_FieldAccumulation();
+	friend bool Test_Vulkan_FDPhaseCandidate();
 	friend bool Test_Vulkan_SynchronizationDependencies(bool);
 
 	struct GridDimensions {
@@ -192,6 +200,37 @@ private:
 		VkMemoryPropertyFlags memoryProperties = 0;
 		void* mapped = nullptr;
 	};
+
+	struct FDChunk {
+		uint32_t offset = 0, count = 0, frequency = 0;
+		VulkanBuffer sums;
+		VkDescriptorSet descriptors = VK_NULL_HANDLE;
+	};
+	struct FDDump {
+		~FDDump() { if (pool) vkDestroyDescriptorPool(device, pool, nullptr); }
+		ProcessFieldsFD* processing = nullptr;
+		std::weak_ptr<bool> active;
+		VkDevice device = VK_NULL_HANDLE;
+		VkDescriptorPool pool = VK_NULL_HANDLE;
+		VulkanBuffer mapping, phases;
+		std::vector<std::unique_ptr<FDChunk>> chunks;
+		uint32_t dims[3] = {}, mode = 0, magnetic = 0;
+		uint64_t bytes = 0, mappingBytes = 0, allocatedBytes = 0;
+	};
+	std::vector<std::unique_ptr<FDDump>> m_fdDumps;
+	VulkanBuffer m_fdStaging;
+	VkDescriptorSetLayout m_descLayoutFD = VK_NULL_HANDLE;
+	VkPipelineLayout m_pipelineLayoutFD = VK_NULL_HANDLE;
+	VkPipeline m_pipelineFD = VK_NULL_HANDLE;
+	bool m_memoryBudget = false;
+	uint64_t m_fdMemoryLimit = UINT64_MAX;
+	uint64_t m_fdChunkBytes = 128ull * 1024 * 1024;
+	bool CreateFDPipeline(bool* allocationFailed);
+	bool SupportsFDDump(const ProcessFieldsFD* processing) const;
+	bool AllocateFDDump(ProcessFieldsFD* processing, std::unique_ptr<FDDump>& dump, std::string& reason);
+	void DestroyFieldDumps(bool reset = false);
+	void PrepareFDPhases(unsigned int firstTS, unsigned int count);
+	bool RecordFieldDumps(VkCommandBuffer cmd, unsigned int timestep, unsigned int slot, bool sampleTimings);
 
 	VkInstance m_instance = VK_NULL_HANDLE;
 	VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;

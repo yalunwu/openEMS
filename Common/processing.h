@@ -100,6 +100,8 @@ public:
 	virtual void SetEnable(bool val) {Enabled=val;}
 	//! If disabled, Process() will do nothing...
 	virtual bool GetEnable() const {return Enabled;}
+	//! This consumer samples device fields without requiring a CPU field mirror.
+	virtual bool UsesDeviceFields() const {return false;}
 
 	virtual void SetWeight(double weight) {m_weight=weight;}
 	virtual double GetWeight() {return m_weight;}
@@ -185,7 +187,7 @@ protected:
 	virtual void OpenFile(std::string outfile);
 };
 
-class ProcessingArray
+class OPENEMS_EXPORT ProcessingArray
 {
 public:
 	ProcessingArray(unsigned int maximalInterval) {maxInterval=maximalInterval;}

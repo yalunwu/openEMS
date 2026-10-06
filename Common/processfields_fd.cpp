@@ -40,6 +40,9 @@ ProcessFieldsFD::~ProcessFieldsFD()
 
 void ProcessFieldsFD::InitProcess()
 {
+	for (auto* field : m_FD_Fields) delete field;
+	m_FD_Fields.clear();
+	Reset();
 	if (Enabled==false) return;
 
 	if (m_FD_Samples.size()==0)
@@ -76,6 +79,7 @@ int ProcessFieldsFD::Process()
 
 	if ((m_FD_Interval==0) || (m_Eng_Interface->GetNumberOfTimesteps()%m_FD_Interval!=0))
 		return GetNextInterval();
+	if (*m_deviceAccumulation) return GetNextInterval();
 
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> tmp_field_td;
 	if (!CalcField(tmp_field_td))
@@ -103,6 +107,15 @@ void ProcessFieldsFD::PostProcess()
 {
 	if (!Enabled) return;
 	DumpFDData();
+}
+
+void ProcessFieldsFD::Reset()
+{
+	Processing::Reset();
+	*m_deviceAccumulation = false;
+	m_FD_SampleCount = 0;
+	for (auto* field : m_FD_Fields)
+		std::fill(field->data(), field->data() + field->size(), std::complex<float>());
 }
 
 void ProcessFieldsFD::DumpFDData()

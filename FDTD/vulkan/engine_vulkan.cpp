@@ -238,6 +238,12 @@ bool EngineVulkan::SetProfilingEnabled(bool enabled)
 	m_profileEnabled = enabled;
 	m_profile = ProfileStatistics();
 #ifdef ENABLE_VULKAN
+	for (const auto& dump : m_fdDumps) {
+		m_profile.fdAccumulatorBytes += dump->bytes;
+		m_profile.fdMappingBytes += dump->mappingBytes;
+	}
+#endif
+#ifdef ENABLE_VULKAN
 	if (m_device && enabled) return InitProfiling();
 #endif
 	return true;
@@ -260,6 +266,12 @@ bool EngineVulkan::ClearProfile()
 	if (m_device && !Synchronize()) return false;
 #endif
 	m_profile = ProfileStatistics();
+#ifdef ENABLE_VULKAN
+	for (const auto& dump : m_fdDumps) {
+		m_profile.fdAccumulatorBytes += dump->bytes;
+		m_profile.fdMappingBytes += dump->mappingBytes;
+	}
+#endif
 	return true;
 }
 
@@ -285,7 +297,12 @@ void EngineVulkan::WriteProfile(std::ostream& stream)
 	       << " submit_ms=" << p.submitSeconds * 1000 << " wait_ms=" << p.waitSeconds * 1000
 	       << " readback_ms=" << p.readbackSeconds * 1000 << " mirror_ms=" << p.mirrorSeconds * 1000;
 	stream << " energy_bytes=" << p.energyBytes;
-	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback", "energy", "barrier"};
+	stream << " fd_samples=" << p.fdSamples << " fd_download_bytes=" << p.fdDownloadBytes
+	       << " fd_phase_bytes=" << p.fdPhaseBytes << " fd_accumulator_bytes=" << p.fdAccumulatorBytes
+	       << " fd_mapping_bytes=" << p.fdMappingBytes
+	       << " fd_phase_ms=" << p.fdPhaseSeconds*1000
+	       << " fd_download_ms=" << p.fdDownloadSeconds*1000;
+	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback", "energy", "barrier", "fd"};
 	for (unsigned int i = 0; i < ProfileCategoryCount; ++i)
 		stream << " gpu_" << names[i] << "_ms=" << p.gpuSeconds[i] * 1000
 		       << " gpu_" << names[i] << "_samples=" << p.gpuSamples[i]
@@ -932,6 +949,18 @@ bool EngineVulkan::InitVulkan()
 	enabled.shaderFloat64 = m_enableEnergyFloat64 ? available.shaderFloat64 : VK_FALSE;
 	m_energyFloat64 = enabled.shaderFloat64 != VK_FALSE;
 	deviceCreateInfo.pEnabledFeatures = &enabled;
+	uint32_t extensionCount = 0;
+	m_memoryBudget = false;
+	vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &extensionCount, nullptr);
+	std::vector<VkExtensionProperties> extensions(extensionCount);
+	vkEnumerateDeviceExtensionProperties(m_physicalDevice, nullptr, &extensionCount, extensions.data());
+	for (const auto& extension : extensions)
+		if (std::strcmp(extension.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) m_memoryBudget = true;
+	const char* budgetExtension = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+	if (m_memoryBudget) {
+		deviceCreateInfo.enabledExtensionCount = 1;
+		deviceCreateInfo.ppEnabledExtensionNames = &budgetExtension;
+	}
 
 	if (vkCreateDevice(m_physicalDevice, &deviceCreateInfo, nullptr, &m_device) != VK_SUCCESS)
 	{
@@ -4636,6 +4665,7 @@ bool EngineVulkan::IterateTSImpl(unsigned int iterTS, bool history)
 		if (!WaitForFence()) return false;
 		const unsigned int count = std::min(m_batchSize, iterTS - done);
 		const unsigned int firstTS = m_level->m_numTS;
+		PrepareFDPhases(firstTS + 1u, count);
 		VkCommandBufferBeginInfo begin = {};
 		begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 		begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -4655,12 +4685,15 @@ bool EngineVulkan::IterateTSImpl(unsigned int iterTS, bool history)
 			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 			MemoryBarrier(m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier);
+			bool fdTimingSampled = false;
 			for (unsigned int step = 0; step < count; ++step)
 			{
 				m_sampleDispatches = m_profileEnabled && step == 0u;
 				if (m_sampleDispatches) ++m_profile.sampledSteps;
 				RecordVoltageHierarchy(m_level->m_cmdBuffer, firstTS + step);
 				RecordCurrentHierarchy(m_level->m_cmdBuffer, firstTS + step);
+				if (!m_fdDumps.empty())
+					fdTimingSampled = RecordFieldDumps(m_level->m_cmdBuffer, firstTS + step + 1u, step, !fdTimingSampled) || fdTimingSampled;
 				if (history)
 				{
 					RecordProjectionHierarchy(m_level->m_cmdBuffer);
@@ -4970,6 +5003,7 @@ void EngineVulkan::Reset()
 
 	if (m_device != VK_NULL_HANDLE)
 	{
+		DestroyFieldDumps(true);
 		DestroyBuffer(m_level->m_bufVv);
 		DestroyBuffer(m_level->m_bufVi);
 		DestroyBuffer(m_level->m_bufIi);

@@ -26,7 +26,7 @@
 class VTK_File_Writer;
 class HDF5_File_Writer;
 
-class ProcessFields : public Processing
+class OPENEMS_EXPORT ProcessFields : public Processing
 {
 public:
 	ProcessFields(Engine_Interface_Base* eng_if);

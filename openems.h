@@ -154,6 +154,7 @@ protected:
 	unsigned int m_vulkanBatchSize = 32;
 	bool m_vulkanProfile = false;
 	std::string m_vulkanCoefficients = "dense";
+	std::string m_vulkanFD = "cpu";
 
 	double endCrit;
 	int m_OverSampling;

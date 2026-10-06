@@ -19,6 +19,11 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Opt-in Vulkan frequency-domain E/H accumulation with `--vulkan-fd=gpu`
+  (Python `vulkan_fd='gpu'`, MATLAB/Octave options string). Basic Cartesian
+  native, node and cell dumps, including FD NF2FF surfaces, retain their output
+  formats. Unsupported mappings or insufficient resources use CPU accumulation
+  per dump; `--vulkan-fd=cpu` remains the default reference.
 - Opt-in exact Vulkan coefficient palettes with `--vulkan-coefficients=palette`,
   dense fallback, and whole-node/per-component storage analysis. The benchmark
   accepts `--coefficients=dense|palette|analyze`; dense remains the default.
