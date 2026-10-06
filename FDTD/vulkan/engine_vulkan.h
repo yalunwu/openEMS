@@ -98,6 +98,7 @@ private:
 	friend bool Test_Vulkan_ExtensionIndexValidation();
 	friend bool Test_Vulkan_ProbeHistory();
 	friend bool Test_Vulkan_FieldAccumulation();
+	friend bool Test_Vulkan_FDMemoryFallback();
 	friend bool Test_Vulkan_FDPhaseCandidate();
 	friend bool Test_Vulkan_SynchronizationDependencies(bool);
 
@@ -175,6 +176,8 @@ private:
 			std::swap(buffer, other.buffer);
 			std::swap(memory, other.memory);
 			std::swap(size, other.size);
+			std::swap(allocationSize, other.allocationSize);
+			std::swap(memoryHeap, other.memoryHeap);
 			std::swap(memoryProperties, other.memoryProperties);
 			std::swap(mapped, other.mapped);
 		}
@@ -191,12 +194,16 @@ private:
 			memory = VK_NULL_HANDLE;
 			mapped = nullptr;
 			size = 0;
+			allocationSize = 0;
+			memoryHeap = UINT32_MAX;
 			memoryProperties = 0;
 		}
 		VkDevice device = VK_NULL_HANDLE;
 		VkBuffer buffer = VK_NULL_HANDLE;
 		VkDeviceMemory memory = VK_NULL_HANDLE;
 		VkDeviceSize size = 0;
+		VkDeviceSize allocationSize = 0;
+		uint32_t memoryHeap = UINT32_MAX;
 		VkMemoryPropertyFlags memoryProperties = 0;
 		void* mapped = nullptr;
 	};
@@ -227,6 +234,7 @@ private:
 	uint64_t m_fdChunkBytes = 128ull * 1024 * 1024;
 	bool CreateFDPipeline(bool* allocationFailed);
 	bool SupportsFDDump(const ProcessFieldsFD* processing) const;
+	bool CheckFDFallbackMemory(const FDDump* pending = nullptr, uint64_t* available = nullptr) const;
 	bool AllocateFDDump(ProcessFieldsFD* processing, std::unique_ptr<FDDump>& dump, std::string& reason);
 	void DestroyFieldDumps(bool reset = false);
 	void PrepareFDPhases(unsigned int firstTS, unsigned int count);

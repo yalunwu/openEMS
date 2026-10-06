@@ -142,9 +142,12 @@ The existing CPU FD arrays remain allocated for finalization and file writers,
 so GPU accumulation adds device storage rather than reducing host memory.
 
 Memory selection uses `VK_EXT_memory_budget` when available, otherwise a
-conservative quarter of device-local heap capacity. Each dump's estimate must
-fit within 75% of the available allowance. Allocation failure selects CPU
-accumulation for that dump before its first sample. Size, storage-buffer,
+conservative quarter of each device-local heap's capacity. Driver estimates
+must fit within 75% of the available allowance. The fallback applies that limit
+across all FD dumps using actual allocation sizes on their selected heaps,
+including device-local mapping, phase and shared staging allocations.
+Allocation failure selects CPU accumulation for that dump before its first
+sample. Size, storage-buffer,
 allocation-count and dispatch limits are checked; sums are partitioned where
 needed. A shared 16 MiB readback buffer bounds final staging. Partitioning does
 not reduce the total sum storage. An accumulated prefix is never discarded to

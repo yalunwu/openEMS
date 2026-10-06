@@ -780,6 +780,8 @@ bool EngineVulkan::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkM
 		}
 	}
 
+	outBuf.allocationSize = memReqs.size;
+	outBuf.memoryHeap = memoryProperties.memoryTypes[memTypeIndex].heapIndex;
 	return true;
 }
 

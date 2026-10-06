@@ -150,6 +150,8 @@ number moved up and patch releases now have somewhere to go.
 
 ### Fixed
 
+- Bound Vulkan FD allocations across dumps by their actual device-heap usage
+  when driver memory-budget estimates are unavailable.
 - Reject Vulkan FD registration after CPU accumulation has started, preserving
   the existing spectrum and leaving all registrations unchanged on rejection.
 - Order Vulkan probe-history reads before the next timestep's field writes.

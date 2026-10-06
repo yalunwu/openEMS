@@ -146,6 +146,37 @@ bool EngineVulkan::SupportsFDDump(const ProcessFieldsFD* processing) const
 	return true;
 }
 
+bool EngineVulkan::CheckFDFallbackMemory(const FDDump* pending, uint64_t* available) const
+{
+	VkPhysicalDeviceMemoryProperties memory={};
+	vkGetPhysicalDeviceMemoryProperties(m_physicalDevice,&memory);
+	std::array<uint64_t,VK_MAX_MEMORY_HEAPS> usage={};
+	auto account=[&](const VulkanBuffer& buffer) {
+		if (buffer.memory && buffer.memoryHeap<memory.memoryHeapCount)
+			usage[buffer.memoryHeap]+=buffer.allocationSize;
+	};
+	auto accountDump=[&](const FDDump& dump) {
+		account(dump.mapping); account(dump.phases);
+		for (const auto& chunk : dump.chunks) account(chunk->sums);
+	};
+	account(m_fdStaging);
+	for (const auto& dump : m_fdDumps) accountDump(*dump);
+	if (pending) accountDump(*pending);
+	bool fits=true;
+	uint64_t committed=0;
+	if (available) *available=0;
+	for (uint32_t h=0; h<memory.memoryHeapCount; ++h)
+		if (memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+			committed+=usage[h];
+			const uint64_t limit=(memory.memoryHeaps[h].size/4)*3/4;
+			if (usage[h]>limit) fits=false;
+			if (available && usage[h]<limit) *available=std::max(*available,limit-usage[h]);
+		}
+	if (committed>m_fdMemoryLimit) fits=false;
+	if (available) *available=std::min(*available,m_fdMemoryLimit>committed ? m_fdMemoryLimit-committed : 0);
+	return fits;
+}
+
 bool EngineVulkan::AllocateFDDump(ProcessFieldsFD* processing, std::unique_ptr<FDDump>& dump, std::string& reason)
 {
 	reason="unsupported field mapping";
@@ -211,17 +242,26 @@ bool EngineVulkan::AllocateFDDump(ProcessFieldsFD* processing, std::unique_ptr<F
 			const uint64_t capacity=m_memoryBudget ? (budget.heapBudget[h]>budget.heapUsage[h] ? budget.heapBudget[h]-budget.heapUsage[h] : 0) : memory.memoryProperties.memoryHeaps[h].size/4;
 			available=std::max(available,capacity);
 		}
-	const uint64_t estimate=dump->bytes+dump->mappingBytes+phaseBytes+16ull*1024*1024+chunkCount*properties.limits.bufferImageGranularity;
+	const uint64_t estimate=dump->bytes+dump->mappingBytes+phaseBytes+(m_fdStaging.buffer ? 0 : 16ull*1024*1024)+chunkCount*properties.limits.bufferImageGranularity;
 	reason="insufficient memory budget or optional allocation";
+	const bool fallbackFits=m_memoryBudget || CheckFDFallbackMemory(nullptr,&available);
 	std::cout << "VULKAN_FD name=" << processing->GetName() << " file=" << processing->m_filename << " estimated_bytes=" << estimate
 	          << " available_bytes=" << available << " memory_budget=" << m_memoryBudget << std::endl;
-	if (estimate>std::min(m_fdMemoryLimit,available*3/4)) return false;
+	if (m_memoryBudget) {
+		// Driver usage already includes prior allocations; do not subtract them again.
+		if (estimate>std::min(m_fdMemoryLimit,available*3/4)) return false;
+	} else {
+		// Bound the device-local sums first, then verify every actual allocation,
+		// including host-visible buffers if their selected heap is device-local.
+		if (!fallbackFits || dump->bytes+dump->mappingBytes>available) return false;
+	}
 	bool allocationFailed=false;
 	if (!UploadStorageBuffer(mapping.data(),dump->mappingBytes,dump->mapping,&allocationFailed)) {
 		if (!allocationFailed) throw std::runtime_error("Vulkan FD mapping upload failed");
 		return false;
 	}
 	if (!CreateBuffer(phaseBytes,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,dump->phases)) return false;
+	if (!m_memoryBudget && !CheckFDFallbackMemory(dump.get())) return false;
 	VkDescriptorPoolSize poolSize={VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,static_cast<uint32_t>(chunkCount*4)};
 	VkDescriptorPoolCreateInfo pool={VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
 	pool.maxSets=static_cast<uint32_t>(chunkCount); pool.poolSizeCount=1; pool.pPoolSizes=&poolSize;
@@ -243,11 +283,9 @@ bool EngineVulkan::AllocateFDDump(ProcessFieldsFD* processing, std::unique_ptr<F
 		}
 		vkUpdateDescriptorSets(m_device,4,writes,0,nullptr);
 		dump->chunks.push_back(std::move(chunk));
+		if (!m_memoryBudget && !CheckFDFallbackMemory(dump.get())) return false;
 	}
-	for (auto& chunk : dump->chunks) {
-		VkMemoryRequirements requirements; vkGetBufferMemoryRequirements(m_device,chunk->sums.buffer,&requirements);
-		dump->allocatedBytes+=requirements.size;
-	}
+	for (const auto& chunk : dump->chunks) dump->allocatedBytes+=chunk->sums.allocationSize;
 	return true;
 }
 
@@ -369,10 +407,17 @@ bool EngineVulkan::RegisterFieldDumps(ProcessingArray* pa, bool enabled)
 			std::cout << "VULKAN_FD name=" << processing->GetName() << " file=" << processing->m_filename << " mode=cpu reason=" << reason << std::endl;
 			continue;
 		}
-		if (!m_fdStaging.buffer && !CreateBuffer(16ull*1024*1024,VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		const bool newStaging=!m_fdStaging.buffer;
+		if (newStaging && !CreateBuffer(16ull*1024*1024,VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 		    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,m_fdStaging)) {
 			std::cout << "VULKAN_FD name=" << processing->GetName() << " file=" << processing->m_filename << " mode=cpu reason=optional readback allocation" << std::endl;
 			m_fdStaging.Release();
+			continue;
+		}
+		if (!m_memoryBudget && !CheckFDFallbackMemory(dump.get())) {
+			if (newStaging) m_fdStaging.Release();
+			std::cout << "VULKAN_FD name=" << processing->GetName() << " file=" << processing->m_filename
+			          << " mode=cpu reason=insufficient cumulative memory budget" << std::endl;
 			continue;
 		}
 		*processing->m_deviceAccumulation=true;

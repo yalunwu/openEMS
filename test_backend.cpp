@@ -3105,6 +3105,7 @@ bool Test_Vulkan_FieldAccumulation()
 	seed(reference); seed(gpu);
 	ProcessingArray cpuProcessing(100), deviceProcessing(100);
 	std::vector<ProcessFieldsFD*> cpuDumps, gpuDumps;
+	const unsigned int frequencyCount=16;
 	for (ProcessingArray* array : {&cpuProcessing,&deviceProcessing})
 	for (unsigned int mode=0; mode<3; ++mode)
 	for (unsigned int field=0; field<2; ++field) {
@@ -3115,7 +3116,9 @@ bool Test_Vulkan_FieldAccumulation()
 		dump->SetDumpType(field ? ProcessFields::H_FIELD_DUMP : ProcessFields::E_FIELD_DUMP);
 		dump->SetDualMesh(field!=0); dump->SetDualTime(field!=0);
 		dump->SetDumpMode(static_cast<Engine_Interface_Base::InterpolationType>(mode));
-		dump->SetFDOverSampling(100); dump->AddFrequency(10e9); dump->AddFrequency(20e9);
+		dump->SetFDOverSampling(100);
+		for (unsigned int frequency=0; frequency<frequencyCount; ++frequency)
+			dump->AddFrequency(10e9+15e9*(frequency+1)/frequencyCount);
 		const double dt=fdtd.GetOp()->GetTimestep(); dump->SetProcessStartStopTime(mode ? 3.5*dt : 0,(mode ? 90.5 : 129)*dt);
 		double start[]={-20,-20,-20}, stop[]={20,20,20}; dump->DefineStartStopCoord(start,stop);
 		array->AddProcessing(dump);
@@ -3148,13 +3151,15 @@ bool Test_Vulkan_FieldAccumulation()
 	gpu.m_fdChunkBytes=4096;
 	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,true),"FD registration failed");
 	for (auto* dump : gpuDumps) TEST_ASSERT(dump->UsesDeviceFields(),"FD unexpectedly fell back to CPU");
+	for (const auto& dump : gpu.m_fdDumps)
+		TEST_ASSERT(dump->chunks.size()>frequencyCount,"FD frequency sweep did not partition each frequency");
 	if (gpu.m_queryPool) TEST_ASSERT(gpu.GetProfile().gpuSamples[EngineVulkan::ProfileFD]>0,"FD initial timestamps were not collected");
 	for (unsigned int batch : {1u,31u,33u,64u}) TEST_ASSERT(gpu.IterateTS(batch),"FD batch failed");
 	TEST_ASSERT(gpu.FinalizeFieldDumps(),"FD finalization failed");
 	for (unsigned int field=0; field<gpuDumps.size(); ++field) {
 		const unsigned int expectedCount=field<2 ? 130 : 89;
 		TEST_ASSERT(cpuDumps[field]->GetFDSampleCount()==expectedCount && gpuDumps[field]->GetFDSampleCount()==expectedCount,"FD sample counts differ");
-		for (unsigned int frequency=0; frequency<2; ++frequency) {
+		for (unsigned int frequency=0; frequency<frequencyCount; ++frequency) {
 			const auto expected=TestFDDump::Values(cpuDumps[field],frequency), actual=TestFDDump::Values(gpuDumps[field],frequency);
 			float peak=0,error=0;
 			TEST_ASSERT(FDSpectrumError(expected,actual,peak,error),"FD spectra are non-finite or have different sizes");
@@ -3179,10 +3184,12 @@ bool Test_Vulkan_FieldAccumulation()
 	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,true),"FD engine reuse failed");
 	TEST_ASSERT(gpu.IterateTS(129) && gpu.FinalizeFieldDumps(),"FD reused run failed");
 	for (unsigned int field=0; field<gpuDumps.size(); ++field) {
-		const auto expected=TestFDDump::Values(cpuDumps[field],0), actual=TestFDDump::Values(gpuDumps[field],0);
-		float peak=0,error=0;
-		TEST_ASSERT(FDSpectrumError(expected,actual,peak,error),"Reused FD spectra are non-finite or have different sizes");
-		TEST_ASSERT(error<=peak*0.001f+1e-18f,"FD reused run differs from fresh run");
+		for (unsigned int frequency=0; frequency<frequencyCount; ++frequency) {
+			const auto expected=TestFDDump::Values(cpuDumps[field],frequency), actual=TestFDDump::Values(gpuDumps[field],frequency);
+			float peak=0,error=0;
+			TEST_ASSERT(FDSpectrumError(expected,actual,peak,error),"Reused FD spectra are non-finite or have different sizes");
+			TEST_ASSERT(error<=peak*0.001f+1e-18f,"FD reused run differs from fresh run");
+		}
 	}
 	deviceProcessing.InitAll();
 	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,false),"FD disable after explicit reset failed");
@@ -3200,8 +3207,10 @@ bool Test_Vulkan_FieldAccumulation()
 	}
 	for(unsigned int field=0;field<gpuDumps.size();++field) {
 		TEST_ASSERT(!gpuDumps[field]->UsesDeviceFields() && gpuDumps[field]->GetFDSampleCount()==cpuDumps[field]->GetFDSampleCount(),"FD fallback sample counts differ");
-		const auto expected=TestFDDump::Values(cpuDumps[field],0), actual=TestFDDump::Values(gpuDumps[field],0);
-		TEST_ASSERT(expected==actual,"FD allocation fallback changed CPU accumulation");
+		for (unsigned int frequency=0; frequency<frequencyCount; ++frequency) {
+			const auto expected=TestFDDump::Values(cpuDumps[field],frequency), actual=TestFDDump::Values(gpuDumps[field],frequency);
+			TEST_ASSERT(expected==actual,"FD allocation fallback changed CPU accumulation");
+		}
 	}
 	deviceProcessing.InitAll(); gpu.m_fdMemoryLimit=UINT64_MAX;
 	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,true),"FD mutation fixture failed");
@@ -3210,6 +3219,140 @@ bool Test_Vulkan_FieldAccumulation()
 	try { gpu.IterateTS(1); } catch(const std::runtime_error&) { rejected=true; }
 	TEST_ASSERT(rejected && gpu.GetNumberOfTimesteps()==129,"FD frequency mutation silently changed a registered spectrum");
 	cpuProcessing.DeleteAll(); deviceProcessing.DeleteAll();
+	return true;
+#endif
+}
+
+bool Test_Vulkan_FDMemoryFallback()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	std::vector<std::complex<float>> reference[2][2];
+	for (const std::string mode : {"cpu","gpu"}) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=vulkan","--numThreads=1","--vulkan-fd="+mode,"--exact-endcriteria"});
+		fdtd.SetCSX(CreateCustomGrid(11,9,7));
+		fdtd.SetGaussExcite(20e9,10e9); fdtd.SetNumberOfTimeSteps(65); fdtd.SetEndCriteria(0);
+		TEST_ASSERT(fdtd.SetupFDTD()==0,"FD memory fixture setup failed");
+		auto* gpu=dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+		TEST_ASSERT(gpu && gpu->SetBatchSize(64) && gpu->SetProfilingEnabled(true),"FD memory fixture Vulkan setup failed");
+		ProcessFieldsFD* dumps[2];
+		for (unsigned int field=0; field<2; ++field) {
+			auto* dump=new ProcessFieldsFD(fdtd.Interface()); dumps[field]=dump;
+			dump->SetFileName("fd_memory_"+mode+std::to_string(field)); dump->SetFileType(ProcessFields::HDF5_FILETYPE);
+			dump->SetDumpType(field ? ProcessFields::H_FIELD_DUMP : ProcessFields::E_FIELD_DUMP);
+			dump->SetDualTime(field!=0); dump->SetDualMesh(field!=0); dump->SetFDOverSampling(100);
+			dump->AddFrequency(10e9); dump->AddFrequency(20e9);
+			double start[]={-20,-20,-20},stop[]={20,20,20}; dump->DefineStartStopCoord(start,stop);
+			fdtd.GetProcessings()->AddProcessing(dump);
+		}
+		uint64_t limit=0;
+		if (mode=="gpu") {
+			// Calibrate using actual allocation sizes so this budget is portable.
+			fdtd.GetProcessings()->InitAll();
+			ProcessingArray first(100); first.AddProcessing(dumps[0]);
+			gpu->m_memoryBudget=false;
+			TEST_ASSERT(gpu->RegisterFieldDumps(&first,true) && dumps[0]->UsesDeviceFields(),"FD budget calibration failed");
+			const auto& dump=*gpu->m_fdDumps[0];
+			VkPhysicalDeviceMemoryProperties memory={};
+			vkGetPhysicalDeviceMemoryProperties(gpu->m_physicalDevice,&memory);
+			auto account=[&](const EngineVulkan::VulkanBuffer& buffer) {
+				if (buffer.memory && buffer.memoryHeap<memory.memoryHeapCount &&
+				    (memory.memoryHeaps[buffer.memoryHeap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) limit+=buffer.allocationSize;
+			};
+			account(dump.mapping); account(dump.phases); account(gpu->m_fdStaging);
+			for (const auto& chunk : dump.chunks) account(chunk->sums);
+			limit+=TestFDDump::Values(dumps[1],0).size()*8;
+			gpu->Reset();
+			TEST_ASSERT(gpu->Initialize(),"FD budget reset failed");
+			gpu->m_memoryBudget=false; gpu->m_fdMemoryLimit=limit;
+		}
+		gpu->SetVolt(2,5,4,3,0.125f); gpu->SetCurr(1,5,4,3,0.01f);
+		TEST_ASSERT(gpu->ClearProfile(),"FD memory profile reset failed");
+		fdtd.RunFDTD();
+		TEST_ASSERT(gpu->GetNumberOfTimesteps()==65,"FD memory fallback changed simulation length");
+		for (unsigned int field=0; field<2; ++field) {
+			TEST_ASSERT(dumps[field]->UsesDeviceFields()==(mode=="gpu" && field==0),"FD budget did not produce the expected residency");
+			TEST_ASSERT(dumps[field]->GetFDSampleCount()==66,"Mixed FD residency lost or duplicated samples");
+			for (unsigned int frequency=0; frequency<2; ++frequency) {
+				const auto actual=TestFDDump::Values(dumps[field],frequency);
+				if (mode=="cpu") reference[field][frequency]=actual;
+				else {
+					float peak=0,error=0;
+					TEST_ASSERT(FDSpectrumError(reference[field][frequency],actual,peak,error) && peak>0 && error<=peak*0.001f+1e-18f,
+					            "Mixed FD residency changed complex spectra");
+				}
+			}
+		}
+		if (mode=="gpu") {
+			const auto statistics=gpu->GetProfile();
+			TEST_ASSERT(statistics.fdSamples==66 && statistics.fdDownloadBytes>0 && statistics.downloadedBytes>0,
+			            "Mixed residency missed GPU samples or CPU field synchronization");
+			uint64_t available=0;
+			TEST_ASSERT(gpu->CheckFDFallbackMemory(nullptr,&available) && available==TestFDDump::Values(dumps[1],0).size()*8,
+			            "FD accounting missed actual allocations or counted shared storage twice");
+			gpu->Reset();
+			TEST_ASSERT(gpu->Initialize(),"Mixed FD reset failed");
+			gpu->m_memoryBudget=false; gpu->m_fdMemoryLimit=limit;
+			fdtd.GetProcessings()->InitAll();
+			TEST_ASSERT(gpu->RegisterFieldDumps(fdtd.GetProcessings(),true) && dumps[0]->UsesDeviceFields() && !dumps[1]->UsesDeviceFields(),
+			            "FD reset retained committed memory or changed fallback selection");
+		}
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_FDCylindricalFallback()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (bool multigrid : {false,true}) {
+		std::vector<std::complex<float>> reference[6];
+		for (const std::string mode : {"cpu","gpu"}) {
+			TestFDTDAccess fdtd;
+			fdtd.SetLibraryArguments({"--engine=vulkan","--numThreads=1","--vulkan-fd="+mode,"--exact-endcriteria"});
+			fdtd.SetCylinderCoords(true);
+			if (multigrid) fdtd.SetupCylinderMultiGrid(std::vector<double>{10});
+			fdtd.SetCSX(CreateCylindricalGrid(25,17,9));
+			fdtd.SetGaussExcite(20e9,10e9); fdtd.SetNumberOfTimeSteps(17); fdtd.SetEndCriteria(0);
+			for (int boundary=0; boundary<6; ++boundary) fdtd.Set_BC_Type(boundary,0);
+			TEST_ASSERT(fdtd.SetupFDTD()==0,"Cylindrical FD fixture setup failed");
+			auto* gpu=dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+			TEST_ASSERT(gpu && gpu->SetBatchSize(64) && gpu->SetProfilingEnabled(true),"Cylindrical FD fixture fell back from Vulkan stepping");
+			TEST_ASSERT((dynamic_cast<Operator_CylinderMultiGrid*>(fdtd.GetOp())!=nullptr)==multigrid,
+			            "Cylindrical FD fixture has the wrong operator");
+			std::vector<ProcessFieldsFD*> dumps;
+			for (unsigned int interpolation=0; interpolation<3; ++interpolation)
+			for (unsigned int field=0; field<2; ++field) {
+				auto* dump=new ProcessFieldsFD(fdtd.Interface()); dumps.push_back(dump);
+				dump->SetFileName("fd_cylinder_"+std::to_string(multigrid)+mode+std::to_string(interpolation)+std::to_string(field));
+				dump->SetFileType(ProcessFields::HDF5_FILETYPE);
+				dump->SetDumpType(field ? ProcessFields::H_FIELD_DUMP : ProcessFields::E_FIELD_DUMP);
+				dump->SetDualTime(field!=0); dump->SetDualMesh(field!=0); dump->SetFDOverSampling(100); dump->AddFrequency(20e9);
+				dump->SetDumpMode(static_cast<Engine_Interface_Base::InterpolationType>(interpolation));
+				double start[]={0,-M_PI,0},stop[]={20,M_PI,20}; dump->DefineStartStopCoord(start,stop);
+				fdtd.GetProcessings()->AddProcessing(dump);
+			}
+			gpu->SetVolt(2,15,8,4,0.125f); gpu->SetCurr(1,15,8,4,0.01f);
+			fdtd.RunFDTD();
+			TEST_ASSERT(gpu->GetNumberOfTimesteps()==17,"Cylindrical FD fallback changed simulation length");
+			TEST_ASSERT(gpu->GetProfile().fdAccumulatorBytes==0 && gpu->GetProfile().fdSamples==0,
+			            "Unsupported cylindrical FD dumps allocated GPU accumulators");
+			for (unsigned int field=0; field<dumps.size(); ++field) {
+				TEST_ASSERT(!dumps[field]->UsesDeviceFields() && dumps[field]->GetFDSampleCount()==18,"Cylindrical FD CPU fallback lost samples");
+				const auto actual=TestFDDump::Values(dumps[field],0);
+				if (mode=="cpu") reference[field]=actual;
+				else {
+					float peak=0,error=0;
+					TEST_ASSERT(FDSpectrumError(reference[field],actual,peak,error) && peak>0 && error<=peak*0.001f+1e-18f,
+					            "Cylindrical FD CPU fallback changed complex spectra");
+				}
+			}
+		}
+	}
 	return true;
 #endif
 }
@@ -3396,6 +3539,8 @@ int main(int argc, char* argv[])
 	if (argc>1 && std::string(argv[1])=="--field-accumulation-tests") {
 		RUN_TEST(Test_FDSpectrumValidation);
 		RUN_TEST(Test_Vulkan_FieldAccumulation);
+		RUN_TEST(Test_Vulkan_FDMemoryFallback);
+		RUN_TEST(Test_Vulkan_FDCylindricalFallback);
 		RUN_TEST(Test_Vulkan_FDInterruption);
 		return tests_failed ? 1 : 0;
 	}
@@ -3509,6 +3654,8 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_SynchronizationDependencies);
 	RUN_TEST(Test_FDSpectrumValidation);
 	RUN_TEST(Test_Vulkan_FieldAccumulation);
+	RUN_TEST(Test_Vulkan_FDMemoryFallback);
+	RUN_TEST(Test_Vulkan_FDCylindricalFallback);
 	RUN_TEST(Test_Vulkan_FDInterruption);
 	RUN_TEST(Test_Vulkan_SynchronizationMultigrid);
 	RUN_TEST(Test_Vulkan_EnergyReduction);
