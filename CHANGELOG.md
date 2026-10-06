@@ -150,6 +150,8 @@ number moved up and patch releases now have somewhere to go.
 
 ### Fixed
 
+- Reject Vulkan FD registration after CPU accumulation has started, preserving
+  the existing spectrum and leaving all registrations unchanged on rejection.
 - Order Vulkan probe-history reads before the next timestep's field writes.
   The synchronization audit also adds opt-in Khronos validation tests and
   barrier/dispatch profiling for extension and multigrid workloads.

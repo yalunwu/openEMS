@@ -330,6 +330,13 @@ bool EngineVulkan::RegisterFieldDumps(ProcessingArray* pa, bool enabled)
 		const auto active=dump->active.lock();
 		if (active && *active && dump->processing->m_FD_SampleCount) return false;
 	}
+	// Validate every candidate before releasing or allocating any registration.
+	if (enabled && pa)
+		for (size_t i=0; i<pa->GetNumberOfProcessings(); ++i) {
+			auto* processing=dynamic_cast<ProcessFieldsFD*>(pa->GetProcessing(i));
+			if (processing && processing->GetEnable() && SupportsFDDump(processing) &&
+			    processing->m_FD_SampleCount) return false;
+		}
 	DestroyFieldDumps();
 	if (!enabled || !pa) return true;
 	for (size_t i=0; i<pa->GetNumberOfProcessings(); ++i) {

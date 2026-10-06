@@ -3048,6 +3048,38 @@ public:
 	}
 };
 
+static bool FDSpectrumError(const std::vector<std::complex<float>>& expected,
+                            const std::vector<std::complex<float>>& actual,
+                            float& peak, float& error)
+{
+	peak=error=0;
+	if (expected.size()!=actual.size()) return false;
+	for (size_t i=0; i<expected.size(); ++i) {
+		if (!std::isfinite(expected[i].real()) || !std::isfinite(expected[i].imag()) ||
+		    !std::isfinite(actual[i].real()) || !std::isfinite(actual[i].imag())) return false;
+		const float magnitude=std::abs(expected[i]), difference=std::abs(expected[i]-actual[i]);
+		if (!std::isfinite(magnitude) || !std::isfinite(difference)) return false;
+		peak=std::max(peak,magnitude); error=std::max(error,difference);
+	}
+	return true;
+}
+
+bool Test_FDSpectrumValidation()
+{
+	const std::vector<std::complex<float>> finite={{1,0},{0,2}};
+	float peak=0,error=0;
+	TEST_ASSERT(FDSpectrumError(finite,finite,peak,error) && peak==2 && error==0,"Finite FD spectra were rejected");
+	for (float value : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+	                    -std::numeric_limits<float>::infinity()})
+	for (bool imaginary : {false,true}) {
+		auto invalid=finite;
+		invalid[1]=imaginary ? std::complex<float>(0,value) : std::complex<float>(value,2);
+		TEST_ASSERT(!FDSpectrumError(finite,invalid,peak,error),"Non-finite GPU FD value was ignored");
+		TEST_ASSERT(!FDSpectrumError(invalid,finite,peak,error),"Non-finite reference FD value was ignored");
+	}
+	return true;
+}
+
 bool Test_Vulkan_FieldAccumulation()
 {
 #ifndef ENABLE_VULKAN
@@ -3096,6 +3128,22 @@ bool Test_Vulkan_FieldAccumulation()
 		TEST_ASSERT(reference.IterateTS(1) && reference.SyncFieldsToHost(),"FD reference stepping failed");
 		fdtd.GetEng()->SetNumberOfTimesteps(ts); cpuProcessing.Process();
 	}
+	{
+		const auto prefix=TestFDDump::Values(cpuDumps[0],0);
+		const unsigned int samples=cpuDumps[0]->GetFDSampleCount();
+		ProcessingArray mixedProcessing(100);
+		mixedProcessing.AddProcessing(gpuDumps[0]);
+		mixedProcessing.AddProcessing(cpuDumps[0]);
+		TEST_ASSERT(!gpu.RegisterFieldDumps(&mixedProcessing,true),"FD registration accepted a CPU-accumulated prefix");
+		TEST_ASSERT(!gpuDumps[0]->UsesDeviceFields() && gpuDumps[0]->GetFDSampleCount()==0 &&
+		            !cpuDumps[0]->UsesDeviceFields() && cpuDumps[0]->GetFDSampleCount()==samples,
+		            "Rejected FD registration changed processing state");
+		const auto registration=gpu.GetProfile();
+		TEST_ASSERT(registration.fdAccumulatorBytes==0 && registration.fdMappingBytes==0 && gpu.GetNumberOfTimesteps()==0,
+		            "Rejected FD registration retained resources or advanced timesteps");
+		TEST_ASSERT(gpu.FinalizeFieldDumps() && TestFDDump::Values(cpuDumps[0],0)==prefix,
+		            "Rejected FD registration changed CPU sums");
+	}
 	TEST_ASSERT(gpu.SetProfilingEnabled(true),"Could not profile FD accumulation");
 	gpu.m_fdChunkBytes=4096;
 	TEST_ASSERT(gpu.RegisterFieldDumps(&deviceProcessing,true),"FD registration failed");
@@ -3109,7 +3157,7 @@ bool Test_Vulkan_FieldAccumulation()
 		for (unsigned int frequency=0; frequency<2; ++frequency) {
 			const auto expected=TestFDDump::Values(cpuDumps[field],frequency), actual=TestFDDump::Values(gpuDumps[field],frequency);
 			float peak=0,error=0;
-			for (size_t i=0; i<expected.size(); ++i) { peak=std::max(peak,std::abs(expected[i])); error=std::max(error,std::abs(expected[i]-actual[i])); }
+			TEST_ASSERT(FDSpectrumError(expected,actual,peak,error),"FD spectra are non-finite or have different sizes");
 			std::cout << "FD field=" << field << " frequency=" << frequency << " peak=" << peak << " error=" << error << std::endl;
 			TEST_ASSERT(peak>0 && error<=peak*0.001f+1e-18f,"FD complex tolerance exceeded");
 		}
@@ -3133,7 +3181,7 @@ bool Test_Vulkan_FieldAccumulation()
 	for (unsigned int field=0; field<gpuDumps.size(); ++field) {
 		const auto expected=TestFDDump::Values(cpuDumps[field],0), actual=TestFDDump::Values(gpuDumps[field],0);
 		float peak=0,error=0;
-		for (size_t i=0; i<expected.size(); ++i) { peak=std::max(peak,std::abs(expected[i])); error=std::max(error,std::abs(expected[i]-actual[i])); }
+		TEST_ASSERT(FDSpectrumError(expected,actual,peak,error),"Reused FD spectra are non-finite or have different sizes");
 		TEST_ASSERT(error<=peak*0.001f+1e-18f,"FD reused run differs from fresh run");
 	}
 	deviceProcessing.InitAll();
@@ -3211,7 +3259,7 @@ bool Test_Vulkan_FDInterruption()
 			if(mode=="cpu") reference[field]=actual;
 			else {
 				float peak=0,error=0;
-				for(size_t i=0;i<actual.size();++i) { peak=std::max(peak,std::abs(reference[field][i])); error=std::max(error,std::abs(actual[i]-reference[field][i])); }
+				TEST_ASSERT(FDSpectrumError(reference[field],actual,peak,error),"Interrupted FD spectra are non-finite or have different sizes");
 				TEST_ASSERT(peak>0 && error<=peak*0.001f+1e-18f,"Graceful abort spectra differ");
 			}
 		}
@@ -3346,6 +3394,7 @@ int main(int argc, char* argv[])
 		return tests_failed ? 1 : 0;
 	}
 	if (argc>1 && std::string(argv[1])=="--field-accumulation-tests") {
+		RUN_TEST(Test_FDSpectrumValidation);
 		RUN_TEST(Test_Vulkan_FieldAccumulation);
 		RUN_TEST(Test_Vulkan_FDInterruption);
 		return tests_failed ? 1 : 0;
@@ -3458,6 +3507,7 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_ProbeHistory);
 	RUN_TEST(Test_Vulkan_BatchingAndProfiling);
 	RUN_TEST(Test_Vulkan_SynchronizationDependencies);
+	RUN_TEST(Test_FDSpectrumValidation);
 	RUN_TEST(Test_Vulkan_FieldAccumulation);
 	RUN_TEST(Test_Vulkan_FDInterruption);
 	RUN_TEST(Test_Vulkan_SynchronizationMultigrid);

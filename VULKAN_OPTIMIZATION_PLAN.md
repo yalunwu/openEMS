@@ -8,9 +8,11 @@ Phases 3 and 5 are cancelled. Phase 6a and the first measured Phase 6b delivery
 are implemented locally on 2026-10-05: the dependency audit, probe-history
 synchronization fix, profiling and independent dispersive pre-pass fusion.
 Duplicate-barrier coalescing remains opt-in because throughput results were
-inconsistent. See `VULKAN_PHASE06_AUDIT.md` and `VULKAN_PHASE06_VALIDATION.md`.
+inconsistent. See the [synchronization dependencies](VULKAN_PERFORMANCE.md#synchronization-dependencies)
+and [recorded measurements](VULKAN_PERFORMANCE.md#recorded-validation-and-measurements).
 Phase 7 is implemented locally, opt-in, with native/node/cell Cartesian E/H
-accumulation and FD NF2FF validation; see `VULKAN_PHASE07_VALIDATION.md`.
+accumulation and FD NF2FF validation; see the
+[recorded measurements](VULKAN_PERFORMANCE.md#recorded-validation-and-measurements).
 Further Phase 6b candidates and Phases 8-10 remain proposed. The
 2026-10-05 review keeps field accumulation (7) first for the reported workload,
 including NF2FF surface validation formerly listed as 10b. GPU energy (8a)
@@ -246,9 +248,9 @@ direct-load shaders. This work is outside the remaining implementation roadmap.
 
 ## Phase 6a: audit extension and synchronization dependencies
 
-Implemented locally, 2026-10-05. The separate dependency map is in
-`VULKAN_PHASE06_AUDIT.md`; baseline findings, numerical/validation coverage and
-dispatch/barrier measurements are in `VULKAN_PHASE06_VALIDATION.md`.
+Implemented locally, 2026-10-05. The dependency invariants, numerical/validation
+coverage and dispatch/barrier measurements are recorded in
+[Vulkan performance](VULKAN_PERFORMANCE.md#synchronization-dependencies).
 
 Build a dependency map for each supported extension phase and multigrid transfer,
 recording buffer reads/writes, overlapping points, face ordering, extension
@@ -572,7 +574,8 @@ cancelled. Delivery status and remaining work are:
 1. Phase 7 delivered: opt-in native/node/cell Cartesian E/H accumulation,
    per-dump memory budgeting and CPU fallback, with NF2FF surface/far-field
    validation. Further devices and automatic performance selection remain
-   measurements to collect; see `VULKAN_PHASE07_VALIDATION.md`.
+   measurements to collect; see the
+   [recorded measurements](VULKAN_PERFORMANCE.md#recorded-validation-and-measurements).
 2. Phase 8a: retain GPU cylindrical/multigrid energy as planned work; measure
    default, exact-endcriteria and steady-state check costs and preserve the
    existing projected-root metric and stopping decisions.

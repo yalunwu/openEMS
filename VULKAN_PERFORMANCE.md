@@ -91,7 +91,8 @@ overhead and is not an isolated hardware barrier latency. Consecutive identical
 compute barriers can be coalesced without changing dispatch or extension order,
 but this candidate is disabled by default because local throughput measurements
 did not show a consistent benefit.
-The dependency proof is in `VULKAN_PHASE06_AUDIT.md`.
+See [Synchronization dependencies](#synchronization-dependencies) for the
+recording invariants and their validation.
 GPU timing instrumentation itself can alter scheduling; use profiling-disabled
 runs for speed comparisons. Unsupported timestamps retain CPU diagnostics.
 
@@ -152,6 +153,9 @@ This is an opt-in resource policy, not an automatic performance selector.
 Changing registered frequencies or interpolation requires reset and
 reinitialization; stepping rejects an inconsistent registration. Reset also
 clears FD sums and sample counters. Re-registration refuses to discard live sums.
+Enabling GPU accumulation also rejects a supported dump with a CPU-accumulated
+prefix. All candidates are checked before changing any registration; reset and
+reinitialize processing before selecting a different accumulation path.
 
 Profiling adds `fd_samples` (sum of per-dump samples), `fd_dispatches`,
 `fd_accumulator_bytes`, `fd_mapping_bytes`, `fd_phase_bytes` (mapped host writes),
@@ -177,8 +181,10 @@ test_backend --vulkan-benchmark --case=fd-volume --fd=gpu --fd-frequencies=5 --f
 `--fd-dump-mode=0|1|2` selects interpolation. Outputs use the
 `vulkan_benchmark_fd_cpu_*` and `vulkan_benchmark_fd_gpu_*` prefixes. Run in a
 scratch directory and compare complex files before interpreting timings.
-`--field-accumulation-tests` covers partitioning, reset/reuse, allocation fallback
-and graceful interruption. The Python and Octave tests exercise scripting and
+`--field-accumulation-tests` covers partitioning, reset/reuse, allocation fallback,
+registration rejection and graceful interruption. Its spectrum comparisons reject
+NaN and infinity in either complex component before applying the 0.1% tolerance.
+The Python and Octave tests exercise scripting and
 file/NF2FF compatibility. The independent synchronization check is:
 
 ```text
@@ -187,8 +193,9 @@ cmake -DBACKEND_EXECUTABLE=/absolute/path/to/test_backend -DTEST_ARGUMENT=--fiel
 
 `--fd-phase-benchmark` evaluates an experimental batched GLSL sine/cosine
 generator against the CPU factors, including large timestep offsets. It does
-not select a runtime implementation. See `VULKAN_PHASE07_VALIDATION.md` for
-accuracy, phase-generation and end-to-end measurements and their limits.
+not select a runtime implementation. See
+[Recorded validation and measurements](#recorded-validation-and-measurements)
+for accuracy, phase-generation and end-to-end measurements and their limits.
 
 ## Coefficient storage
 
@@ -287,7 +294,9 @@ instead of the default combined dispatch. The combined dispatch uses the existin
 over disjoint state records and falls back to separate passes when the device's
 workgroup limit requires it. Apply passes retain their order and barriers.
 CSVs report both switches, barriers, coalesced barriers, dispatch categories and
-sampled barrier timestamps. See `VULKAN_PHASE06_VALIDATION.md` for results.
+sampled barrier timestamps. See
+[Recorded validation and measurements](#recorded-validation-and-measurements)
+for results.
 
 `test_backend --synchronization-tests` compares CPU/reference/coalesced/fused fields
 with intersecting Mur/PML/local boundaries, multiple TFSF faces, overlapping
@@ -311,7 +320,8 @@ enabled. `SHADER_HEURISTIC=1` enables supplemental shader-access analysis;
 use `TEST_ARGUMENT=--synchronization-shader-tests` for boundaries, Debye, RLC,
 probe history and multigrid, or `--batching-tests` for a shorter check. The shared
 Lorentz shader produces known false positives under that heuristic because
-it cannot distinguish runtime modes or disjoint state ranges (see the audit).
+it cannot distinguish runtime modes or disjoint state ranges (see
+[Synchronization dependencies](#synchronization-dependencies)).
 Host accesses and individual shader invocations still need manual/numerical
 verification. Performance runs must disable validation.
 
@@ -321,6 +331,88 @@ field agreement, reset, anisotropic lossy nonuniform meshes, PEC/PMC, PML, Debye
 and cylindrical multigrid. Benchmark CSV coefficient columns describe the root
 level; initialization diagnostics include every level. Phase 4 measurements are
 recorded in `VULKAN_PHASE04_VALIDATION.md`.
+
+## Synchronization dependencies
+
+The Phase 6 changes retain extension priorities, ordered apply passes and
+multigrid transfers. The two recording optimizations have narrower invariants:
+
+- Duplicate-barrier coalescing removes only identical compute-to-compute memory
+  barriers with shader-write sources and shader-read/write destinations. Only
+  bindings, push constants and profiling timestamps may intervene. Dispatch,
+  buffer-copy and command-buffer begin invalidate the coalescing state. Barriers
+  involving transfer or host access are retained.
+- The combined Lorentz/conducting-sheet pre dispatch reads fields and updates
+  one independent state record per invocation. Different poles may read the same
+  field position without sharing state. Apply mode writes those positions, so
+  apply passes keep their original order and barriers. If the combined dispatch
+  exceeds the device's workgroup limit, the original pre passes are used.
+
+| Producer and consumer | Required dependency |
+|---|---|
+| Voltage/current updates, Mur, PML, RLC, Debye, TFSF and local boundary corrections | Compute shader-write to shader-read/write barriers preserve field and extension-state dependencies in priority order. Overlapping face/pole apply passes remain ordered. |
+| Child/root multigrid updates and interpolation/projection | Compute barriers publish each phase and transfer before the next level or timestep consumes it. |
+| Field updates to probe gather | Shader/transfer writes are made visible to the gather. The gather's trailing barrier both publishes results to the host and orders its field reads before subsequent compute writes; the latter is an execution dependency. |
+| Initial FD sum fill and completed fields to FD accumulation | Transfer/compute writes become visible to accumulation. Its trailing compute barrier publishes sums and orders field reads before the next timestep overwrites them. Separate chunks and dumps write disjoint sums. |
+| Device sums/fields to final readback | Compute/transfer writes become visible to transfer reads; transfer writes become visible to host reads, followed by a fence wait before copying mapped results. |
+| CPU phase factors to FD dispatch | Host-coherent phase memory is written after the previous fence wait and before submission. A batch never overwrites phase slots still in use. |
+
+`--synchronization-tests` exercises intersecting boundaries, overlapping
+electric/magnetic poles, excitation/RLC priority, probe history and nested
+multigrid against CPU and separate-pass references. It also forces dispatch-limit
+fallback. `--field-accumulation-tests` validates FD mapping, chunking and lifecycle
+independently. Standard synchronization validation checks recorded dependencies;
+the optional shader heuristic cannot distinguish the shared dispersive shader's
+pre/apply branches or disjoint state records. Numerical checks and the access
+invariants above remain necessary for those cases and for host memory access.
+
+## Recorded validation and measurements
+
+Local measurements recorded on 2026-10-05 used Windows, a MinGW Release build,
+an RTX 3070 with 8 GiB VRAM and NVIDIA driver 591.74. They are historical results,
+not measurements of the later registration/test fixes. Profiling and validation
+were disabled for throughput comparisons; instrumented runs checked counters
+separately. The focused native FD tests passed in both MinGW and MSVC builds.
+Recorded Python/Octave runs covered FD file formats, interpolation and NF2FF.
+Those binding results require rebuilding the matching CSXCAD and openEMS modules.
+
+Two five-repeat dispersive comparisons used batch size 32 and 2,048 timesteps.
+The ranges below are the two rounds' median total stepping times:
+
+| Case | Separate pre passes, ms | Combined pre dispatch, ms |
+|---|---:|---:|
+| Lorentz, 25 cubed | 54.772-56.318 | 52.805-52.860 |
+| Lorentz, 49 cubed | 165.498-170.069 | 163.459-166.086 |
+| Conducting sheet, 25 cubed | 48.306-49.934 | 48.305-55.710 |
+
+Separate 256-timestep profile runs reduced total dispatches from 2,304 to 1,792
+for the Lorentz fixtures and from 1,792 to 1,536 for the sheet, retaining 2,056
+and 1,800 barriers respectively. The sheet timing varied between rounds. Duplicate-barrier
+coalescing also gave mixed throughput results, including slower Lorentz/RLC runs;
+it remains disabled by default. Dispatch reduction alone is not a speed claim.
+
+The FD sweep compared 22 CPU/GPU output pairs across volumes, planes and lines,
+one to five frequencies, and Nyquist/every-step sampling. All complex fields and
+meshes passed; the largest peak-relative complex error was 8.78e-8 against a
+0.001 tolerance. A separate three-repeat confirmation of a 65-cubed volume,
+five frequencies, 257 timesteps, every-step sampling and batch size 64 gave
+median solver-output times of 8.881 s for CPU accumulation and 0.546 s for GPU
+accumulation. Those times include finalization and file writing but exclude setup.
+Sparse outputs can be slower on the GPU, so accumulation remains opt-in.
+
+The 217-cubed five-frequency E/H case needed 2,452,395,120 sum bytes and 20 sum
+chunks plus the shared 16 MiB readback buffer. Every-step solver-output medians
+were 99.900 s CPU and 30.778 s GPU for 65 timesteps; HDF5 output was a substantial
+part of GPU runtime. These results do not establish performance on smaller-VRAM
+devices, including the unmeasured RTX 2060 workload.
+
+The experimental GLSL phase generator reached relative errors of 0.0084-0.0175
+at timestep offset 100,000 and about 2 at offset 100,000,000. The runtime therefore
+retains the CPU `std::exp` phase factors. Reproduce accuracy/lifecycle checks with
+`--field-accumulation-tests`, dependencies with `--synchronization-tests` and the
+validation wrapper above, and timings with the explicit benchmark cases and
+reference switches in this document. Run benchmark modes separately from other
+GPU tests and compare their output files before interpreting performance.
 
 ## References
 
