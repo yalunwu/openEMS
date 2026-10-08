@@ -4,26 +4,34 @@ Status as of 2026-10-07:
 
 | Phase | Delivery status |
 |---|---|
-| 0 | Profiling and reference benchmarks implemented. |
+| 0 | Core profiling and benchmarks implemented; timing breakdown and convergence fixtures need extension. |
 | 1 | Timestep batching implemented. |
 | 2 | Probe gathering/history and basic Cartesian GPU energy implemented. |
 | 3 | Workgroup tuning cancelled. |
 | 4 | Exact coefficient palettes implemented, opt-in; dense remains the default. |
 | 5 | Stencil-load tuning cancelled. |
 | 6a | Extension and synchronization audit implemented. |
-| 6b | First delivery implemented; command-buffer reuse and projection fusion remain candidates. |
+| 6b | First delivery implemented; command reuse, recording overlap and projection fusion remain candidates. |
 | 7 | Cartesian FD E/H accumulation implemented, opt-in, including FD NF2FF recording. |
-| 8a | Proposed; recommended next implementation: cylindrical/multigrid GPU energy. |
+| 7 follow-ups | Proposed; measure final-readback pipelining and host-result memory lifetime separately. |
+| 8 prerequisite | Next delivery: define convergence snapshots, validate detector traces and measure check costs. |
+| 8a | Proposed; select cylindrical/multigrid GPU energy by measured check cost or capability demand. |
 | 8b | Proposed; measure steady-state overhead before selecting execution changes. |
-| 9 | Proposed; compare CPU and GPU probe integration/spectra. |
+| 9 | Proposed; separate compact integration, GPU spectra and final-only output deliveries. |
 | 10a | Proposed; compact waveguide mode processing. |
 | 10b | Folded into Phase 7's FD NF2FF integration and validation. |
-| 10c | Proposed; SAR frequency accumulation. |
+| 10c | Proposed; begin with supported Cartesian cell-conductivity SAR accumulation. |
 
 See [Vulkan performance](VULKAN_PERFORMANCE.md) for options, test commands,
 [synchronization dependencies](VULKAN_PERFORMANCE.md#synchronization-dependencies)
 and [recorded measurements](VULKAN_PERFORMANCE.md#recorded-validation-and-measurements).
 The measurements are historical RTX 3070 results, not portable speedup claims.
+"Implemented" describes code delivery, not a fresh validation of the current
+revision. Track correctness results, measured benefit and hardware coverage
+separately under [Release and acceptance](#release-and-acceptance). The convergence
+phase audit below is unresolved; this plan does not establish CPU/Vulkan detector
+equivalence. Earlier standalone Phase 1/2/4 validation notes are absent from this
+checkout; use retained evidence and mark missing measurements as unverified.
 
 ## Objective and scope
 
@@ -65,12 +73,20 @@ cross-vendor validation is required before claiming portable performance gains.
 
 ## Next priorities
 
-1. **Phase 8a:** extend GPU energy to cylindrical/multigrid models. Measure check
-   costs and preserve the existing stopping metric and decision boundaries.
-2. **Phase 8b:** measure steady-state replay and period comparisons, then select
-   CPU batching improvements or GPU processing only where they help.
-3. **Phases 9, 10a and 10c:** choose by actual probe, mode-port and SAR usage.
-   Compare compact CPU processing with GPU arithmetic before selecting execution.
+1. **Convergence contract:** define the reference voltage/current phases,
+   projection state and timestep mapping; compare CPU/Vulkan detector traces.
+   Resolve discrepancies in a separate correctness change before optimization.
+2. **Measurement extension:** separate convergence, stepping, finalization and
+   file-writing costs; add cylindrical/multigrid solver cases with energy checks.
+3. **Select one candidate:** publish measured cost fractions and choose among
+   Phase 6b recording changes, Phase 7 finalization/memory work, Phase 8a energy,
+   Phase 8b CPU replay, Phase 9 compact probes, Phase 10a modes and Phase 10c SAR.
+   Include capability demand, memory limits, implementation effort and validation
+   cost; Phase 8a has no automatic priority after the prerequisite.
+4. **Prototype, decide, then remeasure:** keep accepted changes independently
+   reviewable and select the next candidate from the resulting workload profile.
+   GPU probe spectra, final-only output and SAR J accumulation remain separately
+   gated follow-ups to their initial deliveries.
 
 Phase 8a closes a capability gap for cylindrical/multigrid models; it does not
 accelerate basic Cartesian energy, which already runs on the GPU. For large
@@ -80,10 +96,21 @@ before selecting more work: output was substantial in the recorded 217-cubed run
 Phase 6b command-buffer reuse is a separate prototype for workloads with material
 recording overhead, particularly small grids and multigrid. Projection fusion is
 lower priority until projection costs justify it. Phases 8-10 do not depend on
-these candidates. Phase 8b needs the validated energy path for its target geometry;
-mode gathering need not wait for Phase 9, and SAR builds on Phase 7.
+these candidates. Phase 8b needs a validated energy path for its target geometry;
+the CPU reference remains valid, so replay work need not wait for Phase 8a's GPU
+implementation. Mode gathering need not wait for Phase 9. SAR can reuse Phase 7
+infrastructure but requires its own processing integration and resource policy.
 
-## Phase 0: measurement and reference results (implemented)
+Before each prototype, record the target workloads, measured baseline, removable
+cost or memory requirement, expected benefit, numerical/resource limits, bounded
+effort and a review milestone. Stop or defer it if correctness requires relaxed
+semantics, resource use exceeds the agreed budget, or repeated measurements fail
+to show the intended benefit beyond variation. A memory/capability delivery may
+instead meet a stated capacity requirement without unacceptable runtime regression.
+Document that outcome separately. Recording share alone is not a universal cutoff;
+do not assign priorities from assumed model prevalence or unmeasured transfer costs.
+
+## Phase 0: measurement and reference results (core implemented; extension next)
 
 Opt-in profiling records CPU recording, submission, fence waiting, readback and
 mirror costs, plus submission/dispatch counts and transferred bytes. GPU queries
@@ -103,6 +130,38 @@ nonuniform meshes, PML, dispersive materials, cylindrical grids, and one/two/fiv
 multigrid levels. Exercise no-output, probes, field dumps and steady-state runs.
 Use fixed timesteps for throughput and deterministic energy schedules for
 end-criteria comparisons. Confirm that Vulkan execution did not fall back.
+
+### Required measurement extension
+
+The harness times solver setup separately. Output-case `iteration_s` wraps all
+of `RunFDTD()`, including processing initialization/FD registration, final field
+synchronization, FD finalization and file writing; its subsequent
+`synchronization_s` does not isolate these costs. Add separate timings for solver
+and processing setup, stepping, field download/mirroring, energy checks, detector
+replay/comparison, FD finalization and file writing. State which timers overlap;
+do not add nested CPU timings or sampled GPU categories to derive total runtime.
+Retain an
+uninstrumented end-to-end measurement as the performance acceptance result.
+
+Extend the existing transfer-byte counters with check counts and fallback reasons.
+For FD finalization, distinguish device copies, fence waits, host copies and file
+serialization/writes. A benchmark-only null sink may help isolate output costs,
+but must preserve sampling, accumulation and final readback, and state which
+serialization work it omits. It is a diagnostic; acceptance still compares real
+output files and end-to-end runs with matching processing schedules.
+
+Add cylindrical and one/two/five-level multigrid solver fixtures that actually
+execute convergence checks; existing direct-stepping cases are insufficient.
+Include default wall-clock checks, exact-endcriteria and steady-state periods,
+with and without other full-field consumers. Count checks, readback bytes and
+fallbacks by reason. Vary probe counts, period lengths and output intervals.
+
+Keep fixed-step throughput, deterministic stopping and wall-clock stopping as
+separate experiments. Faster execution can move a wall-clock check to another
+timestep, so identical stop timesteps are not its acceptance criterion. For each
+candidate, report the measured fraction of runtime it can remove and the expected
+end-to-end benefit. A capability improvement may still be useful with little
+speedup; label that outcome explicitly and reconsider performance priority.
 
 ## Phase 1: batch timesteps into fewer submissions (implemented)
 
@@ -136,6 +195,12 @@ field mirror valid.
 Probe decoding, integrals and interpolation remain on the CPU. The registry
 deduplicates points. Processing that needs full fields or another hierarchy level
 retains its reference path; scheduling-aware subsets require measured benefit.
+
+Retain checked sizes, device buffer limits and history-growth allocation fallback.
+Measure total history bytes by registered point count and batch capacity, including
+point metadata; account for two-period CPU detector records separately. Apply a
+workload-aware byte budget if measurements justify one; 64 frames alone is not a
+total-memory budget. Preserve sampling through the reference path on fallback.
 
 Regression requirements: voltage/current integrals, field/steady-state probes,
 repeat syncs, field edits, mixed sampling intervals and multigrid output. Verify
@@ -213,11 +278,26 @@ separate future candidates; see the Phase 6 audit and measurement record.
 
 Remaining candidates:
 
-- **Command-buffer reuse:** pre-record batch commands and read the timestep from
-  device memory. Evaluate full batches, tails, history gathering and FD sample
-  schedules, including reset/re-registration invalidation. Prototype two command
-  buffers with independent fences only if reuse is not feasible. Prioritize this
-  work where recording consumes a material share of runtime.
+- **Command-buffer reuse:** first prototype fixed full batches with a stable
+  command sequence and no scheduled FD/history consumers. Supply changing
+  timesteps through device memory and retain rerecording for unsupported cases.
+  Then evaluate tails, history/projection placement and FD schedules. Moving the
+  timestep alone is insufficient: FD eligibility changes recorded dispatches,
+  and sample counters currently advance during recording. Define per-submission
+  bookkeeping, phase-buffer ownership and bounded recording variants before
+  extending reuse. Invalidate recordings on relevant batch, registration,
+  schedule, profiling, pipeline, buffer or descriptor changes and reset. Use
+  reusable command-buffer flags, preserve resource lifetimes and wait before
+  modifying in-flight resources. Prioritize material recording overhead.
+- **Recording/execution overlap:** independently prototype two command buffers
+  with separate fences and safe per-submission data to overlap CPU recording
+  with GPU execution. This addresses a different cost from reuse and is not
+  conditional on reuse failing. Preserve field dependencies and stopping bounds;
+  measure each candidate separately before considering a combination. Compare
+  recording and execution durations: ideal overlap changes their sum toward the
+  larger duration, so recording longer than execution remains a bottleneck.
+  Include phase/history buffer ownership, replay and decision-boundary waits in
+  the design and measurements; two command buffers alone do not remove those costs.
 - **Hierarchy projection fusion:** measure projection separately from hierarchy
   updates/transfers. Ordinary stepping projects at the caller's interval end;
   history recording projects every step. Select fusion only where it saves enough
@@ -282,6 +362,13 @@ dump. Both fields over 10 million output points need approximately 480 MB
 coefficients, extensions, mapping, phases and staging. Output point counts can
 differ from solver cell counts; allocate only the requested regions.
 
+Budget host memory separately: `ProcessFieldsFD::InitProcess()` allocates complete
+CPU result arrays before GPU registration, and those arrays remain alongside
+device sums. Include host field mirrors, processing arrays and writer temporaries
+in peak RAM measurements, as well as device allocations in peak VRAM. Bounded
+readback staging does not bound either total. Account for simultaneous FD/SAR
+outputs when extending the accumulator; reducing host residency is separate work.
+
 Check size arithmetic, device buffer/allocation limits and available memory
 before enabling a dump. Use driver heap budgets when available; otherwise cap
 cumulative actual FD allocations by heap, including mappings, phases, all sum
@@ -305,6 +392,34 @@ Report actual FD sample intervals and accumulator traffic: for B
 bytes of sums sampled every I timesteps, read/write traffic is about 2B/I bytes
 per timestep, plus field/mapping reads. The five-frequency example adds about
 4.8 GB per sample; the sample interval determines the per-timestep cost.
+
+### Conditional finalization and host-memory experiments
+
+Select these independently from Phase 0's finalization timings and peak-memory
+measurements; neither is a required precursor to unrelated optimization work.
+
+- **Pipelined final readback:** the current path copies a bounded device chunk,
+  waits, then copies staging data into the CPU result array. Compare bounded
+  staging sizes and a two-buffer pipeline that overlaps a subsequent device copy
+  with the preceding host copy. Give each in-flight slot safe command/fence
+  ownership; never read before completion or reuse staging before its host copy
+  finishes. Count both buffers in allocation policy, retain single-buffer fallback
+  on optional allocation failure, and preserve errors and output equivalence.
+  Accept only a measured finalization and end-to-end benefit. This is separate
+  from Phase 6b's overlap of timestep recording with GPU execution.
+- **Deferred host allocation:** measure memory lifetimes before moving result
+  allocation to finalization. Delaying all allocations can lower stepping-time
+  residency without lowering peak RAM, and can move allocation failure to the end
+  of a long run. Define result ownership and late-failure behavior while preserving
+  CPU accumulation fallback, registration checks and reset/reuse. Claim peak-memory
+  improvement only when measurements include finalization and writing.
+- **Bounded-memory output:** separately evaluate streaming completed results to
+  writers or materializing/releasing smaller result units. Specify the supported
+  HDF5, legacy HDF5 and VTK paths, writer temporaries, format compatibility and
+  processing-object lifetime. Preserve the current materialized reference where
+  needed. Budget host RAM and device heaps separately; reducing CPU result storage
+  does not make oversized device accumulators fit. Accept a demonstrated capacity
+  improvement under the prototype's runtime and compatibility limits.
 
 ### Regression requirements and remaining measurements
 
@@ -343,6 +458,42 @@ readbacks. Decide how to handle the remaining steady-state histories/comparisons
 from measurements against existing batched replay. Deliver these separately,
 retain CPU references, and preserve the stopping metric and decision boundaries.
 
+### Prerequisite: define and validate the convergence contract
+
+Before changing reduction or replay, specify the field snapshot for every check:
+voltage phase, current phase, extension ordering, hierarchy projection state and
+logical timestep. The CPU detector runs in `Apply2Voltages()` before the current
+update. Vulkan currently calls it after a complete timestep and adjusts the CPU
+timestep counter; this does not restore the earlier current field. Establish the
+intended snapshot and resolve any discrepancy separately from performance work.
+
+Ordinary processing probes run after stepping; distinguish them from the detector's
+voltage-update hook. Preserve the existing weighted voltage/current stopping metric
+and separate decay (`currE/maxE`) from steady-state period comparisons. Do not adopt
+a full-step snapshot on an assumed negligible phase error. Evaluate an intermediate
+device-side gather/reduction within the existing command buffer, with dependencies
+before field mutation and compact readback at the decision boundary, if required
+to preserve the contract. Audit hierarchy projection and extension ordering; this
+approach does not inherently require a host wait or separate submission per step.
+
+Add CPU/Vulkan detector traces for sampled voltages, electric/magnetic energy,
+projection state, period index, comparison result and stop timestep. Cover basic
+Cartesian, cylindrical and nested multigrid paths. Existing comparisons of GPU
+energy against CPU reduction under Vulkan stepping do not prove CPU-engine sample
+phase equivalence. Record both same-snapshot arithmetic comparisons and independent
+solver traces, using existing field tolerances for the latter.
+
+Define two acceptance levels. Scheduling changes on the same stepping path must
+preserve samples and deterministic stopping decisions. Reduction changes must
+also bound arithmetic disagreement and resolve ambiguous decisions using the
+reference state. Independent CPU/GPU simulations retain their field tolerances;
+do not infer universal stop-step equality at arbitrary thresholds from those
+tolerances. Add explicit near-threshold cases and document their expected decisions.
+
+Completion: the snapshot contract, trace fixtures and numerical acceptance are
+reviewable, any phase correction is validated, and Phase 0's check-cost measurements
+are available. No new GPU convergence capability is claimed by this prerequisite.
+
 ### 8a. Cylindrical and multigrid energy
 
 Extend Phase 2's energy capability to the actual interfaces used by cylindrical
@@ -354,6 +505,24 @@ criterion. Keep projection and reduction on-device and download only compact
 partial sums or the completed estimate. Do not add a new hierarchy masking or
 physical-energy definition to the existing convergence criterion.
 
+First prototype reference-order arithmetic on identical snapshots, including the
+four SSE FP32 lanes for each of electric and magnetic energy and their final
+combination; measure whether it offers useful parallelism. FP64 or a tree reduction
+is not automatically equivalent to that reference. If a faster reduction is needed,
+specify conservative error bounds and reference recovery before implementation.
+Any required projection must follow the snapshot contract for that check type.
+Judge total check cost including avoided readback and mirroring; limited reduction
+parallelism alone does not establish whether the prototype is useful.
+
+Fallback must cover historical state as well as the current estimate: `currE/maxE`
+depends on previous maxima, and steady-state energy uses the previous period.
+Recomputing only current energy cannot repair an uncertain historical value.
+Specify how reference values are retained or recovered, or how bounds propagate
+through the complete decision. Extend the estimate/decision interface if needed
+to expose validity, uncertainty and fallback reason; a boolean plus scalar alone
+does not carry this contract. Keep CPU reduction for configurations where the
+contract cannot be met efficiently; do not silently loosen stopping semantics.
+
 Measure download, CPU mirroring and energy arithmetic under default wall-clock
 checks, exact-endcriteria and steady-state period checks. Four-second polling
 alone establishes no overhead percentage; record actual check costs and their
@@ -362,9 +531,10 @@ share of total runtime. GPU energy remains in scope even without exact-endcriter
 Validate against the current CPU estimate on identical field snapshots, including
 non-multiple-of-four z sizes, closed/open angular domains, one/two/five nested
 levels, lossy decay, zero/subnormal/non-finite fields and near-threshold cases.
-Reduction order can affect stopping: require documented error bounds and the
-same deterministic stopping decisions, with a reference fallback for ambiguous
-cases. Profile any fallbacks rather than counting those runs as GPU-only checks.
+Test thresholds on both sides of, and within, the candidate error bound; include
+uncertain historical maxima and previous-period estimates. Require deterministic
+decisions against the same-snapshot reference under the contract above. Report
+fallback reasons, frequency and cost rather than counting those runs as GPU-only.
 
 Completion: validated cylindrical/multigrid energy checks no longer routinely
 download full fields. Preserve basic Cartesian behavior and benchmark check
@@ -372,10 +542,11 @@ costs separately from stepping, with and without frequent exact-endcriteria.
 
 ### 8b. Measure remaining steady-state overhead, then select execution
 
-Use the current GPU probe-history plus CPU replay path as the baseline. Measure
-submission counts, probe transfers, per-sample replay, period comparisons and
-energy separately across probe counts and period lengths. Do not assume a fixed
-1-4 probes or infer lost GPU batching from the one-step CPU loop.
+Use the GPU probe-history plus CPU replay path validated by the prerequisite as
+the baseline. Measure submission counts, probe transfers, per-sample replay,
+period comparisons and energy separately across probe counts and period lengths.
+Do not assume a fixed 1-4 probes or infer lost GPU batching from the one-step
+CPU loop.
 
 First evaluate processing compact history batches on the CPU with less replay
 overhead. Prototype GPU histories/reductions only if the remaining costs justify
@@ -383,11 +554,11 @@ them. Compare both against the existing path with identical sample/decision
 times; retaining CPU comparisons is an acceptable outcome when faster or when
 GPU gains do not exceed measurement spread.
 
-For either design, preserve `Engine_Ext_SteadyState::ApplyVoltages()` sample
-phase and timestep mapping, two-period warm-up, signal-power eligibility,
-squared-difference ratios, energy comparison and maximum/clamping rules. Reuse
-the validated energy path, including Phase 8a where needed. End batches at the
-original decision boundaries and check convergence before advancing further;
+For either design, preserve the validated detector snapshot and timestep mapping,
+two-period warm-up, signal-power eligibility, squared-difference ratios, energy
+comparison and maximum/clamping rules. Reuse the validated CPU energy path or
+Phase 8a's accepted GPU path. End batches at the original decision boundaries
+and check convergence before advancing further;
 do not overshoot a converged period. Preserve progress and graceful interruption,
 and budget two periods of detector history with checked reset/reuse behavior.
 
@@ -406,6 +577,12 @@ frequency counts. Keep GPU spectra conditional on an end-to-end benefit; avoid
 mandatory offload of tiny workloads. Use the actual direct-DFT/port workflow as
 the reference, not an assumed FFT timing or an unrelated occupancy estimate.
 
+Deliver separately: (1) compact integration and bounded sample readback with
+existing histories and CPU spectra, (2) an optional GPU spectrum prototype while
+histories remain available, and (3) a final-spectra-only mode with its scripting
+and file contract. Each delivery needs its own numerical/performance evidence;
+success of integration does not require shipping either later mode.
+
 For the GPU candidate, extend gathering with voltage line integrals, current
 contour integrals, E/H point conversion and running Fourier sums for frequencies
 specified before the run. Reuse Phase 7's scheduling/phase-factor infrastructure
@@ -414,11 +591,17 @@ Preserve integration signs, mesh/interpolation rules, weighting, E/H time bases
 and independent TD/FD sample intervals. `ProcessIntegral` accumulates complex
 double values, unlike FP32 field dumps: validate precision explicitly and retain
 a reference path where the device cannot meet its numerical requirements. Do
-not silently lower accumulation precision. Floating-point atomics are not
-required by the design; use independent outputs or staged reductions where
-appropriate and measure the actual device's precision/throughput tradeoff.
+not silently lower accumulation precision or reuse Phase 7's FP32 phase factors
+unchanged. Floating-point atomics are not required by the design; use independent
+outputs or staged reductions where appropriate and measure the actual device's
+precision/throughput tradeoff.
 
-Support both existing time histories and an explicit final-spectra-only mode.
+Preserve existing time histories in the first two deliveries. For a final-only mode,
+define frequency matching, spectral metadata, normalization, sample counts,
+missing-frequency errors and graceful-interruption/finalization behavior before
+implementation. Retain histories for later frequency selection and history-based
+processing such as MATLAB autoregressive estimation; do not silently substitute
+stored spectra for these workflows.
 When histories are requested, buffer reduced samples for bounded batch readback
 and preserve their files/timestamps. GPU spectra alone cannot support arbitrary
 frequencies chosen later. Python/MATLAB port post-processing must either consume
@@ -454,6 +637,15 @@ or GPU spectra where justified. Mode weights are already prepared and normalized
 on the CPU at initialization; a GPU candidate uploads them once and needs no GLSL
 parser or mode-file reader.
 
+Define a processing capability for satisfying a sample from compact data while
+CPU arithmetic remains active. Update both `GetNextFullFieldInterval()` and
+`RunFDTD()`'s full-field synchronization decision; registering a gather alone
+leaves mode probes classified as full-field consumers. Keep unsupported probes
+on the reference path and never mark the full host field mirror valid after a
+partial update. Specify component/interpolation footprints, field phases,
+hierarchy levels, sample mapping, checked history byte limits and allocation
+fallback. Add focused scheduling tests with supported and unsupported consumers.
+
 Measure actual surface/component counts and transfer sizes. Preserve template
 normalization, surface area weights, interpolation and both instantaneous
 mode-purity and voltage/current results. The nonlinear purity history cannot be
@@ -463,15 +655,33 @@ modes, origins, port normalization and resulting S-parameters.
 Keep batches bounded by actual CPU consumers and stopping checks; avoid replacing
 full-grid copies with a new synchronous transfer per sample where compact history
 replay suffices. Completion: no whole-domain readbacks for supported mode probes,
-with execution chosen by measured end-to-end benefit.
+apart from final synchronization or another consumer's needs, with equivalent
+overlap/purity histories and execution chosen by measured end-to-end benefit.
 
 ### 10c. SAR frequency accumulation
 
-Accumulate the E and optional J spectra consumed by `ProcessFieldsSAR`, preserving
-cell interpolation, conductivity handling, material assumptions and normalization.
-Validate raw spectra and resulting local/1g/10g SAR against existing tests. Keep
-mass averaging as separate post-processing initially; quantify any later GPU port
-independently.
+First support basic Cartesian, cell-interpolated E accumulation for the existing
+cell-conductivity path. Preserve conductivity, density, material assumptions and
+normalization. Keep unsupported geometry/material configurations and the optional
+J path on CPU initially. Add J accumulation as a separate delivery with its own
+field conversion, conductivity and timing validation.
+
+Integrate with `ProcessFieldsSAR` explicitly: Phase 7's capability check accepts
+the exact `ProcessFieldsFD` class, while SAR owns separate processing and E/J
+result arrays. Define registration, result ownership, sample counts, scheduling,
+reset/reuse and finalization into those arrays; merely relaxing the type check is
+insufficient. Preserve normal completion, convergence, graceful interruption and
+error propagation. Select CPU fallback before the first sample without losing a
+prefix, and keep stepping plus other eligible dumps on the GPU.
+
+Apply checked cumulative memory accounting across simultaneous FD/SAR outputs,
+including host result arrays, device sums, mappings, phases, staging and CPU
+post-processing temporaries. Measure peak RAM/VRAM and allocation fallback.
+Validate raw complex E and, when supported, J spectra before local/1g/10g SAR,
+including material boundaries, zero conductivity, multiple frequencies, mixed
+outputs and lifecycle cases. Keep mass averaging on the CPU initially and report
+accumulation, finalization and averaging costs separately. Completion requires
+equivalent SAR output and measured end-to-end benefit for the supported range.
 
 ## Later experiments
 
@@ -498,16 +708,39 @@ scheduling or scripting behavior is affected. Check Vulkan-disabled compilation,
 Windows MSVC and the existing MinGW configuration; test Linux and an additional
 GPU vendor before making broad compatibility/performance claims.
 
+For each selected delivery, name the implementation and validation owners and
+record the available build/GPU matrix before work starts. Mark unavailable Linux,
+vendor or device checks as unassigned/unverified with the evidence needed to close
+them. Cover the default path, the candidate and its reference, then the relevant
+interactions with batch size, coefficient mode, FD mode and other execution
+switches. Retain reference switches until those comparisons are recorded; avoid
+requiring every unrelated combination for each delivery.
+
 Keep existing numerical tolerances; scheduling-only changes must preserve sample
-timestamps and deterministic stopping decisions. Reduction changes need explicit
-precision and near-threshold evidence. Record any untested configurations.
+timestamps and deterministic stopping decisions on the same stepping path.
+Reduction changes follow Phase 8's snapshot and historical-state contract with
+explicit precision and near-threshold evidence. Record independent CPU/GPU solver
+comparisons separately from same-snapshot arithmetic tests, and list untested
+configurations. Wall-clock polling retains its policy, not an identical stop step.
 
 Performance acceptance uses warm, repeated runs with profiling disabled. As an
 initial review rule, investigate repeatable regressions above 5% on the workload
-matrix and retain a fallback for configurations that lose performance. A claimed
-gain must exceed measurement spread. Performance timing is informational rather
-than a flaky CI threshold. Report improvements by workload and separate setup,
-stepping and output costs.
+matrix and retain a fallback for configurations that lose performance. Use paired
+or interleaved baseline/candidate runs, with at least five measured runs per path;
+retain raw timings and report medians, minimum/maximum and interquartile ranges.
+Describe spread using those statistics and report paired differences when used.
+For small or overlapping gains, repeat an independent round and require consistent
+improvement beyond observed run-to-run variation before claiming a benefit.
+Performance timing is informational rather than a flaky CI threshold. Report
+improvements by workload and separate setup, stepping and output costs.
+
+For each delivery, retain an evidence record with four distinct statuses: code
+implemented, correctness validated, performance measured and hardware/build
+coverage. Record the revision and dirty diff if applicable, exact commands,
+configuration, numerical tolerances/results, raw timing location and remaining
+gaps. Link only retained files or accessible artifacts; missing historical notes
+are not current validation. Documentation-only plan updates do not change these
+statuses or establish new solver correctness/performance claims.
 
 Update `CHANGELOG.md` for user-visible changes and the validation notes with
 reproduction commands and results. Follow `AGENTS.md` / `AI_POLICY.md` for C++11,
@@ -517,4 +750,5 @@ dependencies, clean diffs and disclosure/sign-off when changes are submitted.
 
 - [Khronos timestamp queries](https://docs.vulkan.org/samples/latest/samples/api/timestamp_queries/README.html): GPU timing support and deferred query collection.
 - [Khronos synchronization examples](https://docs.vulkan.org/guide/latest/synchronization_examples.html): compute and host dependencies; adapt examples to the existing Vulkan 1.2 API.
+- [Khronos command-buffer lifecycle](https://docs.vulkan.org/spec/latest/chapters/cmdbuffers.html#commandbuffers-lifecycle): reuse flags, pending work and resource lifetimes.
 - [NVIDIA Vulkan guidance](https://developer.nvidia.com/blog/vulkan-dos-donts/): submission overhead, synchronization and profiling considerations.

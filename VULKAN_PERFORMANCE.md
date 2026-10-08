@@ -27,10 +27,10 @@ The validated relative tolerances are 1e-12 and 3e-7 respectively. Zero fields
 produce zero energy; non-finite results, including FP32 partial-sum overflow,
 request the synchronized CPU calculation. Very small estimates also use the CPU
 when flushing subnormal float products could exceed the tolerance; a zero GPU
-result is accepted directly only when a complete host mirror confirms that all
-fields are zero. SSE energy uses different FP32 lane accumulation and extents, so
-SSE, cylindrical and multigrid cases retain that CPU calculation. This estimates
-the existing stopping metric, not physical energy.
+result is accepted directly only when the reduction's GPU-side bit check finds no
+nonzero fields in the energy domain. SSE energy uses different FP32 lane
+accumulation and extents, so SSE, cylindrical and multigrid cases retain that CPU
+calculation. This estimates the existing stopping metric, not physical energy.
 
 Full-field consumers still synchronize all fields. Voltage and current copies
 share one submission and wait when a two-field staging buffer is available.
@@ -332,8 +332,9 @@ verification. Performance runs must disable validation.
 zeros and NaN payloads), bounded construction, dense fallback, CPU/dense/palette
 field agreement, reset, anisotropic lossy nonuniform meshes, PEC/PMC, PML, Debye
 and cylindrical multigrid. Benchmark CSV coefficient columns describe the root
-level; initialization diagnostics include every level. Phase 4 measurements are
-recorded in `VULKAN_PHASE04_VALIDATION.md`.
+level; initialization diagnostics include every level. The earlier standalone
+Phase 4 validation note is absent from this checkout; rerun the relevant commands
+and retain results before making current numerical or performance claims.
 
 ## Synchronization dependencies
 
@@ -423,5 +424,7 @@ GPU tests and compare their output files before interpreting performance.
 - [Timestamp command semantics](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp.html)
 - [Query-result availability](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetQueryPoolResults.html)
 
-Measured results and configuration coverage are recorded in
-`VULKAN_PHASE01_VALIDATION.md` and `VULKAN_PHASE02_VALIDATION.md`.
+Retained historical measurements and their limits are in
+[Recorded validation and measurements](#recorded-validation-and-measurements).
+Earlier standalone Phase 1/2 validation notes are absent from this checkout;
+the test commands above support reproduction but are not fresh execution results.
