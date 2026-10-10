@@ -1,6 +1,6 @@
 # Vulkan optimization implementation plan
 
-Status as of 2026-10-07:
+Status as of 2026-10-10:
 
 | Phase | Delivery status |
 |---|---|
@@ -12,7 +12,7 @@ Status as of 2026-10-07:
 | 5 | Stencil-load tuning cancelled. |
 | 6a | Extension and synchronization audit implemented. |
 | 6b | First delivery implemented; command reuse, recording overlap and projection fusion remain candidates. |
-| 7 | Cartesian FD E/H accumulation implemented, opt-in, including FD NF2FF recording. |
+| 7 | Cartesian FD E/H accumulation and compact TD E/H gathering implemented with automatic GPU preference and CPU fallback. |
 | 7 follow-ups | Proposed; measure final-readback pipelining and host-result memory lifetime separately. |
 | 8 prerequisite | Next delivery: define convergence snapshots, validate detector traces and measure check costs. |
 | 8a | Proposed; select cylindrical/multigrid GPU energy by measured check cost or capability demand. |
@@ -60,12 +60,14 @@ cross-vendor validation is required before claiming portable performance gains.
   one-step replay loop does not imply one GPU submission per timestep.
 - Energy-only checks use a GPU reduction for the basic Cartesian engine only.
   SSE, cylindrical and multigrid cases retain CPU energy and full-field reads.
-- With `--vulkan-fd=gpu`, supported Cartesian FD E/H dumps accumulate on-device
+- With `--vulkan-fd=auto` (default), supported Cartesian FD E/H dumps accumulate on-device
   at their original sample times and download completed sums at finalization.
   Native/node/cell sampling and FD NF2FF surfaces are supported. Unsupported or
-  resource-limited dumps retain CPU accumulation per dump; CPU mode is the default.
-- Time-domain fields, CPU FD dumps and other full-field consumers still require
-  synchronized fields and bound batches. Energy/stopping decision times also
+  resource-limited dumps retain CPU accumulation per dump; CPU mode is an explicit reference.
+- With `--vulkan-td=auto` (default), supported Cartesian TD E/H dumps gather and
+  download only their output region, retaining CPU file writing and submission
+  boundaries. Unsupported TD mappings, CPU FD dumps and other full-field consumers
+  still synchronize full fields. Energy/stopping decision times also
   bound batches. Final CPU field synchronization remains.
 - Dense coefficients and direct-load core shaders remain the defaults. Exact
   palettes are opt-in. Multigrid shares device resources but records updates,
@@ -319,11 +321,12 @@ Completion: separately reviewable changes with demonstrated performance benefits
 and documented dependency proofs. Retain the reference path where an optimization
 does not meet the performance acceptance criteria.
 
-## Phase 7: accumulate frequency-domain E/H fields on the GPU (implemented, opt-in)
+## Phase 7: accumulate frequency-domain E/H fields on the GPU (implemented)
 
-`--vulkan-fd=gpu` keeps running complex Fourier sums on-device at the existing
+`--vulkan-fd=auto` keeps running supported complex Fourier sums on-device at the existing
 sample times, then downloads completed results for the existing CPU file writers.
-CPU accumulation remains the default reference. The option is available through
+Automatic GPU preference is the default; CPU accumulation remains available as
+the explicit reference. The option is available through
 the command line, Python and MATLAB/Octave without new XML properties or formats.
 
 ### Scope and integration
@@ -332,7 +335,13 @@ Implemented scope is basic Cartesian `DumpType` 10/11 with native Yee
 (`DumpMode 0`), node (`1`) and cell (`2`) sampling, including FD NF2FF surfaces.
 Cylindrical/multigrid/SSE operators, custom interfaces/processings, SAR and other
 unsupported field types retain CPU handling. The angular NF2FF transform remains
-standalone CPU post-processing; time-domain NF2FF recording is unchanged.
+standalone CPU post-processing. Supported TD E/H dumps, including time-domain
+NF2FF surfaces, use compact GPU gathering by default with `--vulkan-td=auto`.
+TD samples retain submission boundaries and existing CPU file writing. Shared
+device and host readback buffers are each bounded by 16 MiB; mappings and output
+buffers share the dump memory budget. Unsupported mappings and optional
+allocation failures retain CPU sampling. See
+[TD gathering](VULKAN_PERFORMANCE.md#time-domain-fields) for its checks and limits.
 
 Preserve these contracts in subsequent changes:
 
@@ -448,8 +457,9 @@ Continue CPU/GPU comparisons with matching outputs, fixed timesteps and profilin
 disabled; a no-dump run is only a diagnostic bound. Sweep regions, sample rates
 and frequency counts, recording VRAM use, total runtime, MC/s and final transfer/
 file costs. The RTX 2060 10M-cell workload and cross-vendor measurements remain
-unverified. Keep GPU accumulation opt-in until memory/performance selection is
-supported by evidence.
+unverified. Automatic GPU preference now uses the existing compatibility and
+memory safeguards; retain explicit CPU comparisons because selection does not
+yet predict the fastest path for sparse or mixed-consumer workloads.
 
 ## Phase 8: convergence checks (proposed)
 

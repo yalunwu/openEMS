@@ -4,9 +4,9 @@ The Vulkan backend records up to 32 timesteps per queue submission by default.
 The limit controls submission size. Ordinary V/I/E/H probes can keep their sample
 intervals while the GPU records several steps: a mapped buffer retains each
 intermediate result, then the CPU replays processing at the original timestep.
-Submissions end at the next full-field consumer or energy/stopping check.
+Submissions end at the next full-field consumer, TD dump sample or energy/stopping check.
 Steady-state detection also retains its one-step samples and period checks.
-Every-step full-field output or stopping checks still require one-step submissions.
+Every-step TD output or stopping checks still require one-step submissions.
 
 During history recording, probe gathering and multigrid projection run after each
 step. Direct `IterateTS()` calls project and gather at the end of the requested
@@ -106,10 +106,11 @@ Python caller instead of continuing with stale fields.
 
 ## Frequency-domain fields
 
-`--vulkan-fd=gpu` opts into GPU E/H Fourier accumulation on the basic Cartesian
-engine. `--vulkan-fd=cpu` is the default and the explicit reference. Python uses
-`fdtd.Run(sim_path, engine='vulkan', vulkan_fd='gpu')`; MATLAB/Octave passes
-`--engine=vulkan --vulkan-fd=gpu` in the `RunOpenEMS` options string.
+`--vulkan-fd=auto` is the default with the Vulkan engine and prefers GPU E/H
+Fourier accumulation on supported basic Cartesian dumps. `--vulkan-fd=cpu`
+selects the explicit reference; `--vulkan-fd=gpu` requests GPU preference with
+the same capability and resource safeguards. Python accepts
+`vulkan_fd='auto'|'cpu'|'gpu'`; MATLAB/Octave uses the corresponding CLI option.
 No XML property or output format changes are needed.
 
 Supported consumers are frequency-domain E/H dumps (`DumpType` 10/11), including
@@ -117,7 +118,7 @@ planar FD NF2FF recordings, with native (0), node (1) or cell (2) sampling.
 They use the resolved output mesh, including subsampling and `OptResolution`.
 Nonuniform edge scaling and boundary interpolation match the existing interface.
 Cylindrical/multigrid/SSE operators, custom interfaces/processings, other field types and SAR
-retain CPU accumulation. TD output retains its existing sampling and readbacks.
+retain CPU accumulation. TD output uses the independent gathering option below.
 The angular NF2FF transform still runs in the standalone CPU postprocessor.
 
 Eligible samples accumulate after each complete timestep within a submission.
@@ -152,7 +153,8 @@ allocation-count and dispatch limits are checked; sums are partitioned where
 needed. A shared 16 MiB readback buffer bounds final staging. Partitioning does
 not reduce the total sum storage. An accumulated prefix is never discarded to
 fall back during a run; GPU submission/upload/readback failures remain errors.
-This is an opt-in resource policy, not an automatic performance selector.
+Automatic selection checks compatibility and resources. It does not predict
+which implementation is faster for every sparse or mixed-consumer workload.
 Changing registered frequencies or interpolation requires reset and
 reinitialization; stepping rejects an inconsistent registration. Reset also
 clears FD sums and sample counters. Re-registration refuses to discard live sums.
@@ -187,6 +189,13 @@ scratch directory and compare complex files before interpreting timings.
 `--field-accumulation-tests` covers partitioning, reset/reuse, allocation fallback,
 registration rejection and graceful interruption. Its spectrum comparisons reject
 NaN and infinity in either complex component before applying the 0.1% tolerance.
+Additional automatic/TD checks:
+
+| Test | Coverage |
+|---|---|
+| `Test_Vulkan_TimeDomainGather` | E/H native/node/cell volumes, planes and lines against identical snapshots, bounded chunks, sampling boundaries, memory fallback and reset/reuse. |
+| `Test_Vulkan_AutomaticFieldDumps` | Default FD/TD selection, mixed sample intervals, compact readbacks and only the final full-field synchronization. |
+
 The Python and Octave tests exercise scripting and
 file/NF2FF compatibility. The independent synchronization check is:
 
@@ -199,6 +208,48 @@ generator against the CPU factors, including large timestep offsets. It does
 not select a runtime implementation. See
 [Recorded validation and measurements](#recorded-validation-and-measurements)
 for accuracy, phase-generation and end-to-end measurements and their limits.
+
+## Time-domain fields
+
+`--vulkan-td=auto` is the default with the Vulkan engine. Supported basic
+Cartesian E/H dumps (`DumpType` 0/1) gather their resolved output region on the
+GPU with native/node/cell interpolation, subsampling and `OptResolution`.
+Only the three output components are downloaded, and the existing CPU HDF5/VTK
+writers retain filenames, meshes, sample times and staggered H timestamps.
+TD sample times remain submission boundaries, including when probes replay a
+GPU batch. This path does not retain a history of TD volumes.
+
+`--vulkan-td=cpu` retains full-field synchronization and CPU interpolation for
+reference comparisons. `--vulkan-td=gpu` requests GPU preference with the same
+fallback safeguards as `auto`. Python uses `vulkan_td='auto'|'cpu'|'gpu'`;
+MATLAB/Octave passes the corresponding option through `RunOpenEMS`.
+Rebuild Python extensions against the updated native headers and libraries.
+Cylindrical/multigrid/SSE operators, custom processing/interfaces, other field
+types and unsupported sizes retain CPU sampling. Optional allocation failures
+fall back before sampling; execution/upload/readback failures remain errors.
+
+All TD dumps share a device output buffer and a host-cached coherent readback
+buffer, each bounded by 16 MiB and sized down for smaller registered regions.
+Large regions are downloaded in chunks. Each dump additionally stores a compact
+separable axis mapping. Cumulative device-local output allocations are checked
+against the available budget, retaining the conservative fallback when driver
+budgets are unavailable. Reset and re-registration clear device readers; changing
+interpolation while registered is rejected until reset/reinitialization.
+
+`VULKAN_TD` reports selected GPU output bytes or a CPU fallback reason. Profiling
+adds `td_samples`, `td_download_bytes`, `gpu_td_ms`, `gpu_td_samples` and
+`td_dispatches`. TD bytes are separate from full-field `downloaded_bytes`.
+The native field-accumulation suite checks compact TD interpolation against
+identical CPU snapshots with a 3e-6 peak-relative tolerance, chunk boundaries,
+default selection, sample scheduling, resource fallback, mutation and reset.
+The Python TD file comparisons use 0.1% of each frame's peak plus eight FP32
+epsilons of the dump's peak across time for cancellation near zero. GPU
+interpolation uses FP32 intermediates; the CPU interface uses double.
+
+Explicit benchmark cases `td-volume`, `td-surface` and `td-line` use 65-cubed
+grids and `--td=auto|cpu|gpu`. Compare matching `--fd-dump-mode=0|1|2`, steps
+and batch sizes. The FD benchmark also accepts `--fd=auto` (now the default).
+Use explicit `--fd=cpu --td=cpu` when reproducing historical CPU dump baselines.
 
 ## Coefficient storage
 
@@ -372,6 +423,44 @@ invariants above remain necessary for those cases and for host memory access.
 
 ## Recorded validation and measurements
 
+### Automatic FD and compact TD dumps, 2026-10-10
+
+Windows MinGW Release builds passed all 7 Vulkan CTest checks and all 6 CPU-only
+checks. The focused field-dump suite also passed Khronos synchronization
+validation with the shader heuristic enabled. Rebuilt matching CSXCAD/openEMS
+Python bindings passed all 10 field-output tests and 4 related scheduling,
+disabled-output and coefficient-palette tests. Octave passed CPU/GPU/automatic
+FD and TD comparisons for all three interpolation modes through legacy HDF5.
+
+An RTX 3070 (8 GiB, driver 591.74) compared CPU and automatic processing on
+65-cubed grids, 257 timesteps, batch size 64 and native interpolation. Three
+measured repeats followed one excluded warm-up per mode; profiling and validation
+were disabled. Times include processing initialization, finalization and HDF5
+writing, excluding operator/backend setup. FD cases recorded E/H at five
+frequencies every timestep (`--fd-frequencies=5 --fd-over-sampling=32`); TD cases
+recorded E every three timesteps with the default dump schedule (86 frames).
+All six output pairs had nonzero fields and matching values, meshes and HDF5
+metadata. These uniform-grid native samples agreed exactly; interpolated
+nonuniform comparisons use the tolerances documented above.
+
+| Output | CPU, s | Automatic, s | CPU/automatic |
+|---|---:|---:|---:|
+| FD volume | 9.124 | 0.584 | 15.63 |
+| FD surface | 1.233 | 0.559 | 2.21 |
+| FD line | 0.775 | 0.420 | 1.84 |
+| TD volume | 2.644 | 1.763 | 1.50 |
+| TD surface | 1.561 | 1.617 | 0.97 |
+| TD line | 1.695 | 1.630 | 1.04 |
+
+Sparse TD timings showed no consistent improvement: the surface median was
+3.6% slower, with overlapping repeat ranges. Separate profiled TD-surface runs
+reduced full-field downloads from 566,826,000 to 6,591,000 bytes, adding
+4,360,200 compact TD bytes: 98.1% fewer field-transfer bytes overall. This
+does not remove file-writing or submission costs. Automatic selection remains
+a compatibility/resource preference; use the CPU overrides for comparisons.
+
+### Historical measurements, 2026-10-05
+
 Local measurements recorded on 2026-10-05 used Windows, a MinGW Release build,
 an RTX 3070 with 8 GiB VRAM and NVIDIA driver 591.74. They are historical results,
 not measurements of the later registration/test fixes. Profiling and validation
@@ -402,7 +491,8 @@ meshes passed; the largest peak-relative complex error was 8.78e-8 against a
 five frequencies, 257 timesteps, every-step sampling and batch size 64 gave
 median solver-output times of 8.881 s for CPU accumulation and 0.546 s for GPU
 accumulation. Those times include finalization and file writing but exclude setup.
-Sparse outputs can be slower on the GPU, so accumulation remains opt-in.
+Sparse outputs can be slower on the GPU. These historical results predate
+automatic selection; retain explicit CPU comparisons for those workloads.
 
 The 217-cubed five-frequency E/H case needed 2,452,395,120 sum bytes and 20 sum
 chunks plus the shared 16 MiB readback buffer. Every-step solver-output medians

@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <iosfwd>
 #include <utility>
+#include <functional>
+#include "tools/arraylib/array_nijk.h"
 
 #ifdef ENABLE_VULKAN
 #include <vulkan/vulkan.h>
@@ -16,6 +18,8 @@
 
 class Excitation;
 class ProcessFieldsFD;
+class ProcessFields;
+class ProcessFieldsTD;
 class Operator_Ext_Absorbing_BC;
 class Operator_CylinderMultiGrid;
 
@@ -50,13 +54,14 @@ public:
 	void RegisterProbes(const ProcessingArray* pa) override;
 	std::string GetBackendName() const override;
 	bool RegisterFieldDumps(ProcessingArray* pa, bool enabled);
+	bool RegisterTimeDomainDumps(ProcessingArray* pa, const std::string& mode);
 	bool FinalizeFieldDumps();
 
 	static bool CheckModelSupport(const Operator* op, const ContinuousStructure* csx, std::string& unsupportedReason);
 
 	enum GpuProfileCategory { ProfileBatch, ProfileVoltage, ProfileCurrent,
 	                          ProfileExtension, ProfileMultigrid, ProfileProbe,
-	                          ProfileReadback, ProfileEnergy, ProfileBarrier, ProfileFD, ProfileCategoryCount };
+	                          ProfileReadback, ProfileEnergy, ProfileBarrier, ProfileFD, ProfileTD, ProfileCategoryCount };
 	struct ProfileStatistics {
 		uint64_t submissions = 0, dispatches = 0, timesteps = 0, sampledSteps = 0;
 		uint64_t uploadedBytes = 0, downloadedBytes = 0, probeBytes = 0;
@@ -64,6 +69,7 @@ public:
 		uint64_t barriers = 0, coalescedBarriers = 0;
 		uint64_t fdSamples = 0, fdDownloadBytes = 0, fdPhaseBytes = 0;
 		uint64_t fdAccumulatorBytes = 0, fdMappingBytes = 0;
+		uint64_t tdSamples = 0, tdDownloadBytes = 0;
 		std::array<uint64_t, ProfileCategoryCount> categoryDispatches = {};
 		double recordSeconds = 0, submitSeconds = 0, waitSeconds = 0;
 		double readbackSeconds = 0, mirrorSeconds = 0;
@@ -99,6 +105,7 @@ private:
 	friend bool Test_Vulkan_ProbeHistory();
 	friend bool Test_Vulkan_FieldAccumulation();
 	friend bool Test_Vulkan_FDMemoryFallback();
+	friend bool Test_Vulkan_TimeDomainGather();
 	friend bool Test_Vulkan_FDPhaseCandidate();
 	friend bool Test_Vulkan_SynchronizationDependencies(bool);
 
@@ -213,6 +220,23 @@ private:
 		VulkanBuffer sums;
 		VkDescriptorSet descriptors = VK_NULL_HANDLE;
 	};
+	struct FieldAxis { uint32_t position; float a, b; uint32_t padding; };
+	struct TDDump {
+		~TDDump() { if (pool) vkDestroyDescriptorPool(device, pool, nullptr); }
+		ProcessFieldsTD* processing = nullptr;
+		std::weak_ptr<std::function<bool(ArrayLib::ArrayNIJK<float>&)>> reader;
+		VkDevice device = VK_NULL_HANDLE;
+		VkDescriptorPool pool = VK_NULL_HANDLE;
+		VkDescriptorSet descriptors = VK_NULL_HANDLE;
+		VulkanBuffer mapping;
+		uint32_t dims[3] = {}, mode = 0, magnetic = 0, count = 0;
+	};
+	std::vector<std::unique_ptr<TDDump>> m_tdDumps;
+	VulkanBuffer m_tdValues, m_tdStaging;
+	VkDescriptorSetLayout m_descLayoutTD = VK_NULL_HANDLE;
+	VkPipelineLayout m_pipelineLayoutTD = VK_NULL_HANDLE;
+	VkPipeline m_pipelineTD = VK_NULL_HANDLE;
+	uint64_t m_tdChunkBytes = 16ull * 1024 * 1024, m_tdMemoryLimit = UINT64_MAX;
 	struct FDDump {
 		~FDDump() { if (pool) vkDestroyDescriptorPool(device, pool, nullptr); }
 		ProcessFieldsFD* processing = nullptr;
@@ -233,6 +257,12 @@ private:
 	uint64_t m_fdMemoryLimit = UINT64_MAX;
 	uint64_t m_fdChunkBytes = 128ull * 1024 * 1024;
 	bool CreateFDPipeline(bool* allocationFailed);
+	bool CreateFieldPipeline(bool timeDomain, bool* allocationFailed);
+	bool SupportsFieldDump(const ProcessFields* processing) const;
+	bool BuildFieldMapping(const ProcessFields* processing, uint32_t* dims, uint32_t& mode,
+	                       uint32_t& magnetic, std::vector<FieldAxis>& mapping) const;
+	void DestroyTimeDomainDumps();
+	bool ReadTimeDomainDump(TDDump& dump, ArrayLib::ArrayNIJK<float>& field);
 	bool SupportsFDDump(const ProcessFieldsFD* processing) const;
 	bool CheckFDFallbackMemory(const FDDump* pending = nullptr, uint64_t* available = nullptr) const;
 	bool AllocateFDDump(ProcessFieldsFD* processing, std::unique_ptr<FDDump>& dump, std::string& reason);

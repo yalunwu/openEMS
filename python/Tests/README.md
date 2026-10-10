@@ -37,6 +37,23 @@ run.
 Anything but `python/` works as the current directory — from inside it `import
 openEMS` picks up the unbuilt source tree instead of the installed module.
 
+### Vulkan integration tests
+
+Requires a Vulkan-enabled native build, compatible device and matching rebuilt bindings.
+
+```bash
+python3 run_testsuite.py --only-unittests test_vulkan_fd
+```
+
+The GPU-engine module checks solver physics, probes and scheduling. The field-dump
+module compares automatic/CPU/GPU selection, complex E/H spectra, TD volume/plane/line
+values, meshes, timestamps, sampling windows, mixed outputs, HDF5/VTK and NF2FF
+results. See [Vulkan performance](../../VULKAN_PERFORMANCE.md) for native
+regression/validation commands and the unresolved steady-state phase audit.
+TD comparisons retain the 0.1% frame-peak tolerance and add eight FP32 epsilons
+of each dump's peak across time for interpolation cancellation near zero;
+CPU interpolation uses double intermediates, while GPU interpolation uses FP32.
+
 What the runner does to a test it starts:
 
 - It points `TMPDIR` at an empty per-test folder. Every test builds its

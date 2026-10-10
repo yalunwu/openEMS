@@ -27,7 +27,11 @@ function RunOpenEMS(Sim_Path, Sim_File, opts, Settings)
 %      --numThreads=<n>     Force use n threads for multithreaded engine
 %      --vulkan-batch-size=<n>  Maximum timesteps per Vulkan submission (1..64, default 32)
 %      --vulkan-profile        Report Vulkan CPU/GPU timings and submission/transfer counts
-%      --vulkan-fd=<cpu|gpu>    FD E/H accumulation on CPU (default) or GPU; basic Cartesian only
+%      --vulkan-fd=<auto|cpu|gpu>  FD E/H accumulation; auto (default) prefers supported GPU dumps
+%      --vulkan-td=<auto|cpu|gpu>  TD E/H gathering; auto (default) downloads only the output region
+%          Basic Cartesian DumpType 0/1 supports native/node/cell sampling.
+%          Unsupported mappings or insufficient resources use CPU sampling.
+%          TD sample times and CPU file writing are preserved.
 %      --no-simulation      only run preprocessing; do not simulate
 %      --dump-statistics    dump simulation statistics to 'openEMS_run_stats.txt' and 'openEMS_stats.txt'
 %

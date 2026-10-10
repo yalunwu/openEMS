@@ -19,9 +19,13 @@
 #define PROCESSFIELDS_TD_H
 
 #include "processfields.h"
+#include <functional>
+#include <memory>
 
-class ProcessFieldsTD : public ProcessFields
+class OPENEMS_EXPORT ProcessFieldsTD : public ProcessFields
 {
+	friend class EngineVulkan;
+	friend class TestTDDump;
 public:
 	ProcessFieldsTD(Engine_Interface_Base* eng_if);
 	virtual ~ProcessFieldsTD();
@@ -31,12 +35,17 @@ public:
 	virtual void InitProcess();
 
 	virtual int Process();
+	void Reset() override;
+	bool UsesDeviceFields() const override {return bool(*m_deviceGather);}
+	bool RequiresTimestepBoundary() const override {return true;}
 
 	//! Set the length of the filename timestep pad filled with zeros (default is 8)
 	void SetPadLength(int val) {pad_length=val;};
 
 protected:
 	int pad_length;
+	using DeviceGather = std::function<bool(ArrayLib::ArrayNIJK<float>&)>;
+	std::shared_ptr<DeviceGather> m_deviceGather = std::make_shared<DeviceGather>();
 };
 
 #endif // PROCESSFIELDS_TD_H

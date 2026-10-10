@@ -1,4 +1,4 @@
-"""Vulkan FD output equivalence: complex spectra, schedules and NF2FF."""
+"""Vulkan FD/TD output equivalence: fields, schedules and NF2FF."""
 import os
 import base64
 import tempfile
@@ -21,7 +21,8 @@ class Test_VulkanFD(unittest.TestCase):
 
     def run_case(self, name, mode=0, accumulation='gpu', batch=32, engine='vulkan',
                  steps=129, mixed=False, nf2ff=False, legacy=False, end=0,
-                 windows=True, directions=None, mirror=None, disabled=False, vtk=False):
+                 windows=True, directions=None, mirror=None, disabled=False, vtk=False,
+                 td_accumulation=None, td_only=False):
         path = os.path.join(self.temp.name, name)
         csx = gpu.ContinuousStructure()
         grid = csx.GetGrid()
@@ -34,8 +35,8 @@ class Test_VulkanFD(unittest.TestCase):
         material.AddBox([-5, -5, -5], [5, 5, 5])
         source = csx.AddExcitation('source', exc_type=0, exc_val=[0, 0, 1])
         source.AddBox([0, 0, -5], [0, 0, -2.5])
-        for kind in (10, 11):
-            field = 'e' if kind == 10 else 'h'
+        for kind in ((0, 1) if td_only else (10, 11)):
+            field = 'e' if kind in (0, 10) else 'h'
             for region, start, stop, sampling in (
                     ('volume', [-20]*3, [20]*3, {'sub_sampling': [2, 3, 2]}),
                     ('plane', [-17, -20, 0], [17, 20, 0], {'opt_resolution': [5, 6, 1]}),
@@ -50,6 +51,8 @@ class Test_VulkanFD(unittest.TestCase):
             probe.AddBox([5, 0, -5], [5, 0, 5])
             unsupported = csx.AddDump('d', dump_type=14, file_type=1, frequency=[20e9])
             unsupported.AddBox([-5, -5, 0], [5, 5, 0])
+            unsupported_td = csx.AddDump('d_td', dump_type=4, file_type=1)
+            unsupported_td.AddBox([-5, -5, 0], [5, 5, 0])
         fdtd = gpu.openEMS(NrTS=steps, EndCriteria=end)
         fdtd.SetCSX(csx)
         fdtd.SetGaussExcite(20e9, 10e9)
@@ -69,11 +72,31 @@ class Test_VulkanFD(unittest.TestCase):
                 dump.set('StopTime', '3e-10')
         tree.write(xml)
         self.assertEqual(csx.ReadFromXML(xml), '')
-        fdtd.Run(path, engine=engine, vulkan_fd=accumulation, vulkan_batch_size=batch,
+        options = {}
+        if accumulation is not None:
+            options['vulkan_fd'] = accumulation
+        if td_accumulation is not None:
+            options['vulkan_td'] = td_accumulation
+        fdtd.Run(path, engine=engine, vulkan_batch_size=batch, **options,
                  vulkan_profile=True, exact_endcriteria=True, numThreads=1,
                  legacyHDF5Dumps=legacy, disable_dumps=disabled,
                  dump_statistics=end>0, cleanup=False)
         return path, recorder
+
+    def test_automatic_fd_selection(self):
+        reference, _ = self.run_case('auto_reference', accumulation='cpu')
+        for mode in (None, 'auto'):
+            actual, _ = self.run_case('automatic_' + str(mode), accumulation=mode)
+            self.compare_files(reference, actual)
+
+    def test_time_domain_gathering(self):
+        for mode in (0, 1, 2):
+            reference, _ = self.run_case('td_reference_' + str(mode), mode=mode,
+                                         td_only=True, td_accumulation='cpu', steps=65)
+            for selection in (None, 'gpu'):
+                actual, _ = self.run_case('td_' + str(mode) + str(selection), mode=mode,
+                                          td_only=True, td_accumulation=selection, steps=65, batch=64)
+                self.compare_files(reference, actual)
 
     def compare_files(self, expected, actual):
         names = sorted(name for name in os.listdir(expected) if name.endswith('.h5'))
@@ -85,6 +108,12 @@ class Test_VulkanFD(unittest.TestCase):
                 other = []
                 b.visititems(lambda path, item: other.append(path) if isinstance(item, h5py.Dataset) else None)
                 self.assertEqual(paths, other)
+                # CPU interpolation uses double intermediates, while the GPU
+                # uses FP32. Bound cancellation noise by eight FP32 epsilons
+                # of this dump's peak across time, including near-zero frames.
+                td_peak = max((np.max(np.abs(a[path][...]), initial=0) for path in paths
+                               if path.startswith('FieldData/TD/')), default=0)
+                td_floor = td_peak * (8*np.finfo(np.float32).eps)
                 for path in paths:
                     x, y = a[path][...], b[path][...]
                     self.assertEqual(x.shape, y.shape)
@@ -96,7 +125,8 @@ class Test_VulkanFD(unittest.TestCase):
                     else:
                         peak = np.max(np.abs(x), initial=0)
                         error = np.max(np.abs(x-y), initial=0)
-                        self.assertLessEqual(error, peak*.001 + 1e-18, (name, path, peak, error))
+                        floor = td_floor if path.startswith('FieldData/TD/') else 0
+                        self.assertLessEqual(error, peak*.001 + floor + 1e-18, (name, path, peak, error))
                 self.assertEqual(set(a.attrs), set(b.attrs))
                 for attr in a.attrs:
                     np.testing.assert_array_equal(a.attrs[attr], b.attrs[attr])
@@ -116,7 +146,7 @@ class Test_VulkanFD(unittest.TestCase):
             self.compare_files(reference, actual)
 
     def test_mixed_output_and_long_decay(self):
-        reference, _ = self.run_case('mixed_reference', mode=1, accumulation='cpu', mixed=True, steps=2049, windows=False)
+        reference, _ = self.run_case('mixed_reference', mode=1, accumulation='cpu', td_accumulation='cpu', mixed=True, steps=2049, windows=False)
         actual, _ = self.run_case('mixed_gpu', mode=1, mixed=True, steps=2049, batch=64, windows=False)
         self.compare_files(reference, actual)
         np.testing.assert_allclose(np.loadtxt(os.path.join(reference, 'voltage'), comments='%'),
@@ -141,6 +171,15 @@ class Test_VulkanFD(unittest.TestCase):
     def test_vtk_output(self):
         reference, _ = self.run_case('vtk_reference', mode=1, accumulation='cpu', vtk=True)
         actual, _ = self.run_case('vtk_gpu', mode=1, vtk=True)
+        self.compare_vtk_files(reference, actual)
+
+    def test_time_domain_vtk_output(self):
+        reference, _ = self.run_case('td_vtk_reference', mode=0, td_only=True,
+                                     td_accumulation='cpu', vtk=True, steps=65)
+        actual, _ = self.run_case('td_vtk_auto', mode=0, td_only=True, vtk=True, steps=65)
+        self.compare_vtk_files(reference, actual)
+
+    def compare_vtk_files(self, reference, actual):
         names = sorted(name for name in os.listdir(reference) if name.endswith('.vtr'))
         self.assertTrue(names)
         self.assertEqual(names, sorted(name for name in os.listdir(actual) if name.endswith('.vtr')))

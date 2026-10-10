@@ -302,7 +302,8 @@ void EngineVulkan::WriteProfile(std::ostream& stream)
 	       << " fd_mapping_bytes=" << p.fdMappingBytes
 	       << " fd_phase_ms=" << p.fdPhaseSeconds*1000
 	       << " fd_download_ms=" << p.fdDownloadSeconds*1000;
-	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback", "energy", "barrier", "fd"};
+	stream << " td_samples=" << p.tdSamples << " td_download_bytes=" << p.tdDownloadBytes;
+	const char* names[] = {"batch", "voltage", "current", "extension", "multigrid", "probe", "readback", "energy", "barrier", "fd", "td"};
 	for (unsigned int i = 0; i < ProfileCategoryCount; ++i)
 		stream << " gpu_" << names[i] << "_ms=" << p.gpuSeconds[i] * 1000
 		       << " gpu_" << names[i] << "_samples=" << p.gpuSamples[i]
@@ -5006,6 +5007,7 @@ void EngineVulkan::Reset()
 	if (m_device != VK_NULL_HANDLE)
 	{
 		DestroyFieldDumps(true);
+		DestroyTimeDomainDumps();
 		DestroyBuffer(m_level->m_bufVv);
 		DestroyBuffer(m_level->m_bufVi);
 		DestroyBuffer(m_level->m_bufIi);

@@ -60,7 +60,8 @@ void Box(ContinuousStructure* csx, CSProperties* property, const double bounds[6
 }
 
 void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int batch, bool profile, const std::string& coefficients,
-           const std::string& fdMode, unsigned int frequencies, unsigned int fdOverSampling, unsigned int dumpMode)
+           const std::string& fdMode, unsigned int frequencies, unsigned int fdOverSampling, unsigned int dumpMode,
+           const std::string& tdMode)
 {
 	ContinuousStructure* csx = new ContinuousStructure();
 	CSRectGrid* grid = csx->GetGrid();
@@ -147,13 +148,16 @@ void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int 
 		const double bounds[] = {20, 20, 20, 20, 10, 30};
 		Box(csx, probe, bounds);
 	}
-	if (c.processing == 2u)
+	if (c.processing == 2u || c.processing==7u)
 	{
 		auto* dump = new CSPropDumpBox(csx->GetParameterSet());
-		dump->SetName("vulkan_benchmark_dump");
+		dump->SetName("vulkan_benchmark_dump_"+tdMode);
 		dump->SetDumpType(0);
 		dump->SetFileType(1); // HDF5
-		const double bounds[] = {0, 40, 0, 40, 20, 20};
+		dump->SetDumpMode(dumpMode);
+		double bounds[] = {0, 40, 0, 40, 0, 40};
+		if (name!="td-volume") bounds[4]=bounds[5]=20;
+		if (name=="td-line") bounds[0]=bounds[1]=bounds[2]=bounds[3]=20;
 		Box(csx, dump, bounds);
 	}
 	if (c.processing==5u) {
@@ -171,7 +175,7 @@ void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int 
 	}
 	fdtd.SetLibraryArguments({"--engine=vulkan", "--numThreads=1", "--exact-endcriteria",
 	                          "--vulkan-batch-size=" + std::to_string(batch), "--vulkan-coefficients=" + coefficients,
-	                          "--vulkan-fd=" + fdMode});
+	                          "--vulkan-fd=" + fdMode,"--vulkan-td="+tdMode});
 	fdtd.SetNumberOfTimeSteps(steps);
 	fdtd.SetEndCriteria(0.0);
 	if (c.processing == 3u) fdtd.SetSinusExcite(10e9);
@@ -179,7 +183,7 @@ void Setup(BenchmarkFDTD& fdtd, const Case& c, unsigned int steps, unsigned int 
 	fdtd.SetCSX(csx);
 	fdtd.SetCylinderCoords(c.cylinder);
 	if (!c.splits.empty()) fdtd.SetupCylinderMultiGrid(c.splits);
-	fdtd.SetEnableDumps(c.processing == 2u || c.processing==5u);
+	fdtd.SetEnableDumps(c.processing == 2u || c.processing==5u || c.processing==7u);
 	for (int i = 0; i < 6; ++i) {
 		if (c.pml) fdtd.Set_BC_PML(i, 4);
 		else fdtd.Set_BC_Type(i, name == "mur" || name == "tfsf" || name == "absorber" ? 2 : 0);
@@ -253,14 +257,17 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 		unsigned int steps = 256, repeats = 5;
 		bool profile = false, referenceReadback = false, referenceBarriers = true, referenceDispersive = false, verifyEnergy = false;
 		std::string selected, csvPath, coefficients = "dense";
-		std::string fdMode="cpu";
+		std::string fdMode="auto",tdMode="auto";
 		unsigned int fdFrequencies=1, fdOverSampling=1, fdDumpMode=0;
 		std::vector<unsigned int> batches = {1, 8, 16, 32, 64};
 		for (int i = 2; i < argc; ++i) {
 			std::string arg(argv[i]);
 			if (arg == "--profile") profile = true;
 			else if (arg.find("--fd=")==0) {
-				fdMode=arg.substr(5); Require(fdMode=="cpu" || fdMode=="gpu","fd must be cpu or gpu");
+				fdMode=arg.substr(5); Require(fdMode=="auto" || fdMode=="cpu" || fdMode=="gpu","fd must be auto, cpu or gpu");
+			}
+			else if (arg.find("--td=")==0) {
+				tdMode=arg.substr(5); Require(tdMode=="auto" || tdMode=="cpu" || tdMode=="gpu","td must be auto, cpu or gpu");
 			}
 			else if (arg.find("--fd-frequencies=")==0) { fdFrequencies=std::stoul(arg.substr(17)); Require(fdFrequencies>=1 && fdFrequencies<=16,"fd-frequencies must be 1..16"); }
 			else if (arg.find("--fd-over-sampling=")==0) { fdOverSampling=std::stoul(arg.substr(19)); Require(fdOverSampling>=1,"fd-over-sampling must be positive"); }
@@ -300,6 +307,9 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 			{"fd-large", 129, 129, 129, false, false, false, false, {}, 5},
 			{"fd-10m", 217, 217, 217, false, false, false, false, {}, 5},
 			{"fd-none", 65, 65, 65, false, false, false, false, {}, 6},
+			{"td-volume", 65, 65, 65, false, false, false, false, {}, 7},
+			{"td-surface", 65, 65, 65, false, false, false, false, {}, 7},
+			{"td-line", 65, 65, 65, false, false, false, false, {}, 7},
 			{"rlc", 25, 25, 25, false, false, false, false, {}, 0},
 			{"absorber", 25, 25, 25, false, false, false, false, {}, 0},
 			{"cylinder", 41, 129, 33, true, false, false, false, {}, 0},
@@ -315,7 +325,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 		if (!csvPath.empty()) {
 			csv.open(csvPath);
 			Require(csv.good(), "Could not open benchmark CSV");
-			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback,coefficient_mode,root_coefficient_bytes,root_allocated_bytes,root_dense_bytes,root_unique_tuples,root_palette,reference_barriers,barriers,coalesced_barriers,voltage_dispatches,current_dispatches,extension_dispatches,multigrid_dispatches,probe_dispatches,gpu_barrier_s,gpu_barrier_samples,reference_dispersive_pre,fd_mode,fd_frequencies,fd_over_sampling,fd_dump_mode,fd_samples,fd_download_bytes,fd_phase_bytes,fd_accumulator_bytes,fd_mapping_bytes,gpu_fd_s,fd_dispatches,fd_phase_s,fd_download_s\n";
+			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback,coefficient_mode,root_coefficient_bytes,root_allocated_bytes,root_dense_bytes,root_unique_tuples,root_palette,reference_barriers,barriers,coalesced_barriers,voltage_dispatches,current_dispatches,extension_dispatches,multigrid_dispatches,probe_dispatches,gpu_barrier_s,gpu_barrier_samples,reference_dispersive_pre,fd_mode,fd_frequencies,fd_over_sampling,fd_dump_mode,fd_samples,fd_download_bytes,fd_phase_bytes,fd_accumulator_bytes,fd_mapping_bytes,gpu_fd_s,fd_dispatches,fd_phase_s,fd_download_s,td_mode,td_samples,td_download_bytes,gpu_td_s\n";
 			csv << std::setprecision(10);
 		}
 		bool found = false, metadata = false;
@@ -329,7 +339,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 				if (!c.processing) {
 					fdtd.reset(new BenchmarkFDTD);
 					const auto init = Clock::now();
-					Setup(*fdtd, c, steps, batch, profile, coefficients,fdMode,fdFrequencies,fdOverSampling,fdDumpMode);
+					Setup(*fdtd, c, steps, batch, profile, coefficients,fdMode,fdFrequencies,fdOverSampling,fdDumpMode,tdMode);
 					Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
 					Require(fdtd->GPU()->SetBarrierCoalescingEnabled(!referenceBarriers), "Could not configure barrier reference");
 					Require(fdtd->GPU()->SetDispersivePreFusionEnabled(!referenceDispersive), "Could not configure dispersive reference");
@@ -341,7 +351,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					if (c.processing) {
 						fdtd.reset(new BenchmarkFDTD);
 						const auto init = Clock::now();
-						Setup(*fdtd, c, steps, batch, profile, coefficients,fdMode,fdFrequencies,fdOverSampling,fdDumpMode);
+						Setup(*fdtd, c, steps, batch, profile, coefficients,fdMode,fdFrequencies,fdOverSampling,fdDumpMode,tdMode);
 						Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
 						Require(fdtd->GPU()->SetBarrierCoalescingEnabled(!referenceBarriers), "Could not configure barrier reference");
 						Require(fdtd->GPU()->SetDispersivePreFusionEnabled(!referenceDispersive), "Could not configure dispersive reference");
@@ -385,7 +395,8 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					             << ',' << fdMode << ',' << fdFrequencies << ',' << fdOverSampling << ',' << fdDumpMode
 					             << ',' << p.fdSamples << ',' << p.fdDownloadBytes << ',' << p.fdPhaseBytes
 					             << ',' << p.fdAccumulatorBytes << ',' << p.fdMappingBytes << ',' << p.gpuSeconds[EngineVulkan::ProfileFD]
-					             << ',' << p.categoryDispatches[EngineVulkan::ProfileFD] << ',' << p.fdPhaseSeconds << ',' << p.fdDownloadSeconds << '\n';
+					             << ',' << p.categoryDispatches[EngineVulkan::ProfileFD] << ',' << p.fdPhaseSeconds << ',' << p.fdDownloadSeconds
+					             << ',' << tdMode << ',' << p.tdSamples << ',' << p.tdDownloadBytes << ',' << p.gpuSeconds[EngineVulkan::ProfileTD] << '\n';
 				}
 				std::sort(timings.begin(), timings.end());
 				const double median = (timings[(repeats - 1) / 2] + timings[repeats / 2]) / 2;
@@ -393,7 +404,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 				          << " coefficients=" << coefficients << " reference_readback=" << referenceReadback
 				          << " reference_barriers=" << referenceBarriers
 				          << " reference_dispersive_pre=" << referenceDispersive
-				          << " fd=" << fdMode << " fd_frequencies=" << fdFrequencies << " fd_over_sampling=" << fdOverSampling << " fd_dump_mode=" << fdDumpMode
+				          << " fd=" << fdMode << " td=" << tdMode << " fd_frequencies=" << fdFrequencies << " fd_over_sampling=" << fdOverSampling << " fd_dump_mode=" << fdDumpMode
 				          << " steps=" << steps << " repeats=" << repeats << " mode=" << (c.processing ? "solver-output" : "stepping")
 				          << " stored_nodes=" << Nodes(fdtd->GetOp(), false) << " active_voltage_nodes=" << Nodes(fdtd->GetOp(), true)
 				          << " operator_cells=" << fdtd->GetOp()->GetNumberCells() << " initialization_s=" << initSeconds

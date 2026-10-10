@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <stdexcept>
 
 using namespace std;
 
@@ -36,6 +37,7 @@ ProcessFieldsTD::~ProcessFieldsTD()
 
 void ProcessFieldsTD::InitProcess()
 {
+	*m_deviceGather = DeviceGather();
 	if (Enabled==false) return;
 
 	ProcessFields::InitProcess();
@@ -47,6 +49,12 @@ void ProcessFieldsTD::InitProcess()
 		m_HDF5_Dump_File->SetCurrentGroup("/FieldData/TD");
 }
 
+void ProcessFieldsTD::Reset()
+{
+	Processing::Reset();
+	*m_deviceGather = DeviceGather();
+}
+
 int ProcessFieldsTD::Process()
 {
 	if (Enabled==false) return -1;
@@ -55,7 +63,11 @@ int ProcessFieldsTD::Process()
 	string filename = m_filename;
 
 	ArrayLib::ArrayNIJK<float> field("TD_field", numLines);
-	bool success = CalcField(field);
+	bool success;
+	if (UsesDeviceFields()) {
+		success = (*m_deviceGather)(field);
+		if (!success) throw std::runtime_error("Device time-domain field gathering failed");
+	} else success = CalcField(field);
 
 	if (m_fileType==VTK_FILETYPE)
 	{

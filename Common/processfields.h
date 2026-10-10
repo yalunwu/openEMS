@@ -28,6 +28,7 @@ class HDF5_File_Writer;
 
 class OPENEMS_EXPORT ProcessFields : public Processing
 {
+	friend class EngineVulkan;
 public:
 	ProcessFields(Engine_Interface_Base* eng_if);
 	virtual ~ProcessFields();

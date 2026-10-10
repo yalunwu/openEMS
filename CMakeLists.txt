@@ -252,6 +252,11 @@ if(BUILD_TESTING)
   ADD_TEST(NAME vulkan-coefficients-invalid COMMAND ${CMAKE_COMMAND}
     "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>"
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_coefficient_rejection.cmake)
+  foreach(domain fd td)
+    ADD_TEST(NAME vulkan-${domain}-invalid COMMAND ${CMAKE_COMMAND}
+      "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>" -DDUMP_DOMAIN=${domain}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_dump_rejection.cmake)
+  endforeach()
 endif()
  
 if (WIN32)

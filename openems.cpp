@@ -299,12 +299,21 @@ void openEMS::collectCommandLineArguments()
 		)
 		(
 			"vulkan-fd",
-			po::value<std::string>()->default_value("cpu")->notifier([&](const std::string& val) {
-				if (val != "cpu" && val != "gpu")
-					throw std::invalid_argument("vulkan-fd must be cpu or gpu");
+			po::value<std::string>()->default_value("auto")->notifier([&](const std::string& val) {
+				if (val != "auto" && val != "cpu" && val != "gpu")
+					throw std::invalid_argument("vulkan-fd must be auto, cpu or gpu");
 				m_vulkanFD = val;
 			}),
-			"Frequency-domain E/H accumulation: cpu (default reference), or opt-in gpu"
+			"Frequency-domain E/H accumulation: auto (default), cpu reference, or gpu preference"
+		)
+		(
+			"vulkan-td",
+			po::value<std::string>()->default_value("auto")->notifier([&](const std::string& val) {
+				if (val != "auto" && val != "cpu" && val != "gpu")
+					throw std::invalid_argument("vulkan-td must be auto, cpu or gpu");
+				m_vulkanTD = val;
+			}),
+			"Time-domain E/H gathering: auto (default), cpu reference, or gpu preference"
 		)
 		(
 			"numThreads",
@@ -1535,7 +1544,9 @@ void openEMS::RunFDTD()
 	//init processings
 	PA->InitAll();
 	EngineVulkan* vulkanBackend = dynamic_cast<EngineVulkan*>(m_EngineBackend.get());
-	if (vulkanBackend && !vulkanBackend->RegisterFieldDumps(PA, m_vulkanFD == "gpu"))
+	if (vulkanBackend && !vulkanBackend->RegisterTimeDomainDumps(PA, m_vulkanTD))
+		throw std::runtime_error("Vulkan time-domain registration failed");
+	if (vulkanBackend && !vulkanBackend->RegisterFieldDumps(PA, m_vulkanFD != "cpu"))
 		throw std::runtime_error("Vulkan frequency-domain registration failed");
 
 	//add all timesteps to end-crit field processing with max excite amplitude

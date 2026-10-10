@@ -89,6 +89,20 @@ reports its result instead of dying in `figure()`. Override any of it:
 The runner discovers the groups, so a new folder needs no registration. Cheap
 groups run first.
 
+## Vulkan FD test
+
+`enginetests/vulkan_fd.m` compares CPU, GPU and automatic FD accumulation and
+compact TD gathering under Vulkan stepping for E/H native, node and cell sampling.
+It checks output meshes, TD sample times/values and complex spectra at two
+frequencies through the legacy HDF5 reader, using a 0.1% peak-relative tolerance
+plus an absolute floor.
+
+Requires a Vulkan-enabled native build and compatible device. From `TESTSUITE`:
+
+```bash
+octave --no-gui run_testsuite.m vulkan_fd
+```
+
 ## Writing a test
 
 A test is a function file in a group folder:

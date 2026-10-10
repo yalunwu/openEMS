@@ -963,7 +963,7 @@ class Test_GPUEngine(unittest.TestCase):
         self.assertLess(abs(impedances['vulkan'] - impedances['basic']) / abs(impedances['basic']), 0.001)
 
     def test_disabled_dumps_preserve_readback_volume(self):
-        """Disabled TD/FD dumps transfer no more full fields than a probe-only run."""
+        """Automatic TD output gathers compact fields; disabled dumps gather none."""
         downloads = {}
         for kind in ('none', 'td', 'fd', 'enabled'):
             sdir = self._sim_path('disabled_' + kind)
@@ -976,13 +976,17 @@ class Test_GPUEngine(unittest.TestCase):
             profile = re.search(r'VULKAN_PROFILE .*?downloaded_bytes=(\d+)', result.stdout)
             self.assertIsNotNone(profile, result.stdout + result.stderr)
             downloads[kind] = int(profile.group(1))
+            compact = re.search(r'VULKAN_PROFILE .*?td_download_bytes=(\d+)', result.stdout)
+            self.assertIsNotNone(compact, result.stdout + result.stderr)
             if kind == 'enabled':
                 self.assertTrue(os.path.isfile(os.path.join(sdir, 'fields.h5')))
+                self.assertGreater(int(compact.group(1)), 0)
             else:
                 self.assertFalse(os.path.exists(os.path.join(sdir, 'fields.h5')))
+                self.assertEqual(int(compact.group(1)), 0)
         self.assertEqual(downloads['td'], downloads['none'])
         self.assertEqual(downloads['fd'], downloads['none'])
-        self.assertGreater(downloads['enabled'], downloads['none'])
+        self.assertEqual(downloads['enabled'], downloads['none'])
         # Disabled FD post-processing also skipped initialization on the CPU.
         sdir = self._sim_path('disabled_fd_basic')
         result = subprocess.run(

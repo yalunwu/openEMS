@@ -27,6 +27,7 @@
 #include "FDTD/engine.h"
 #include "FDTD/engine_interface_fdtd.h"
 #include "Common/processfields_fd.h"
+#include "Common/processfields_td.h"
 #include "FDTD/operator.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/extensions/operator_ext_upml.h"
@@ -3048,6 +3049,130 @@ public:
 	}
 };
 
+class TestTDDump {
+public:
+	static bool Read(ProcessFieldsTD* dump, ArrayLib::ArrayNIJK<float>& field, bool device) {
+		field.Init("TD test",dump->numLines);
+		return device ? (*dump->m_deviceGather)(field) : dump->CalcField(field);
+	}
+};
+
+bool Test_Vulkan_TimeDomainGather()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=basic","--numThreads=1"});
+	fdtd.SetCSX(CreateCustomGrid(11,9,7)); fdtd.SetGaussExcite(20e9,10e9);
+	fdtd.SetEnableDumps(false);
+	TEST_ASSERT(fdtd.SetupFDTD()==0,"TD gather fixture failed");
+	EngineVulkan gpu(fdtd.GetOp());
+	TEST_ASSERT(gpu.Initialize() && gpu.SetProfilingEnabled(true),"TD gather engine failed");
+	gpu.m_tdChunkBytes=128; // Exercise bounded readbacks across component boundaries.
+	for (unsigned int x=0; x<11; ++x)
+	for (unsigned int y=0; y<9; ++y)
+	for (unsigned int z=0; z<7; ++z)
+	for (unsigned int n=0; n<3; ++n) {
+		gpu.SetVolt(n,x,y,z,float((x+1)*(y+2)+(z+3)*(n+1))*.001f);
+		gpu.SetCurr(n,x,y,z,float(int((x+3)*(z+1))-int((y+1)*(n+1)))*.0001f);
+	}
+	ProcessingArray processing(100);
+	std::vector<ProcessFieldsTD*> dumps;
+	for (unsigned int mode=0; mode<3; ++mode)
+	for (unsigned int field=0; field<2; ++field)
+	for (unsigned int region=0; region<3; ++region) {
+		auto* dump=new ProcessFieldsTD(fdtd.Interface());
+		dump->SetFileName("td_gather_"+std::to_string(dumps.size()));
+		dump->SetFileType(ProcessFields::HDF5_FILETYPE);
+		dump->SetDumpType(field ? ProcessFields::H_FIELD_DUMP : ProcessFields::E_FIELD_DUMP);
+		dump->SetDualMesh(field!=0); dump->SetDualTime(field!=0);
+		dump->SetDumpMode(static_cast<Engine_Interface_Base::InterpolationType>(mode));
+		dump->SetSubSampling(3); dump->SetProcessInterval(3);
+		double start[]={-20,-20,-20},stop[]={20,20,20};
+		if (region>0) start[2]=stop[2]=0;
+		if (region>1) start[1]=stop[1]=0;
+		dump->DefineStartStopCoord(start,stop);
+		processing.AddProcessing(dump); dumps.push_back(dump);
+	}
+	processing.InitAll();
+	TEST_ASSERT(gpu.RegisterTimeDomainDumps(&processing,"auto"),"Automatic TD registration failed");
+	TEST_ASSERT(gpu.m_tdValues.size==128 && gpu.m_tdStaging.size==128,"TD scratch storage is not bounded");
+	TEST_ASSERT(processing.GetNextFullFieldInterval()==3,"GPU TD sampling lost its submission boundary");
+	for (unsigned int steps : {0u,1u,16u}) {
+		TEST_ASSERT(gpu.IterateTS(steps) && gpu.SyncFieldsToHost(),"TD snapshot synchronization failed");
+		const uint64_t fullDownloads=gpu.GetProfile().downloadedBytes;
+		for (auto* dump : dumps) {
+			TEST_ASSERT(dump->UsesDeviceFields() && dump->RequiresTimestepBoundary(),"TD residency or scheduling changed");
+			ArrayLib::ArrayNIJK<float> expected,actual;
+			TEST_ASSERT(TestTDDump::Read(dump,expected,false) && TestTDDump::Read(dump,actual,true),"TD gathering failed");
+			float peak=0,error=0;
+			for (unsigned int i=0; i<expected.size(); ++i) {
+				TEST_ASSERT(std::isfinite(expected.data()[i]) && std::isfinite(actual.data()[i]),"TD output is non-finite");
+				peak=std::max(peak,std::abs(expected.data()[i]));
+				error=std::max(error,std::abs(expected.data()[i]-actual.data()[i]));
+			}
+			TEST_ASSERT(error<=peak*3e-6f+1e-12f,"GPU TD interpolation differs from the identical CPU snapshot");
+		}
+		TEST_ASSERT(gpu.GetProfile().downloadedBytes==fullDownloads,"Compact TD gathering downloaded full fields");
+	}
+	TEST_ASSERT(gpu.GetProfile().tdSamples==54 && gpu.GetProfile().tdDownloadBytes>0,"TD profile missed samples");
+	dumps[0]->SetDumpMode2Node();
+	bool rejected=false;
+	try { ArrayLib::ArrayNIJK<float> field; TestTDDump::Read(dumps[0],field,true); }
+	catch (const std::runtime_error&) { rejected=true; }
+	TEST_ASSERT(rejected,"TD mutation silently reused a stale mapping");
+	gpu.m_tdMemoryLimit=0;
+	TEST_ASSERT(gpu.RegisterTimeDomainDumps(&processing,"auto"),"TD budget fallback failed");
+	for (auto* dump : dumps) TEST_ASSERT(!dump->UsesDeviceFields(),"TD budget fallback retained a GPU reader");
+	gpu.m_tdMemoryLimit=UINT64_MAX;
+	TEST_ASSERT(gpu.RegisterTimeDomainDumps(&processing,"gpu"),"TD re-registration failed");
+	gpu.Reset();
+	for (auto* dump : dumps) TEST_ASSERT(!dump->UsesDeviceFields(),"TD reset retained a dead GPU reader");
+	TEST_ASSERT(gpu.Initialize() && gpu.RegisterTimeDomainDumps(&processing,"auto"),"TD reset/reuse failed");
+	processing.DeleteAll();
+	gpu.Reset(); // Expired processing readers must not be dereferenced.
+	return true;
+#endif
+}
+
+bool Test_Vulkan_AutomaticFieldDumps()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=vulkan","--numThreads=1","--exact-endcriteria"});
+	fdtd.SetCSX(CreateCustomGrid(11,9,7)); fdtd.SetGaussExcite(20e9,10e9);
+	fdtd.SetNumberOfTimeSteps(65); fdtd.SetEndCriteria(0);
+	TEST_ASSERT(fdtd.SetupFDTD()==0,"Automatic dump fixture failed");
+	auto* gpu=dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+	TEST_ASSERT(gpu && gpu->SetBatchSize(64) && gpu->SetProfilingEnabled(true),"Automatic dump Vulkan setup failed");
+	for (unsigned int field=0; field<2; ++field) {
+		auto* fd=new ProcessFieldsFD(fdtd.Interface());
+		auto* td=new ProcessFieldsTD(fdtd.Interface());
+		fd->SetFDOverSampling(100); fd->AddFrequency(20e9);
+		td->SetProcessInterval(7);
+		for (ProcessFields* dump : {static_cast<ProcessFields*>(fd),static_cast<ProcessFields*>(td)}) {
+			dump->SetFileName(std::string(dump==fd ? "automatic_fd_" : "automatic_td_")+std::to_string(field));
+			dump->SetFileType(ProcessFields::HDF5_FILETYPE);
+			dump->SetDumpType(field ? ProcessFields::H_FIELD_DUMP : ProcessFields::E_FIELD_DUMP);
+			dump->SetDualMesh(field!=0); dump->SetDualTime(field!=0); dump->SetDumpMode2Node();
+			double start[]={-20,-20,0},stop[]={20,20,0}; dump->DefineStartStopCoord(start,stop);
+			fdtd.GetProcessings()->AddProcessing(dump);
+		}
+	}
+	gpu->SetVolt(2,5,4,3,.125f); gpu->SetCurr(1,5,4,3,.01f);
+	TEST_ASSERT(gpu->ClearProfile(),"Automatic dump profile reset failed");
+	fdtd.RunFDTD();
+	const auto statistics=gpu->GetProfile();
+	TEST_ASSERT(statistics.fdSamples==132 && statistics.tdSamples==20,"Default GPU dumps lost sample boundaries");
+	TEST_ASSERT(statistics.fdDownloadBytes>0 && statistics.tdDownloadBytes==20ull*11*9*3*4,"Automatic dumps did not download the requested region");
+	TEST_ASSERT(statistics.downloadedBytes==24ull*11*9*7,"Automatic dumps caused intermediate full-field downloads");
+	return true;
+#endif
+}
+
 static bool FDSpectrumError(const std::vector<std::complex<float>>& expected,
                             const std::vector<std::complex<float>>& actual,
                             float& peak, float& error)
@@ -3229,7 +3354,7 @@ bool Test_Vulkan_FDMemoryFallback()
 	return true;
 #else
 	std::vector<std::complex<float>> reference[2][2];
-	for (const std::string mode : {"cpu","gpu"}) {
+	for (const std::string mode : {"cpu","gpu","auto"}) {
 		TestFDTDAccess fdtd;
 		fdtd.SetLibraryArguments({"--engine=vulkan","--numThreads=1","--vulkan-fd="+mode,"--exact-endcriteria"});
 		fdtd.SetCSX(CreateCustomGrid(11,9,7));
@@ -3248,7 +3373,7 @@ bool Test_Vulkan_FDMemoryFallback()
 			fdtd.GetProcessings()->AddProcessing(dump);
 		}
 		uint64_t limit=0;
-		if (mode=="gpu") {
+		if (mode!="cpu") {
 			// Calibrate using actual allocation sizes so this budget is portable.
 			fdtd.GetProcessings()->InitAll();
 			ProcessingArray first(100); first.AddProcessing(dumps[0]);
@@ -3273,7 +3398,7 @@ bool Test_Vulkan_FDMemoryFallback()
 		fdtd.RunFDTD();
 		TEST_ASSERT(gpu->GetNumberOfTimesteps()==65,"FD memory fallback changed simulation length");
 		for (unsigned int field=0; field<2; ++field) {
-			TEST_ASSERT(dumps[field]->UsesDeviceFields()==(mode=="gpu" && field==0),"FD budget did not produce the expected residency");
+			TEST_ASSERT(dumps[field]->UsesDeviceFields()==(mode!="cpu" && field==0),"FD budget did not produce the expected residency");
 			TEST_ASSERT(dumps[field]->GetFDSampleCount()==66,"Mixed FD residency lost or duplicated samples");
 			for (unsigned int frequency=0; frequency<2; ++frequency) {
 				const auto actual=TestFDDump::Values(dumps[field],frequency);
@@ -3285,7 +3410,7 @@ bool Test_Vulkan_FDMemoryFallback()
 				}
 			}
 		}
-		if (mode=="gpu") {
+		if (mode!="cpu") {
 			const auto statistics=gpu->GetProfile();
 			TEST_ASSERT(statistics.fdSamples==66 && statistics.fdDownloadBytes>0 && statistics.downloadedBytes>0,
 			            "Mixed residency missed GPU samples or CPU field synchronization");
@@ -3311,7 +3436,7 @@ bool Test_Vulkan_FDCylindricalFallback()
 #else
 	for (bool multigrid : {false,true}) {
 		std::vector<std::complex<float>> reference[6];
-		for (const std::string mode : {"cpu","gpu"}) {
+		for (const std::string mode : {"cpu","gpu","auto"}) {
 			TestFDTDAccess fdtd;
 			fdtd.SetLibraryArguments({"--engine=vulkan","--numThreads=1","--vulkan-fd="+mode,"--exact-endcriteria"});
 			fdtd.SetCylinderCoords(true);
@@ -3538,6 +3663,8 @@ int main(int argc, char* argv[])
 	}
 	if (argc>1 && std::string(argv[1])=="--field-accumulation-tests") {
 		RUN_TEST(Test_FDSpectrumValidation);
+		RUN_TEST(Test_Vulkan_TimeDomainGather);
+		RUN_TEST(Test_Vulkan_AutomaticFieldDumps);
 		RUN_TEST(Test_Vulkan_FieldAccumulation);
 		RUN_TEST(Test_Vulkan_FDMemoryFallback);
 		RUN_TEST(Test_Vulkan_FDCylindricalFallback);
@@ -3654,6 +3781,8 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_Vulkan_SynchronizationDependencies);
 	RUN_TEST(Test_FDSpectrumValidation);
 	RUN_TEST(Test_Vulkan_FieldAccumulation);
+	RUN_TEST(Test_Vulkan_TimeDomainGather);
+	RUN_TEST(Test_Vulkan_AutomaticFieldDumps);
 	RUN_TEST(Test_Vulkan_FDMemoryFallback);
 	RUN_TEST(Test_Vulkan_FDCylindricalFallback);
 	RUN_TEST(Test_Vulkan_FDInterruption);

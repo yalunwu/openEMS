@@ -102,6 +102,8 @@ public:
 	virtual bool GetEnable() const {return Enabled;}
 	//! This consumer samples device fields without requiring a CPU field mirror.
 	virtual bool UsesDeviceFields() const {return false;}
+	//! This consumer must observe the completed timestep before CPU processing.
+	virtual bool RequiresTimestepBoundary() const {return !UsesDeviceFields();}
 
 	virtual void SetWeight(double weight) {m_weight=weight;}
 	virtual double GetWeight() {return m_weight;}

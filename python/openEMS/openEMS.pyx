@@ -679,8 +679,24 @@ cdef class openEMS:
           from 1 to 64 (default 32); processing intervals still limit advancement
         * vulkan_profile (bool) - report CPU timings, sampled GPU timings and
           submission/transfer counts; disabled by default
-        * vulkan_fd ('cpu' or 'gpu') - frequency-domain E/H field accumulation;
-          'cpu' is the default reference, 'gpu' enables supported dump regions
+        * vulkan_fd ('auto', 'cpu' or 'gpu') - frequency-domain E/H accumulation;
+          'auto' (default) prefers GPU accumulation for supported dumps.
+          'cpu' selects the reference. 'gpu' supports basic Cartesian
+          DumpType 10/11 with native/node/cell sampling, including FD NF2FF
+          surfaces. Unsupported mappings or insufficient resources retain CPU
+          accumulation per dump before its first sample. Cylindrical/multigrid,
+          SSE and SAR retain their CPU processing
+        * vulkan_td ('auto', 'cpu' or 'gpu') - time-domain E/H gathering;
+          'auto' (default) gathers supported basic Cartesian DumpType 0/1
+          regions on the GPU, downloading only the output values. 'cpu'
+          selects full-field CPU sampling. Unsupported mappings or insufficient
+          resources retain CPU sampling; file writing remains on the CPU
+
+        Example with automatic GPU field processing::
+
+            FDTD.Run(sim_path, engine='vulkan', vulkan_fd='auto', vulkan_td='auto',
+                     vulkan_coefficients='dense', vulkan_batch_size=32)
+
         """
         # a relative sim_path would be resolved against itself after the chdir below
         sim_path = os.path.abspath(sim_path)

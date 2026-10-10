@@ -1,6 +1,7 @@
 /* Copyright (C) 2026 openEMS Project. SPDX-License-Identifier: GPL-3.0-or-later */
 #include "engine_vulkan.h"
 #include "Common/processfields_fd.h"
+#include "Common/processfields_td.h"
 #include "FDTD/engine_interface_fdtd.h"
 #include "FDTD/operator.h"
 #include <algorithm>
@@ -19,14 +20,17 @@ struct FDTimer {
 	double* value;
 	std::chrono::steady_clock::time_point start;
 };
-struct FDAxis { uint32_t position; float a, b; uint32_t padding; };
 const char* fdShader = R"(#version 450
 layout(local_size_x=256) in;
 struct Axis { uint position; float a; float b; uint padding; };
 layout(std430,binding=0) readonly buffer Field { float fieldData[]; };
 layout(std430,binding=1) readonly buffer Mapping { Axis axes[]; };
+#ifdef TIME_DOMAIN
+layout(std430,binding=2) writeonly buffer Values { float values[]; };
+#else
 layout(std430,binding=2) buffer Sums { vec2 sums[]; };
 layout(std430,binding=3) readonly buffer Phases { vec2 phases[]; };
+#endif
 layout(push_constant) uniform Parameters {
     uint nx; uint ny; uint nz; uint gx; uint gy; uint gz;
     uint offset; uint count; uint phase; uint mode; uint magnetic; uint cells;
@@ -66,17 +70,29 @@ void main() {
             value=value+fieldData[third]*a[n].a;
         }
     }
+#ifdef TIME_DOMAIN
+    values[i]=value;
+#else
     precise vec2 contribution=value*phases[pc.phase];
     precise vec2 result=sums[i]+contribution;
     sums[i]=result;
+#endif
 }
 )";
 }
 
 bool EngineVulkan::CreateFDPipeline(bool* allocationFailed)
 {
+	return CreateFieldPipeline(false, allocationFailed);
+}
+
+bool EngineVulkan::CreateFieldPipeline(bool timeDomain, bool* allocationFailed)
+{
 	*allocationFailed=false;
-	if (m_pipelineFD) return true;
+	auto& target=timeDomain ? m_pipelineTD : m_pipelineFD;
+	auto& descriptorLayout=timeDomain ? m_descLayoutTD : m_descLayoutFD;
+	auto& targetLayout=timeDomain ? m_pipelineLayoutTD : m_pipelineLayoutFD;
+	if (target) return true;
 	auto failed=[&](VkResult result) {
 		*allocationFailed=result==VK_ERROR_OUT_OF_HOST_MEMORY || result==VK_ERROR_OUT_OF_DEVICE_MEMORY;
 		return result!=VK_SUCCESS;
@@ -85,6 +101,7 @@ bool EngineVulkan::CreateFDPipeline(bool* allocationFailed)
 	shaderc::CompileOptions options;
 	options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
 	options.SetOptimizationLevel(shaderc_optimization_level_performance);
+	if (timeDomain) options.AddMacroDefinition("TIME_DOMAIN");
 	const auto compiled = compiler.CompileGlslToSpv(fdShader, shaderc_glsl_compute_shader, "field_fd.comp", options);
 	if (compiled.GetCompilationStatus() != shaderc_compilation_status_success) {
 		std::cerr << compiled.GetErrorMessage();
@@ -102,18 +119,18 @@ bool EngineVulkan::CreateFDPipeline(bool* allocationFailed)
 		bindings[i].stageFlags=VK_SHADER_STAGE_COMPUTE_BIT;
 	}
 	VkDescriptorSetLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-	layout.bindingCount=4; layout.pBindings=bindings;
-	if (failed(vkCreateDescriptorSetLayout(m_device,&layout,nullptr,&m_descLayoutFD))) return false;
+	layout.bindingCount=timeDomain ? 3 : 4; layout.pBindings=bindings;
+	if (failed(vkCreateDescriptorSetLayout(m_device,&layout,nullptr,&descriptorLayout))) return false;
 	VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT,0,48};
 	VkPipelineLayoutCreateInfo pipelineLayout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-	pipelineLayout.setLayoutCount=1; pipelineLayout.pSetLayouts=&m_descLayoutFD;
+	pipelineLayout.setLayoutCount=1; pipelineLayout.pSetLayouts=&descriptorLayout;
 	pipelineLayout.pushConstantRangeCount=1; pipelineLayout.pPushConstantRanges=&range;
-	if (failed(vkCreatePipelineLayout(m_device,&pipelineLayout,nullptr,&m_pipelineLayoutFD))) return false;
+	if (failed(vkCreatePipelineLayout(m_device,&pipelineLayout,nullptr,&targetLayout))) return false;
 	VkComputePipelineCreateInfo pipeline = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-	pipeline.layout=m_pipelineLayoutFD;
+	pipeline.layout=targetLayout;
 	pipeline.stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	pipeline.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT; pipeline.stage.module=module; pipeline.stage.pName="main";
-	return !failed(vkCreateComputePipelines(m_device,VK_NULL_HANDLE,1,&pipeline,nullptr,&m_pipelineFD));
+	return !failed(vkCreateComputePipelines(m_device,VK_NULL_HANDLE,1,&pipeline,nullptr,&target));
 }
 
 void EngineVulkan::DestroyFieldDumps(bool reset)
@@ -136,13 +153,56 @@ void EngineVulkan::DestroyFieldDumps(bool reset)
 
 bool EngineVulkan::SupportsFDDump(const ProcessFieldsFD* processing) const
 {
-	if (typeid(*processing)!=typeid(ProcessFieldsFD) ||
-	    typeid(*processing->m_Eng_Interface)!=typeid(Engine_Interface_FDTD) ||
+	return typeid(*processing)==typeid(ProcessFieldsFD) && SupportsFieldDump(processing);
+}
+
+bool EngineVulkan::SupportsFieldDump(const ProcessFields* processing) const
+{
+	if (!m_level->m_op || typeid(*processing->m_Eng_Interface)!=typeid(Engine_Interface_FDTD) ||
 	    typeid(*m_level->m_op)!=typeid(Operator) || !m_level->m_op->GetEngine() ||
 	    m_level->m_op->GetEngine()->GetType()!=Engine::BASIC || processing->Op!=m_level->m_op ||
 	    (processing->m_DumpType!=ProcessFields::E_FIELD_DUMP && processing->m_DumpType!=ProcessFields::H_FIELD_DUMP)) return false;
 	if (processing->m_Eng_Interface->GetInterpolationType()<Engine_Interface_Base::NO_INTERPOLATION ||
 	    processing->m_Eng_Interface->GetInterpolationType()>Engine_Interface_Base::CELL_INTERPOLATE) return false;
+	return true;
+}
+
+bool EngineVulkan::BuildFieldMapping(const ProcessFields* processing, uint32_t* dims, uint32_t& mode,
+                                    uint32_t& magnetic, std::vector<FieldAxis>& mapping) const
+{
+	magnetic=processing->m_DumpType==ProcessFields::H_FIELD_DUMP;
+	mode=processing->m_Eng_Interface->GetInterpolationType();
+	uint64_t components=3;
+	for (unsigned int n=0; n<3; ++n) {
+		dims[n]=processing->numLines[n];
+		if (!dims[n] || components>UINT32_MAX/dims[n]) return false;
+		components*=dims[n];
+		for (unsigned int i=0; i<dims[n]; ++i) {
+			unsigned int pos[3]={0,0,0}; pos[n]=processing->posLines[n][i];
+			if (pos[n]>=m_level->m_op->GetNumberOfLines(n)) return false;
+			const double delta=m_level->m_op->GetEdgeLength(n,pos,magnetic!=0);
+			double a=delta ? 1.0/delta : 0, b=0;
+			if (mode==1 && !magnetic) {
+				if (pos[n]==m_level->m_op->GetNumberOfLines(n,true)-1) {
+					--pos[n]; const double lower=m_level->m_op->GetEdgeLength(n,pos); ++pos[n];
+					a=0; b=lower ? 1.0/lower : 0;
+				} else if (delta && pos[n]>0) {
+					--pos[n]; const double lower=m_level->m_op->GetEdgeLength(n,pos); ++pos[n];
+					const double fraction=delta/(delta+lower);
+					a*=(1-fraction); b=lower ? fraction/lower : 0;
+				}
+			} else if (mode==2 && magnetic) {
+				if (pos[n]>=m_level->m_op->GetNumberOfLines(n,true)-1) a=0;
+				else {
+					++pos[n]; const double upper=m_level->m_op->GetEdgeLength(n,pos,true); --pos[n];
+					const double fraction=delta/(delta+upper);
+					a*=(1-fraction); b=upper ? fraction/upper : 0;
+				}
+			} else if (mode!=0) a*=0.25;
+			if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(static_cast<float>(a)) || !std::isfinite(static_cast<float>(b))) return false;
+			mapping.push_back({pos[n],static_cast<float>(a),static_cast<float>(b),0});
+		}
+	}
 	return true;
 }
 
@@ -160,6 +220,8 @@ bool EngineVulkan::CheckFDFallbackMemory(const FDDump* pending, uint64_t* availa
 		for (const auto& chunk : dump.chunks) account(chunk->sums);
 	};
 	account(m_fdStaging);
+	account(m_tdValues); account(m_tdStaging);
+	for (const auto& dump : m_tdDumps) account(dump->mapping);
 	for (const auto& dump : m_fdDumps) accountDump(*dump);
 	if (pending) accountDump(*pending);
 	bool fits=true;
@@ -184,47 +246,14 @@ bool EngineVulkan::AllocateFDDump(ProcessFieldsFD* processing, std::unique_ptr<F
 	dump.reset(new FDDump);
 	dump->device=m_device; dump->processing=processing;
 	dump->active=processing->m_deviceAccumulation;
-	dump->magnetic=processing->m_DumpType==ProcessFields::H_FIELD_DUMP;
-	dump->mode=processing->m_Eng_Interface->GetInterpolationType();
-	uint64_t components=3;
-	std::vector<FDAxis> mapping;
-	for (unsigned int n=0; n<3; ++n) {
-		dump->dims[n]=processing->numLines[n];
-		if (!dump->dims[n] || components>UINT32_MAX/dump->dims[n]) return false;
-		components*=dump->dims[n];
-		for (unsigned int i=0; i<dump->dims[n]; ++i) {
-			unsigned int pos[3]={0,0,0}; pos[n]=processing->posLines[n][i];
-			if (pos[n]>=m_level->m_op->GetNumberOfLines(n)) return false;
-			const double delta=m_level->m_op->GetEdgeLength(n,pos,dump->magnetic!=0);
-			// Cartesian edge length depends only on its component axis. The two
-			// weights scale the current/adjacent edge; cross-axis averages use a.
-			double a=delta ? 1.0/delta : 0, b=0;
-			if (dump->mode==1 && !dump->magnetic) {
-				if (pos[n]==m_level->m_op->GetNumberOfLines(n,true)-1) {
-					--pos[n]; const double lower=m_level->m_op->GetEdgeLength(n,pos); ++pos[n];
-					a=0; b=lower ? 1.0/lower : 0;
-				} else if (delta && pos[n]>0) {
-					--pos[n]; const double lower=m_level->m_op->GetEdgeLength(n,pos); ++pos[n];
-					const double fraction=delta/(delta+lower);
-					a*=(1-fraction); b=lower ? fraction/lower : 0;
-				}
-			} else if (dump->mode==2 && dump->magnetic) {
-				if (pos[n]>=m_level->m_op->GetNumberOfLines(n,true)-1) a=0;
-				else {
-					++pos[n]; const double upper=m_level->m_op->GetEdgeLength(n,pos,true); --pos[n];
-					const double fraction=delta/(delta+upper);
-					a*=(1-fraction); b=upper ? fraction/upper : 0;
-				}
-			} else if (dump->mode!=0) a*=0.25;
-			if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(static_cast<float>(a)) || !std::isfinite(static_cast<float>(b))) return false;
-			mapping.push_back({pos[n],static_cast<float>(a),static_cast<float>(b),0});
-		}
-	}
+	std::vector<FieldAxis> mapping;
+	if (!BuildFieldMapping(processing,dump->dims,dump->mode,dump->magnetic,mapping)) return false;
+	const uint64_t components=3ull*dump->dims[0]*dump->dims[1]*dump->dims[2];
 	const uint64_t frequencies=processing->m_FD_Samples.size();
 	if (!frequencies || frequencies>UINT32_MAX || components>UINT64_MAX/(8*frequencies) ||
 	    processing->m_FD_Fields.size()!=frequencies) return false;
 	dump->bytes=components*8*frequencies;
-	dump->mappingBytes=mapping.size()*sizeof(FDAxis);
+	dump->mappingBytes=mapping.size()*sizeof(FieldAxis);
 	const uint64_t phaseBytes=frequencies*64*8;
 	VkPhysicalDeviceProperties properties={}; vkGetPhysicalDeviceProperties(m_physicalDevice,&properties);
 	const uint64_t limit=std::min<uint64_t>(m_fdChunkBytes,properties.limits.maxStorageBufferRange);
@@ -357,6 +386,170 @@ bool EngineVulkan::RecordFieldDumps(VkCommandBuffer cmd, unsigned int timestep, 
 	}
 	m_sampleDispatches=previousSampling;
 	return sampled;
+}
+#endif
+
+bool EngineVulkan::RegisterTimeDomainDumps(ProcessingArray* pa, const std::string& mode)
+{
+	if (mode!="auto" && mode!="cpu" && mode!="gpu") return false;
+#ifdef ENABLE_VULKAN
+	if (GetPendingProbeHistorySteps() || !Synchronize()) return false;
+	DestroyTimeDomainDumps();
+	if (mode=="cpu" || !pa) return true;
+	try {
+	VkPhysicalDeviceProperties properties={};
+	vkGetPhysicalDeviceProperties(m_physicalDevice,&properties);
+	uint64_t largest=0;
+	for (size_t i=0; i<pa->GetNumberOfProcessings(); ++i) {
+		auto* processing=dynamic_cast<ProcessFieldsTD*>(pa->GetProcessing(i));
+		if (!processing || !processing->GetEnable() || typeid(*processing)!=typeid(ProcessFieldsTD) || !SupportsFieldDump(processing)) continue;
+		uint64_t count=3;
+		for (unsigned int n=0; n<3; ++n) {
+			if (!processing->numLines[n] || count>UINT32_MAX/processing->numLines[n]) { count=0; break; }
+			count*=processing->numLines[n];
+		}
+		largest=std::max(largest,count*4);
+	}
+	const uint64_t chunkBytes=std::min({largest,m_tdChunkBytes,uint64_t(properties.limits.maxStorageBufferRange),
+	                                 uint64_t(properties.limits.maxComputeWorkGroupCount[0])*256*4})/4*4;
+	for (size_t i=0; i<pa->GetNumberOfProcessings(); ++i) {
+		auto* processing=dynamic_cast<ProcessFieldsTD*>(pa->GetProcessing(i));
+		if (!processing || !processing->GetEnable()) continue;
+		auto fallback=[&](const std::string& reason) {
+			std::cout << "VULKAN_TD name=" << processing->GetName() << " file=" << processing->m_filename
+			          << " mode=cpu reason=" << reason << std::endl;
+		};
+		if (typeid(*processing)!=typeid(ProcessFieldsTD) || !SupportsFieldDump(processing)) {
+			fallback("unsupported field mapping"); continue;
+		}
+		bool allocationFailed=false;
+		if (!CreateFieldPipeline(true,&allocationFailed)) {
+			if (!allocationFailed) return false;
+			DestroyTimeDomainDumps();
+			fallback("optional pipeline allocation"); return true;
+		}
+		std::unique_ptr<TDDump> dump(new TDDump);
+		dump->device=m_device; dump->processing=processing; dump->reader=processing->m_deviceGather;
+		std::vector<FieldAxis> mapping;
+		if (!BuildFieldMapping(processing,dump->dims,dump->mode,dump->magnetic,mapping) || !chunkBytes) {
+			fallback("unsupported output size or mapping"); continue;
+		}
+		dump->count=3u*dump->dims[0]*dump->dims[1]*dump->dims[2];
+		const uint64_t estimate=mapping.size()*sizeof(FieldAxis)+(m_tdValues.buffer ? 0 : chunkBytes*2);
+		VkPhysicalDeviceMemoryBudgetPropertiesEXT budget={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+		VkPhysicalDeviceMemoryProperties2 memory={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+		if (m_memoryBudget) memory.pNext=&budget;
+		vkGetPhysicalDeviceMemoryProperties2(m_physicalDevice,&memory);
+		uint64_t available=0;
+		for (uint32_t h=0; h<memory.memoryProperties.memoryHeapCount; ++h)
+			if (memory.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+				const uint64_t capacity=m_memoryBudget ? (budget.heapBudget[h]>budget.heapUsage[h] ? budget.heapBudget[h]-budget.heapUsage[h] : 0) : memory.memoryProperties.memoryHeaps[h].size/4;
+				available=std::max(available,capacity*3/4);
+			}
+		if (!m_memoryBudget && !CheckFDFallbackMemory(nullptr,&available)) available=0;
+		if (estimate>std::min(available,m_tdMemoryLimit)) {
+			fallback("insufficient memory budget"); continue;
+		}
+		if (!UploadStorageBuffer(mapping.data(),mapping.size()*sizeof(FieldAxis),dump->mapping,&allocationFailed)) {
+			if (!allocationFailed) return false;
+			fallback("optional mapping allocation"); continue;
+		}
+		if (!m_tdValues.buffer &&
+		    (!CreateBuffer(chunkBytes,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,m_tdValues) ||
+		     !CreateBuffer(chunkBytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,m_tdStaging))) {
+			m_tdValues.Release(); m_tdStaging.Release();
+			fallback("optional readback allocation"); continue;
+		}
+		VkDescriptorPoolSize poolSize={VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,3};
+		VkDescriptorPoolCreateInfo pool={VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+		pool.maxSets=1; pool.poolSizeCount=1; pool.pPoolSizes=&poolSize;
+		VkResult result=vkCreateDescriptorPool(m_device,&pool,nullptr,&dump->pool);
+		VkDescriptorSetAllocateInfo allocation={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+		allocation.descriptorPool=dump->pool; allocation.descriptorSetCount=1; allocation.pSetLayouts=&m_descLayoutTD;
+		if (result==VK_SUCCESS) result=vkAllocateDescriptorSets(m_device,&allocation,&dump->descriptors);
+		if (result!=VK_SUCCESS) {
+			if (result!=VK_ERROR_OUT_OF_DEVICE_MEMORY && result!=VK_ERROR_OUT_OF_HOST_MEMORY) return false;
+			fallback("optional descriptor allocation"); continue;
+		}
+		const auto& field=dump->magnetic ? m_level->m_bufCurr : m_level->m_bufVolt;
+		VkDescriptorBufferInfo buffers[]={{field.buffer,0,field.size},{dump->mapping.buffer,0,dump->mapping.size},{m_tdValues.buffer,0,m_tdValues.size}};
+		VkWriteDescriptorSet writes[3]={};
+		for (uint32_t binding=0; binding<3; ++binding) {
+			writes[binding].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[binding].dstSet=dump->descriptors;
+			writes[binding].dstBinding=binding; writes[binding].descriptorCount=1;
+			writes[binding].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[binding].pBufferInfo=&buffers[binding];
+		}
+		vkUpdateDescriptorSets(m_device,3,writes,0,nullptr);
+		TDDump* registered=dump.get();
+		m_tdDumps.push_back(std::move(dump));
+		if (!m_memoryBudget && !CheckFDFallbackMemory()) {
+			m_tdDumps.pop_back(); fallback("insufficient cumulative memory budget"); continue;
+		}
+		*processing->m_deviceGather=[this,registered](ArrayLib::ArrayNIJK<float>& output) {return ReadTimeDomainDump(*registered,output);};
+		std::cout << "VULKAN_TD name=" << processing->GetName() << " file=" << processing->m_filename
+		          << " mode=gpu output_bytes=" << uint64_t(registered->count)*4 << " staging_bytes=" << m_tdStaging.size << std::endl;
+	}
+	if (m_tdDumps.empty()) DestroyTimeDomainDumps();
+	} catch (const std::bad_alloc&) {
+		DestroyTimeDomainDumps();
+		std::cout << "VULKAN_TD mode=cpu reason=optional host allocation" << std::endl;
+	}
+#else
+	(void)pa;
+#endif
+	return true;
+}
+
+#ifdef ENABLE_VULKAN
+void EngineVulkan::DestroyTimeDomainDumps()
+{
+	for (auto& dump : m_tdDumps)
+		if (auto reader=dump->reader.lock()) *reader={};
+	m_tdDumps.clear();
+	m_tdValues.Release(); m_tdStaging.Release();
+	if (m_pipelineTD) vkDestroyPipeline(m_device,m_pipelineTD,nullptr);
+	if (m_pipelineLayoutTD) vkDestroyPipelineLayout(m_device,m_pipelineLayoutTD,nullptr);
+	if (m_descLayoutTD) vkDestroyDescriptorSetLayout(m_device,m_descLayoutTD,nullptr);
+	m_pipelineTD=VK_NULL_HANDLE; m_pipelineLayoutTD=VK_NULL_HANDLE; m_descLayoutTD=VK_NULL_HANDLE;
+}
+
+bool EngineVulkan::ReadTimeDomainDump(TDDump& dump, ArrayLib::ArrayNIJK<float>& field)
+{
+	if (GetPendingProbeHistorySteps() || !Synchronize() || !SyncHierarchyToDevice() || !WaitForFence()) return false;
+	if (field.size()!=dump.count || dump.processing->m_Eng_Interface->GetInterpolationType()!=dump.mode ||
+	    dump.processing->m_DumpType!=(dump.magnetic ? ProcessFields::H_FIELD_DUMP : ProcessFields::E_FIELD_DUMP))
+		throw std::runtime_error("Vulkan TD mapping changed; reset and reinitialize before another run");
+	const auto& grid=m_level->m_grid;
+	for (uint64_t offset=0; offset<dump.count; offset+=m_tdValues.size/4) {
+		const uint32_t count=static_cast<uint32_t>(std::min<uint64_t>(dump.count-offset,m_tdValues.size/4));
+		VkCommandBufferBeginInfo begin={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+		begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		if (vkBeginCommandBuffer(m_level->m_cmdBuffer,&begin)!=VK_SUCCESS) return false;
+		BeginProfileCommands(m_level->m_cmdBuffer);
+		VkMemoryBarrier barrier={VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+		barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
+		MemoryBarrier(m_level->m_cmdBuffer,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,barrier);
+		const uint32_t parameters[]={dump.dims[0],dump.dims[1],dump.dims[2],grid.dimX,grid.dimY,grid.dimZ,
+			static_cast<uint32_t>(offset),count,0,dump.mode,dump.magnetic,grid.numCells};
+		vkCmdBindPipeline(m_level->m_cmdBuffer,VK_PIPELINE_BIND_POINT_COMPUTE,m_pipelineTD);
+		vkCmdBindDescriptorSets(m_level->m_cmdBuffer,VK_PIPELINE_BIND_POINT_COMPUTE,m_pipelineLayoutTD,0,1,&dump.descriptors,0,nullptr);
+		vkCmdPushConstants(m_level->m_cmdBuffer,m_pipelineLayoutTD,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(parameters),parameters);
+		const bool previous=m_sampleDispatches; m_sampleDispatches=m_profileEnabled;
+		Dispatch(m_level->m_cmdBuffer,(count+255u)/256u,1,1,ProfileTD);
+		m_sampleDispatches=previous;
+		barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+		MemoryBarrier(m_level->m_cmdBuffer,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,barrier);
+		VkBufferCopy copy={0,0,uint64_t(count)*4};
+		vkCmdCopyBuffer(m_level->m_cmdBuffer,m_tdValues.buffer,m_tdStaging.buffer,1,&copy);
+		barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+		MemoryBarrier(m_level->m_cmdBuffer,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,barrier);
+		if (vkEndCommandBuffer(m_level->m_cmdBuffer)!=VK_SUCCESS || !SubmitCommandBuffer() || !WaitForFence()) return false;
+		std::memcpy(field.data()+offset,m_tdStaging.mapped,static_cast<size_t>(copy.size));
+		if (m_profileEnabled) m_profile.tdDownloadBytes+=copy.size;
+	}
+	if (m_profileEnabled) ++m_profile.tdSamples;
+	return true;
 }
 #endif
 
