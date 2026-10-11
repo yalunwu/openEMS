@@ -9,12 +9,13 @@ Status as of 2026-10-10:
 | 2 | Probe gathering/history and basic Cartesian GPU energy implemented. |
 | 3 | Workgroup tuning cancelled. |
 | 4 | Exact coefficient palettes implemented, opt-in; dense remains the default. |
-| 5 | Stencil-load tuning cancelled. |
+| 5 | Targeted compiled-load tuning planned; broad tiling/subgroup work remains deferred. |
 | 6a | Extension and synchronization audit implemented. |
 | 6b | First delivery implemented; command reuse, recording overlap and projection fusion remain candidates. |
+| 6c | Planned: direct Cartesian PML addressing, then validated same-phase PML/Yee fusion. |
 | 7 | Cartesian FD E/H accumulation and compact TD E/H gathering implemented with automatic GPU preference and CPU fallback. |
 | 7 follow-ups | Proposed; measure final-readback pipelining and host-result memory lifetime separately. |
-| 8 prerequisite | Next delivery: define convergence snapshots, validate detector traces and measure check costs. |
+| 8 prerequisite | Required for convergence changes: define snapshots, validate detector traces and measure check costs. |
 | 8a | Proposed; select cylindrical/multigrid GPU energy by measured check cost or capability demand. |
 | 8b | Proposed; measure steady-state overhead before selecting execution changes. |
 | 9 | Proposed; separate compact integration, GPU spectra and final-only output deliveries. |
@@ -75,9 +76,19 @@ cross-vendor validation is required before claiming portable performance gains.
 
 ## Next priorities
 
+The selected antenna memory work is detailed in the
+[memory-access implementation plan](VULKAN_MEMORY_IMPLEMENTATION_PLAN.md):
+attribute shader costs, implement direct PML addressing, investigate compiled
+core loads, then prototype same-phase PML/Yee fusion. Each delivery retains a
+reference path and separate numerical/performance acceptance. Fixed-work
+prototypes can proceed while the convergence audit remains open; they must
+preserve current stopping semantics and do not establish CPU/Vulkan detector
+equivalence. Other roadmap priorities below remain separate deliveries.
+
 1. **Convergence contract:** define the reference voltage/current phases,
    projection state and timestep mapping; compare CPU/Vulkan detector traces.
-   Resolve discrepancies in a separate correctness change before optimization.
+   Resolve discrepancies in a separate correctness change before optimizations
+   that depend on altered convergence semantics.
 2. **Measurement extension:** separate convergence, stepping, finalization and
    file-writing costs; add cylindrical/multigrid solver cases with energy checks.
 3. **Select one candidate:** publish measured cost fractions and choose among
@@ -249,11 +260,14 @@ Use dense storage for the primary before/after benchmarks of subsequent phases.
 Keep palette compatibility and regression coverage, and label any separately
 measured palette results so coefficient-mode changes cannot obscure the gain.
 
-## Phase 5: reduce stencil loads (cancelled)
+## Phase 5: targeted core-load tuning (planned)
 
-Cancelled because shared-memory tiling and subgroup variants introduce tile-size,
-barrier and resource tradeoffs whose performance depends on the GPU. Retain the
-direct-load shaders. This work is outside the remaining implementation roadmap.
+Inspect optimized producer loads, reuse and spills before selecting a bounded
+shader change. Preserve contiguous field access and the direct-load reference;
+repeated source expressions alone do not prove repeated hardware loads. See M0
+and M2 in the [memory-access plan](VULKAN_MEMORY_IMPLEMENTATION_PLAN.md).
+Broad shared-memory tiling, subgroup rewrites and workgroup sweeps remain
+deferred because their barriers and resource tradeoffs need separate evidence.
 
 ## Phase 6a: extension and synchronization audit (implemented)
 
@@ -320,6 +334,19 @@ multigrid workloads.
 Completion: separately reviewable changes with demonstrated performance benefits
 and documented dependency proofs. Retain the reference path where an optimization
 does not meet the performance acceptance criteria.
+
+## Phase 6c: PML memory traffic (planned)
+
+Use regular Cartesian boundary descriptors to remove per-component field-index
+loads, preserving coefficient/flux ownership and an indexed fallback. Measure
+extra address arithmetic and dispatches before accepting this path. Validate
+region bounds/disjointness at setup; an overlapping layout needs rejection or
+a proven ordered path, since indexed addressing alone does not prevent races.
+Compare per-region and unified descriptor dispatches. Then prototype PML
+pre/Yee/post fusion within voltage or current separately, with a
+single writer per component, preserved extension priority and required global
+dependencies. See M1/M3 and their validation gates in the
+[memory-access plan](VULKAN_MEMORY_IMPLEMENTATION_PLAN.md).
 
 ## Phase 7: accumulate frequency-domain E/H fields on the GPU (implemented)
 
