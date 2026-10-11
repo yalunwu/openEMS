@@ -7,6 +7,7 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/operator_setup.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/field_accumulator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/operator_cpu_setup.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_multithread.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_cylinder.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_cylinder.cpp

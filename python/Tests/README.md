@@ -48,6 +48,11 @@ Use a matching native build/Python wheel and set `OPENEMS_INSTALL_PATH` when
 testing an isolated install. Native construction fixtures additionally run with
 `test_backend --setup-tests`.
 
+`test_vulkan_fd.Test_VulkanFD.test_cpu_operator_setup_threads` compares one,
+three and automatic CPU worker counts feeding the same Vulkan solver, including
+FD/TD files and angular NF2FF. `test_backend --cpu-setup-tests` checks native
+CPU construction and worker limits in both Vulkan and CPU-only builds.
+
 Requires a Vulkan-enabled native build, compatible device and matching rebuilt bindings.
 
 ```bash

@@ -31,13 +31,16 @@ class Operator_Ext_Excitation;
 class Engine;
 class TiXmlElement;
 class OperatorSetup;
+class CpuOperatorSetup;
 
 //! Basic FDTD-operator
 class OPENEMS_EXPORT Operator : public Operator_Base
 {
 	friend class Engine;
 	friend class VulkanOperatorSetup;
+	friend class CpuOperatorSetup;
 	friend bool Test_Vulkan_OperatorSetup();
+	friend bool Test_CPU_OperatorSetup();
 	friend class Engine_Interface_FDTD;
 	friend class Operator_Ext_LorentzMaterial;
 	friend class Operator_Ext_ConductingSheet;
@@ -63,6 +66,9 @@ public:
 	virtual bool SetGeometryCSX(ContinuousStructure* geo);
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
+	// Construct the basic layout with CPU workers, then retain the normal engine interfaces.
+	int CalcECOperatorMultithreaded(unsigned int numThreads = 0, DebugFlags debugFlags = None);
+	unsigned int GetLastSetupThreadCount() const { return m_lastSetupThreads; }
 	void SetSetupBackend(OperatorSetup* backend) { m_setupBackend = backend; }
 	OperatorSetup* GetSetupBackend() const { return m_setupBackend; }
 
@@ -246,6 +252,8 @@ public:
 
 protected:
 	OperatorSetup* m_setupBackend = NULL; // borrowed during CalcECOperator only
+	CpuOperatorSetup* m_cpuSetup = NULL; // borrowed during CPU construction only
+	unsigned int m_lastSetupThreads = 1;
 	//! use New() for creating a new Operator
 	Operator();
 

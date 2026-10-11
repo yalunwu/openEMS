@@ -24,11 +24,12 @@ function RunOpenEMS(Sim_Path, Sim_File, opts, Settings)
 %          --engine=sse             engine using sse vector extensions
 %          --engine=sse-compressed  engine using compressed operator + sse vector extensions
 %          --engine=multithreaded   engine using compressed operator + sse vector extensions + multithreading
-%      --numThreads=<n>     Force use n threads for multithreaded engine
+%      --numThreads=<n>     CPU workers for multithreaded engine or Vulkan CPU setup (0: available CPUs)
 %      --vulkan-batch-size=<n>  Maximum timesteps per Vulkan submission (1..64, default 32)
 %      --vulkan-profile        Report Vulkan CPU/GPU timings and submission/transfer counts
 %      --vulkan-setup=<auto|cpu|gpu>  Operator construction
-%          cpu selects the single-threaded reference; auto (default) attempts
+%          cpu uses numThreads CPU workers (1 selects the serial reference);
+%          auto (default) attempts
 %          GPU setup with clean CPU fallback; gpu requires GPU setup and
 %          rejects unsupported models.
 %          Basic Cartesian Vulkan models require FP64, supported primitives

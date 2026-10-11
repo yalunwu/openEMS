@@ -58,6 +58,7 @@
 #include "CSPrimBox.h"
 #include "CSPrimSphere.h"
 #include "CSPrimCylinder.h"
+#include "CSPrimUserDefined.h"
 #include "CSPropMetal.h"
 #include "CSPropLorentzMaterial.h"
 #include "CSPropDebyeMaterial.h"
@@ -3660,6 +3661,133 @@ void main() {
 #endif
 }
 
+bool Test_CPU_OperatorSetup()
+{
+	// CPU workers must preserve coefficients, material mirrors, used flags,
+	// PEC counts and GPU stepping, including models requiring CPU fallback.
+	for (unsigned int fixture=0; fixture<4; ++fixture) {
+		std::vector<VulkanCoefficients::Node> coefficients;
+		std::vector<float> fields;
+		std::vector<double> materials;
+		std::vector<bool> used;
+		std::vector<unsigned int> pec;
+		double dt=0;
+		unsigned int threeThreads=0, automaticThreads=0;
+		const unsigned int nx=fixture==3 ? 3 : 17;
+		for (unsigned int requested : {1u,3u,0u,UINT32_MAX}) {
+			TestFDTDAccess fdtd;
+			const std::string setup=(fixture==1 || fixture==2) && requested!=1 ? "auto" : "cpu";
+			fdtd.SetLibraryArguments({"--engine=vulkan","--vulkan-setup="+setup,
+				"--numThreads="+std::to_string(requested==UINT32_MAX ? 10000 : requested)});
+			auto* csx=CreateCustomGrid(nx,13,19);
+			if (fixture!=3) {
+				for (unsigned int p=0;p<nx;++p) csx->GetGrid()->SetLine(0,p,-12+0.8*p+0.04*p*p);
+			} else for (unsigned int p=0;p<nx;++p) csx->GetGrid()->SetLine(0,p,2*double(p)-2);
+			auto* material=new CSPropMaterial(csx->GetParameterSet());
+			material->SetIsotropy(false);
+			for (int n=0;n<3;++n) {
+				material->SetEpsilon(2+n,n); material->SetMue(1+0.1*n,n);
+				material->SetKappa(0.01*(n+1),n); material->SetSigma(0.02*(n+1),n);
+				if (fixture==1) material->SetEpsilonWeightFunction("1+0.001*x*x",n);
+			}
+			CSPrimitives* shape=nullptr;
+			if (fixture==2) {
+				auto* expression=new CSPrimUserDefined(csx->GetParameterSet(),material);
+				expression->SetFunction("x*x+y*y+z*z<36"); shape=expression;
+			} else {
+				auto* box=new CSPrimBox(csx->GetParameterSet(),material);
+				for (int k=0;k<6;++k) box->SetCoord(k,k%2?4:-4);
+				box->GetTransform()->RotateZ(0.2); shape=box;
+			}
+			shape->SetPriority(2); csx->AddProperty(material);
+			auto* unused=new CSPrimBox(csx->GetParameterSet(),material);
+			for (int k=0;k<6;++k) unused->SetCoord(k,k%2?104:100);
+			auto* overlap=new CSPropMaterial(csx->GetParameterSet()); overlap->SetEpsilon(5);
+			auto* overlapBox=new CSPrimBox(csx->GetParameterSet(),overlap); overlapBox->SetPriority(2);
+			for (int k=0;k<6;++k) overlapBox->SetCoord(k,k%2?2:-2);
+			csx->AddProperty(overlap);
+			auto* metal=new CSPropMetal(csx->GetParameterSet());
+			auto* metalBox=new CSPrimBox(csx->GetParameterSet(),metal); metalBox->SetPriority(2);
+			for (int k=0;k<6;++k) metalBox->SetCoord(k,k/2==2?0:(k%2?3:-3));
+			csx->AddProperty(metal);
+			fdtd.SetCSX(csx); fdtd.SetGaussExcite(2e9,1e9); fdtd.SetNumberOfTimeSteps(48);
+			fdtd.SetEnableDumps(false);
+			for (int face=0;face<6;++face) fdtd.Set_BC_Type(face,face%2);
+			TEST_ASSERT(fdtd.SetupFDTD()==0,"CPU worker setup failed");
+			Operator* op=fdtd.GetOp();
+			const unsigned int workers=op->GetLastSetupThreadCount();
+			TEST_ASSERT(workers>=1 && workers<=nx && (!requested || workers<=requested),
+				"CPU setup did not cap its worker count");
+			if (requested==1) TEST_ASSERT(workers==1,"Serial CPU setup started extra workers");
+			if (requested==3) threeThreads=workers;
+			if (requested==0) {
+				automaticThreads=workers;
+				TEST_ASSERT(threeThreads==std::min(3u,workers),"Explicit worker count disagrees with automatic CPU capacity");
+			}
+			if (requested==UINT32_MAX) TEST_ASSERT(workers==automaticThreads,"Large CPU worker count was not capped");
+			for (int type=0;type<4;++type) op->SetMaterialStoreFlags(type,true);
+			for (auto* primitive:csx->GetAllPrimitives()) primitive->SetPrimitiveUsed(false);
+			op->SetTimestep(0);
+			op->SetTimeStepMethod(fixture%2?1:3);
+			TEST_ASSERT(op->CalcECOperatorMultithreaded(requested)==0,"CPU worker rebuild failed");
+			const auto primitives=csx->GetAllPrimitives();
+			std::vector<bool> actualUsed;
+			for (auto* primitive:primitives) actualUsed.push_back(primitive->GetPrimitiveUsed());
+			const std::vector<unsigned int> actualPEC(op->m_Nr_PEC,op->m_Nr_PEC+3);
+			if (requested==1) { dt=op->GetTimestep(); used=actualUsed; pec=actualPEC; }
+			else {
+				TEST_ASSERT(std::abs(op->GetTimestep()-dt)<=dt*1e-12,"CPU workers changed timestep");
+				TEST_ASSERT(actualUsed==used && actualPEC==pec,"CPU workers changed used flags or PEC counts");
+			}
+			TEST_ASSERT(shape->GetPrimitiveUsed() && !unused->GetPrimitiveUsed(),"CPU setup lost used-primitive tracking");
+			size_t index=0;
+			for (unsigned int x=0;x<nx;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+				const auto value=VulkanCoefficients::ReadNode(*op,x,y,z);
+				if (requested==1) coefficients.push_back(value);
+				else {
+					float actual[12],expected[12];
+					std::memcpy(actual,value.data(),sizeof(actual)); std::memcpy(expected,coefficients[index].data(),sizeof(expected));
+					for (unsigned int i=0;i<12;++i)
+						TEST_ASSERT(std::abs(actual[i]-expected[i])<=1e-7+2e-6*std::abs(expected[i]),"CPU worker coefficient mismatch");
+				}
+				++index;
+			}
+			index=0;
+			for (int type=0;type<4;++type) for (unsigned int n=0;n<3;++n)
+				for (unsigned int x=0;x<nx;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+					unsigned int pos[3]={x,y,z}; const double value=op->GetDiscMaterial(type,n,pos);
+					if (requested==1) materials.push_back(value);
+					else TEST_ASSERT(std::abs(value-materials[index])<=1e-7+2e-6*std::abs(materials[index]),"CPU worker material mirror mismatch");
+					++index;
+				}
+			// Reinitialize the already selected backend after rebuilding its operator.
+			EngineBackend* backend=fdtd.GetBackend();
+			backend->Reset();
+			TEST_ASSERT(backend->Initialize(),"CPU construction could not initialize stepping");
+#ifdef ENABLE_VULKAN
+			auto* gpu=dynamic_cast<EngineVulkan*>(backend);
+			TEST_ASSERT(gpu && gpu->SupportsFastEnergy(),"CPU construction lost Vulkan execution or fast energy");
+#endif
+			backend->SetVolt(2,nx/2,6,10,1);
+			TEST_ASSERT(backend->IterateTS(48),"CPU construction failed during propagation");
+#ifdef ENABLE_VULKAN
+			TEST_ASSERT(gpu->SyncFieldsToHost(),"CPU construction field synchronization failed");
+#endif
+			index=0; double error=0,norm=0;
+			for (unsigned int n=0;n<3;++n) for (unsigned int x=0;x<nx;++x)
+				for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z)
+					for (float value : {backend->GetVolt(n,x,y,z),backend->GetCurr(n,x,y,z)}) {
+						TEST_ASSERT(std::isfinite(value),"CPU worker fields became non-finite");
+						if (requested==1) fields.push_back(value);
+						else { error+=std::pow(double(value)-fields[index],2); norm+=std::pow(double(fields[index]),2); }
+						++index;
+					}
+			if (requested!=1) TEST_ASSERT(std::sqrt(error)<=1e-7+1e-3*std::sqrt(norm),"CPU workers changed propagated fields");
+		}
+	}
+	return true;
+}
+
 bool Test_Vulkan_OperatorSetup()
 {
 #ifndef ENABLE_VULKAN
@@ -3823,9 +3951,9 @@ bool Test_Vulkan_PhysicsSetup()
 		std::vector<VulkanCoefficients::Node> coefficients;
 		std::vector<float> fields;
 		double referenceDt=0;
-		for (unsigned int mode=0;mode<2;++mode) {
+		for (unsigned int mode=0;mode<3;++mode) {
 			TestFDTDAccess fdtd;
-			fdtd.SetLibraryArguments(mode?std::vector<std::string>{"--engine=vulkan","--vulkan-setup=gpu"}:
+			fdtd.SetLibraryArguments(mode?std::vector<std::string>{"--engine=vulkan",mode==1?"--vulkan-setup=cpu":"--vulkan-setup=gpu","--numThreads=3"}:
 				std::vector<std::string>{"--engine=basic","--numThreads=1"});
 			auto* csx=CreateCustomGrid(17,13,19);
 			CSProperties* property=nullptr;
@@ -3975,6 +4103,11 @@ bool Test_Vulkan_SetupAllocationFailure()
 
 int main(int argc, char* argv[])
 {
+	if (argc>1 && std::string(argv[1])=="--cpu-setup-tests") {
+		try { RUN_TEST(Test_CPU_OperatorSetup); }
+		catch (const std::exception& error) { std::cerr << error.what() << std::endl; return 1; }
+		return tests_failed?1:0;
+	}
 	if (argc>1 && std::string(argv[1])=="--physics-setup-tests") {
 		try { RUN_TEST(Test_Vulkan_PhysicsSetup); }
 		catch (const std::exception& error) { std::cerr << error.what() << std::endl; return 1; }

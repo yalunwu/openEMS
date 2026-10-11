@@ -50,10 +50,23 @@ requiring explicit cache invalidation. Device metadata reports
 `--engine=vulkan --vulkan-setup=auto` builds supported Cartesian operators on
 the GPU. `auto` is the default for Vulkan and rebuilds a fresh CPU operator if
 setup is unsupported or construction resources cannot be allocated. Select
-`--vulkan-setup=cpu` for the single-threaded CPU reference path, or `gpu` to
-require GPU construction and report an error instead of falling back. The
-multithreaded CPU operator is not used by this Vulkan setup path;
-`--numThreads` does not parallelize it.
+`--vulkan-setup=cpu` for CPU construction, or `gpu` to require GPU construction
+and report an error instead of falling back. For basic Cartesian CPU setup,
+`--numThreads=0` (default) uses available CPUs, capped by the number of x grid
+lines; `1` selects the serial reference. Explicit counts are capped by available
+CPUs and x lines. Automatic CPU fallback uses the same setting.
+
+CPU workers parallelize material averaging, core coefficients and PEC scanning
+while retaining the basic operator layout and Vulkan processing features. Each
+worker owns geometry/property copies and merges used-primitive flags after
+joining. This preserves expression parser/cache isolation and priority ordering.
+Timestep reduction, boundary application, curve handling, lumped elements and
+extension construction remain serial. Cylindrical/multigrid setup retains its
+existing CPU operator threading. No worker runs in the Vulkan timestep loop.
+
+```python
+fdtd.Run(sim_path, engine='vulkan', vulkan_setup='cpu', numThreads=16)
+```
 
 ```python
 fdtd.Run(sim_path, engine='vulkan', vulkan_setup='auto', vulkan_batch_size=32)
@@ -101,6 +114,9 @@ modes. This comparison isolates construction from CPU-versus-GPU stepping.
 
 ### Antenna setup benchmark (2026-10-10)
 
+The following measurements predate parallel CPU construction; their CPU
+reference uses one thread. Use `--numThreads=1` to reproduce that baseline.
+
 RTX 3070 8 GB, Threadripper 2950X, Windows/MSVC Release, NVIDIA driver 591.74:
 4,168,980 cells, 4096 steps, six PML-8 boundaries, four RC ports, eight probes
 and twelve complex FD NF2FF surfaces at 77 GHz. All modes use Vulkan stepping,
@@ -132,6 +148,35 @@ directivity, port-1 input impedance and S11 at 77 GHz also match exactly.
 This establishes equivalence between construction modes using the same Vulkan
 engine. It does not validate independent CPU/Vulkan detector phases or stopping
 behavior.
+
+### Multithreaded CPU construction benchmark
+
+The same antenna and hardware were compared again after adding parallel CPU
+construction: 4,168,980 cells, 4096 fixed steps, dense Vulkan coefficients,
+GPU FD accumulation, batch limit 32 and identical 120-step energy checks.
+Each configuration ran three times in separate processes, with the order
+reversed for the second repetition. Automatic CPU selection used 32 workers.
+The following values are median seconds with the observed min-max in parentheses.
+
+| Construction | Creation (s) | Stepping (s) | Whole process (s) |
+|---|---:|---:|---:|
+| CPU, 1 worker | 42.04 (41.52-42.25) | 13.58 (13.35-13.82) | 58.37 (57.44-58.49) |
+| CPU, 16 workers | 11.97 (11.93-23.20) | 14.10 (13.36-14.14) | 28.75 (27.87-39.88) |
+| CPU, automatic (32) | 10.88 (10.77-10.89) | 13.85 (13.32-20.04) | 27.34 (26.59-33.56) |
+| Automatic GPU | 1.66 (1.54-10.17) | 14.03 (13.51-14.07) | 17.73 (16.98-26.30) |
+
+Automatic CPU construction is 3.86 times as fast as the serial CPU reference
+for setup, reducing median setup time by 74.1% and whole-process time by 53.2%.
+All twelve runs use the same timestep and sample schedules. Eight port records
+and twelve complex NF2FF surfaces have relative L2 error 0 against the serial
+CPU reference. GPU construction code is unchanged in this comparison; the
+ranges record the substantial timing variation observed in this session.
+
+A separate 32-worker CPU construction run reaches the -40 dB criterion after
+17,400 steps at -40.06 dB, matching the earlier serial-construction reference.
+Its eight port histories and twelve complex NF2FF surfaces have relative L2
+error 0 against that reference. This single converged run takes 11.20 seconds
+for construction, 56.69 seconds for stepping and 70.69 seconds for the process.
 
 ## Simulation options
 

@@ -197,9 +197,9 @@ class Test_GPUEngine(unittest.TestCase):
         fdtd.SetCSX(csx)
         fdtd.SetGaussExcite(20e9, 10e9)
         fdtd.SetBoundaryCond(['PEC']*6)
-        for mode in ('cpu', 'gpu', 'auto', 'gpu'):
-            self.assertIsNone(fdtd.Run(self._sim_path('setup_' + mode), engine='vulkan',
-                                      vulkan_setup=mode, cleanup=False))
+        for mode, threads in (('cpu', 1), ('cpu', 3), ('cpu', 0), ('gpu', 0), ('auto', 3), ('cpu', 3)):
+            self.assertIsNone(fdtd.Run(self._sim_path('setup_' + mode + str(threads)), engine='vulkan',
+                                      vulkan_setup=mode, numThreads=threads, cleanup=False))
         with self.assertRaises((ValueError, RuntimeError)):
             fdtd.Run(self._sim_path('invalid_setup'), engine='vulkan',
                      vulkan_setup='invalid', setup_only=True)

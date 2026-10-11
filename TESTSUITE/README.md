@@ -92,10 +92,13 @@ groups run first.
 ## Vulkan FD test
 
 `enginetests/vulkan_setup.m` compares CPU, strict GPU and automatic operator
-construction under identical Vulkan stepping. It checks exact probe sample
+construction under identical Vulkan stepping, including serial, explicit-worker
+and automatic-worker CPU setup. It checks exact probe sample
 times and values within 0.1%. Run it with `octave --no-gui run_testsuite.m
 vulkan_setup` using the candidate executable. Native setup/physics, allocation
 recovery and fallback checks run through `test_backend --setup-tests`.
+`test_backend --cpu-setup-tests` also checks CPU worker limits, weighted and
+user-defined geometry, priority ties, used flags, material mirrors and fields.
 
 `enginetests/vulkan_fd.m` compares CPU, GPU and automatic FD accumulation and
 compact TD gathering under Vulkan stepping for E/H native, node and cell sampling.

@@ -336,8 +336,7 @@ void openEMS::collectCommandLineArguments()
 							 << m_engine_numThreads << endl;
 				}
 			),
-			"Force use n threads for multithreaded engine "
-			"(needs: --engine=multithreaded)"
+			"CPU worker count for the multithreaded engine or Vulkan CPU setup (0: available CPUs)"
 		)
 		(
 			"no-simulation",
@@ -1398,7 +1397,9 @@ int openEMS::SetupFDTD()
 			catch (...) { m_vulkanSetup=requestedMode; throw; }
 		}
 		cout << "[openEMS Vulkan] Operator constructed on GPU." << endl;
-	} else FDTD_Op->CalcECOperator( debugFlags );
+	} else if (m_engine==EngineType_Vulkan && typeid(*FDTD_Op)==typeid(Operator))
+		FDTD_Op->CalcECOperatorMultithreaded(m_engine_numThreads,debugFlags);
+	else FDTD_Op->CalcECOperator( debugFlags );
 	/*******************************************************************************/
 
 	//reset flags for material storage, if no dump-box resets it to true, it will be cleaned up...

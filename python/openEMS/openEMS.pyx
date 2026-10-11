@@ -661,7 +661,8 @@ cdef class openEMS:
         see `./openEMS --help`). Examples are:
 
         * verbose (int) -- set the openEMS verbosity level 0..3
-        * numThreads (int) -- set the number of threads (default 0 --> max)
+        * numThreads (int) -- CPU workers for the multithreaded engine or Vulkan
+          CPU construction/fallback (default 0 --> available CPUs; 1 --> serial)
         * disable_dumps (bool) -- disable all field dumps for faster simulation
         * debug_material (bool) - dump material distribution to a vtk file for
           debugging.
@@ -680,7 +681,8 @@ cdef class openEMS:
         * vulkan_profile (bool) - report CPU timings, sampled GPU timings and
           submission/transfer counts; disabled by default
         * vulkan_setup ('auto', 'cpu' or 'gpu') - operator construction;
-          'cpu' uses the single-threaded reference. 'auto' (default) attempts
+          'cpu' uses numThreads CPU workers (1 selects the serial reference).
+          'auto' (default) attempts
           GPU construction with a clean CPU fallback. 'gpu' requires GPU
           construction and raises on unsupported models or insufficient resources.
           GPU setup requires a basic Cartesian Vulkan model, FP64 and supported

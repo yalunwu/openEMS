@@ -18,21 +18,32 @@ CSX = AddBox(CSX, 'source', 1, [0 0 -2], [0 0 2]);
 CSX = AddProbe(CSX, 'voltage', 0);
 CSX = AddBox(CSX, 'voltage', 0, [5 0 -4], [5 0 4]);
 pass = [];
-for selection = {'cpu', 'gpu', 'auto'}
-    mode = selection{1}; folder = fullfile(Sim_Path, mode);
+selections = {'cpu', 1; 'cpu', 3; 'cpu', 0; 'gpu', 0; 'auto', 0};
+for selection = 1:size(selections, 1)
+    mode = selections{selection, 1}; threads = selections{selection, 2};
+    label = [mode '_' num2str(threads)]; folder = fullfile(Sim_Path, label);
     mkdir(folder); WriteOpenEMS(fullfile(folder, 'model.xml'), FDTD, CSX);
     RunOpenEMS(folder, 'model.xml', ['--engine=vulkan --vulkan-setup=' mode ...
-        ' --vulkan-batch-size=32 --exact-endcriteria'], ...
+        ' --vulkan-batch-size=32 --exact-endcriteria --numThreads=' num2str(threads)], ...
         struct('Silent', 1, 'LogFile', 'solver.log'));
     values = dlmread(fullfile(folder, 'voltage'), '', 2, 0);
+    logtext = fileread(fullfile(folder, 'solver.log'));
     if strcmp(mode, 'cpu')
+        counts = regexp(logtext, 'CPU operator construction using (\d+) thread', 'tokens');
+        selected = ~isempty(counts);
+        if selected && threads>0
+            selected = str2double(counts{1}{1})>=1 && str2double(counts{1}{1})<=threads;
+        end
+        pass(end+1) = ts_check(['CPU construction selected: ' label], selected);
+    else
+        pass(end+1) = ts_check('GPU construction selected', ~isempty(strfind(logtext, 'Operator constructed on GPU.')));
+    end
+    if selection==1
         reference = values;
     else
-        logtext = fileread(fullfile(folder, 'solver.log'));
-        pass(end+1) = ts_check('GPU construction selected', ~isempty(strfind(logtext, 'Operator constructed on GPU.')));
         pass(end+1) = ts_check('Probe schedule', isequal(reference(:,1), values(:,1)));
         err = norm(reference(:,2)-values(:,2)); scale = norm(reference(:,2));
-        pass(end+1) = ts_check(['Probe values: ' mode], scale>0 && all(isfinite(values(:))) && err<=0.001*scale+1e-18);
+        pass(end+1) = ts_check(['Probe values: ' label], scale>0 && all(isfinite(values(:))) && err<=0.001*scale+1e-18);
     end
 end
 pass = ts_finish(opt, mfilename, pass, Sim_Path);

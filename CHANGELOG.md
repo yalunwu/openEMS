@@ -19,6 +19,10 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Multithreaded CPU construction feeding Vulkan stepping. `--vulkan-setup=cpu`
+  and automatic CPU fallback parallelize material averaging, core coefficients
+  and PEC scanning; `--numThreads` (Python `numThreads`) selects the workers,
+  with `0` using available CPUs and `1` retaining the serial reference.
 - Vulkan operator construction with `--vulkan-setup=auto|cpu|gpu` (Python
   `vulkan_setup`, MATLAB/Octave options string). Basic Cartesian geometry,
   material averaging, timestep reduction, boundary conditions and extension

@@ -23,7 +23,7 @@ class Test_VulkanFD(unittest.TestCase):
     def run_case(self, name, mode=0, accumulation='gpu', batch=32, engine='vulkan',
                  steps=129, mixed=False, nf2ff=False, legacy=False, end=0,
                  windows=True, directions=None, mirror=None, disabled=False, vtk=False,
-                 td_accumulation=None, td_only=False, setup=None):
+                 td_accumulation=None, td_only=False, setup=None, threads=1):
         path = os.path.join(self.temp.name, name)
         csx = gpu.ContinuousStructure()
         grid = csx.GetGrid()
@@ -81,7 +81,7 @@ class Test_VulkanFD(unittest.TestCase):
         if td_accumulation is not None:
             options['vulkan_td'] = td_accumulation
         fdtd.Run(path, engine=engine, vulkan_batch_size=batch, **options,
-                 vulkan_profile=True, exact_endcriteria=True, numThreads=1,
+                 vulkan_profile=True, exact_endcriteria=True, numThreads=threads,
                  legacyHDF5Dumps=legacy, disable_dumps=disabled,
                  dump_statistics=end>0, cleanup=False)
         return path, recorder
@@ -100,6 +100,15 @@ class Test_VulkanFD(unittest.TestCase):
         for mode in (None, 'auto'):
             actual, _ = self.run_case('automatic_' + str(mode), accumulation=mode)
             self.compare_files(reference, actual)
+
+    def test_cpu_operator_setup_threads(self):
+        """CPU workers feeding Vulkan preserve FD/TD and angular NF2FF (0.1%)."""
+        reference, a = self.run_case('cpu_setup_serial', setup='cpu', threads=1,
+                                     nf2ff=True, mixed=True, steps=257)
+        for threads in (3, 0):
+            actual, b = self.run_case('cpu_setup_' + str(threads), setup='cpu', threads=threads,
+                                      nf2ff=True, mixed=True, steps=257)
+            self.compare_far_field(reference, a, actual, b)
 
     def test_time_domain_gathering(self):
         for mode in (0, 1, 2):

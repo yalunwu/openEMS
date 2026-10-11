@@ -238,6 +238,7 @@ if(BUILD_TESTING)
   TARGET_LINK_LIBRARIES( test_backend openEMS ${CSXCAD_LIBRARIES} ${VULKAN_LIBRARIES} )
   ADD_TEST(NAME backend COMMAND test_backend)
   ADD_TEST(NAME vulkan-operator-setup COMMAND test_backend --setup-tests)
+  ADD_TEST(NAME cpu-operator-setup COMMAND test_backend --cpu-setup-tests)
   option(OPENEMS_VULKAN_SYNC_TESTS "Run GPU tests with installed Khronos synchronization validation" OFF)
   if(ENABLE_VULKAN AND OPENEMS_VULKAN_SYNC_TESTS)
     ADD_TEST(NAME vulkan-synchronization COMMAND ${CMAKE_COMMAND}

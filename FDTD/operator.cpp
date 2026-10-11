@@ -20,6 +20,9 @@
 #include <stdexcept>
 #include "operator.h"
 #include "operator_setup.h"
+#include "operator_cpu_setup.h"
+#include "tools/useful.h"
+#include <typeinfo>
 #include "engine.h"
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_excitation.h"
@@ -957,7 +960,10 @@ void Operator::SetExcitationSignal(Excitation* exc)
 
 void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 {
-	unsigned int i = MainOp->SetPos(pos[0],pos[1],pos[2]);
+	// Parallel construction fixes MainOp's cursor at the origin before workers
+	// start; GetPos computes an offset without mutating that shared cursor.
+	unsigned int i = m_cpuSetup && m_cpuSetup->HasWorkerContext() ? MainOp->GetPos(pos[0],pos[1],pos[2]) :
+		MainOp->SetPos(pos[0],pos[1],pos[2]);
 	double C = EC_C[n][i];
 	double G = EC_G[n][i];
 	if (C>0)
@@ -983,6 +989,23 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 		SetII(n,pos[0],pos[1],pos[2], 0 );
 		SetIV(n,pos[0],pos[1],pos[2], 0 );
 	}
+}
+
+int Operator::CalcECOperatorMultithreaded(unsigned int numThreads, DebugFlags debugFlags)
+{
+	if (typeid(*this)!=typeid(Operator) || m_setupBackend || m_cpuSetup)
+		throw std::invalid_argument("Parallel CPU construction requires an idle basic operator");
+	const unsigned int available=AvailableThreads();
+	m_lastSetupThreads=std::max(1u,std::min(numLines[0],numThreads ? std::min(numThreads,available) : available));
+	cout << "[openEMS] CPU operator construction using " << m_lastSetupThreads << " thread(s)." << endl;
+	if (m_lastSetupThreads==1) return CalcECOperator(debugFlags);
+	CpuOperatorSetup setup(*this,m_lastSetupThreads);
+	m_cpuSetup=&setup;
+	try {
+		const int result=CalcECOperator(debugFlags);
+		m_cpuSetup=nullptr;
+		return result;
+	} catch (...) { m_cpuSetup=nullptr; throw; }
 }
 
 int Operator::CalcECOperator( DebugFlags debugFlags )
@@ -1031,6 +1054,8 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 
 	if (m_setupBackend)
 		m_setupBackend->CalcCoefficients(*this);
+	else if (m_cpuSetup)
+		m_cpuSetup->CalcCoefficients();
 	else for (int n=0; n<3; ++n)
 	{
 		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
@@ -1808,6 +1833,7 @@ bool Operator::Calc_EC()
 	}
 
 	MainOp->SetPos(0,0,0);
+	if (m_cpuSetup) { m_cpuSetup->CalcEC(); return true; }
 	Calc_EC_Range(0,numLines[0]-1);
 	return true;
 }
@@ -1834,7 +1860,8 @@ Operator::GetPrimitivesBoundBox(
 		}
 	}
 
-	std::vector<CSPrimitives*> vPrim = this->CSX->GetPrimitivesByBoundBox(boundBox, true, type);
+	std::vector<CSPrimitives*> vPrim = m_cpuSetup ? m_cpuSetup->PrimitivesBoundBox(boundBox,type) :
+		this->CSX->GetPrimitivesByBoundBox(boundBox, true, type);
 	return vPrim;
 }
 
@@ -2038,7 +2065,8 @@ bool Operator::CalcPEC()
 	m_Nr_PEC[1]=0;
 	m_Nr_PEC[2]=0;
 
-	CalcPEC_Range(0,numLines[0]-1,m_Nr_PEC);
+	if (m_cpuSetup) m_cpuSetup->CalcPEC();
+	else CalcPEC_Range(0,numLines[0]-1,m_Nr_PEC);
 
 	CalcPEC_Curves();
 
