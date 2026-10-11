@@ -29,6 +29,8 @@ class Operator_Ext_Excitation : public Operator_Extension
 	friend class Engine_Ext_Excitation;
 	friend class Engine_Ext_Mur_ABC;
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
+	friend bool Test_Vulkan_OperatorSetup();
 	friend class Operator;
 public:
 	Operator_Ext_Excitation(Operator* op);

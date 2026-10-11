@@ -45,6 +45,94 @@ reduces CPU read costs for staging, probe values and energy partials without
 requiring explicit cache invalidation. Device metadata reports
 `staging_host_cached` for the selected field staging allocation.
 
+## GPU operator construction
+
+`--engine=vulkan --vulkan-setup=auto` builds supported Cartesian operators on
+the GPU. `auto` is the default for Vulkan and rebuilds a fresh CPU operator if
+setup is unsupported or construction resources cannot be allocated. Select
+`--vulkan-setup=cpu` for the single-threaded CPU reference path, or `gpu` to
+require GPU construction and report an error instead of falling back. The
+multithreaded CPU operator is not used by this Vulkan setup path;
+`--numThreads` does not parallelize it.
+
+```python
+fdtd.Run(sim_path, engine='vulkan', vulkan_setup='auto', vulkan_batch_size=32)
+```
+
+```matlab
+RunOpenEMS(sim_path, 'model.xml', '--engine=vulkan --vulkan-setup=auto')
+```
+
+GPU construction covers material averaging, EC coefficients, timestep reduction,
+PEC/PMC, UPML, sources, RC ports, general RLC, Mur and local absorbers, TFSF,
+Lorentz/Drude, multipole Debye and conducting sheets. It supports boxes, spheres,
+finite cylinders and nonsingular affine transforms, with constant evaluated
+material/source weights. Spatial weights, other primitives and cylindrical or
+multigrid operators use CPU construction under `auto`. GPU construction requires
+FP64 and at least 22 storage-buffer bindings. Allocation limits and device memory
+budget are checked before construction; a later failure also triggers clean CPU
+reconstruction under `auto`.
+
+XML parsing, geometry descriptors and candidate lists, scalar extension metadata,
+one-dimensional PML grading, waveform generation and file writing remain on the
+CPU. Coefficient mirrors preserve existing processing/debug interfaces. Dense
+core and extension buffers are reused for stepping on the same Vulkan device;
+large construction scratch buffers are released first. Palette mode retains its
+existing CPU palette packing after GPU construction. Angular NF2FF remains CPU
+post-processing. Construction comparisons use the same Vulkan stepping engine;
+they do not establish independent CPU/Vulkan detector-phase equivalence.
+
+`test_backend --setup-tests` compares GPU setup with CPU setup: timestep relative
+tolerance 1e-12, coefficient tolerance `1e-7 + 2e-6*abs(reference)`, exact source
+indices/delays and PEC counts, and propagated fields within 0.1%. It includes
+geometry, nonuniform meshes, anisotropy, losses, both timestep methods, forced
+timesteps, scaling, periodic sources, material mirrors, boundaries, extensions,
+unsupported-model fallback, allocation failure and reset/reinitialization.
+Python `test_vulkan_fd.Test_VulkanFD.test_gpu_operator_setup_outputs` checks
+FD/TD schedules, complex surfaces and angular NF2FF. Octave/Matlab
+`enginetests/vulkan_setup.m` checks the scripting option and probe samples.
+
+For setup benchmarks, use the same executable, XML and Vulkan stepping settings
+with `vulkan-setup=cpu`, `gpu` and `auto`. Measure operator creation, stepping and
+whole-process time separately, repeat each mode at least three times, and compare
+probe/port records and complex FD surfaces. Fixed steps establish throughput;
+a separate converged run checks stopping and output equivalence between setup
+modes. This comparison isolates construction from CPU-versus-GPU stepping.
+
+### Antenna setup benchmark (2026-10-10)
+
+RTX 3070 8 GB, Threadripper 2950X, Windows/MSVC Release, NVIDIA driver 591.74:
+4,168,980 cells, 4096 steps, six PML-8 boundaries, four RC ports, eight probes
+and twelve complex FD NF2FF surfaces at 77 GHz. All modes use Vulkan stepping,
+dense coefficients, batch limit 32, GPU FD accumulation and identical 120-step
+energy checks (`--exact-endcriteria`, criterion 1e-30). The table reports medians
+of three runs per mode, with order reversed for the second repetition.
+
+| Operator setup | Creation (s) | Stepping (s) | Whole process (s) |
+|---|---:|---:|---:|
+| CPU reference (single thread) | 40.51 | 13.69 | 56.84 |
+| Strict GPU | 6.26 | 13.85 | 22.92 |
+| Automatic GPU | 6.06 | 13.83 | 21.97 |
+
+Automatic setup reduces construction time by 85.0% and whole-process time by
+61.3%; stepping time differs by 1.1%. All nine runs have the same timestep,
+sample schedules and output meshes. The eight port records and twelve complex
+FD surfaces have relative L2 error 0 against the first CPU-setup run.
+These are measurements for this model and device, including shader compilation
+and compatibility copies; they are not a general speed guarantee or a
+comparison with multithreaded CPU construction.
+
+A separate converged comparison uses criterion 1e-4 and a 35,000-step ceiling
+with the same 120-step check schedule. CPU, strict GPU and automatic setup all
+stop at 17,400 steps and -40.06 dB. Whole-process times for these single runs
+are 101.96, 67.09 and 66.57 seconds respectively. Port histories and complex
+surfaces again have relative L2 error 0. Angular E fields and circular
+polarizations (theta 0:5:180 degrees, phi 0/90 degrees), radiated power,
+directivity, port-1 input impedance and S11 at 77 GHz also match exactly.
+This establishes equivalence between construction modes using the same Vulkan
+engine. It does not validate independent CPU/Vulkan detector phases or stopping
+behavior.
+
 ## Simulation options
 
 Use `--vulkan-batch-size=N` to select a limit from 1 to 64. A limit of 1 provides

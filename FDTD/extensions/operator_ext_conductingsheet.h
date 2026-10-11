@@ -30,6 +30,7 @@
 class OPENEMS_EXPORT Operator_Ext_ConductingSheet : public Operator_Ext_LorentzMaterial
 {
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
 public:
 	Operator_Ext_ConductingSheet(Operator* op, double f_max);
 

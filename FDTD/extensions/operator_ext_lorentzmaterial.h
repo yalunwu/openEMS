@@ -25,6 +25,7 @@ class OPENEMS_EXPORT Operator_Ext_LorentzMaterial : public Operator_Ext_Dispersi
 {
 	friend class Engine_Ext_LorentzMaterial;
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
 public:
 	Operator_Ext_LorentzMaterial(Operator* op);
 	virtual ~Operator_Ext_LorentzMaterial();

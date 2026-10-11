@@ -35,6 +35,7 @@ class OPENEMS_EXPORT Operator_Ext_LumpedRLC : public Operator_Extension
 {
 	friend class Engine_Ext_LumpedRLC;
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
 public:
 	Operator_Ext_LumpedRLC(Operator* op);
 

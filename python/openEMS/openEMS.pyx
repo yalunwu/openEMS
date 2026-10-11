@@ -679,6 +679,13 @@ cdef class openEMS:
           from 1 to 64 (default 32); processing intervals still limit advancement
         * vulkan_profile (bool) - report CPU timings, sampled GPU timings and
           submission/transfer counts; disabled by default
+        * vulkan_setup ('auto', 'cpu' or 'gpu') - operator construction;
+          'cpu' uses the single-threaded reference. 'auto' (default) attempts
+          GPU construction with a clean CPU fallback. 'gpu' requires GPU
+          construction and raises on unsupported models or insufficient resources.
+          GPU setup requires a basic Cartesian Vulkan model, FP64 and supported
+          primitives with constant material/source weights. XML and waveform generation,
+          compatibility copies and file writing remain on the CPU
         * vulkan_fd ('auto', 'cpu' or 'gpu') - frequency-domain E/H accumulation;
           'auto' (default) prefers GPU accumulation for supported dumps.
           'cpu' selects the reference. 'gpu' supports basic Cartesian

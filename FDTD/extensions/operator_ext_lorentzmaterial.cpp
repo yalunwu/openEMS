@@ -55,39 +55,35 @@ Operator_Ext_LorentzMaterial::Operator_Ext_LorentzMaterial(Operator* op, Operato
 Operator_Ext_LorentzMaterial::~Operator_Ext_LorentzMaterial()
 {
 	if ((m_curr_Lor_ADE_On==NULL) || (m_volt_Lor_ADE_On==NULL)) // all data already cleaned up or never used
+	{
+		delete[] m_curr_Lor_ADE_On;
+		delete[] m_volt_Lor_ADE_On;
 		return;
+	}
 	for (int i=0;i<m_Order;++i)
 	{
 		for (int n=0; n<3; ++n)
 		{
-			if (m_volt_ADE_On[i])
-			{
-				delete[] v_int_ADE[i][n];
-				delete[] v_ext_ADE[i][n];
-			}
-			if (m_curr_ADE_On[i])
-			{
-				delete[] i_int_ADE[i][n];
-				delete[] i_ext_ADE[i][n];
-			}
-			if (m_volt_Lor_ADE_On[i])
-				delete[] v_Lor_ADE[i][n];
-			if (m_curr_Lor_ADE_On[i])
-				delete[] i_Lor_ADE[i][n];
+			if (m_volt_ADE_On[i] && v_int_ADE && v_int_ADE[i]) delete[] v_int_ADE[i][n];
+			if (m_volt_ADE_On[i] && v_ext_ADE && v_ext_ADE[i]) delete[] v_ext_ADE[i][n];
+			if (m_curr_ADE_On[i] && i_int_ADE && i_int_ADE[i]) delete[] i_int_ADE[i][n];
+			if (m_curr_ADE_On[i] && i_ext_ADE && i_ext_ADE[i]) delete[] i_ext_ADE[i][n];
+			if (m_volt_Lor_ADE_On[i] && v_Lor_ADE && v_Lor_ADE[i]) delete[] v_Lor_ADE[i][n];
+			if (m_curr_Lor_ADE_On[i] && i_Lor_ADE && i_Lor_ADE[i]) delete[] i_Lor_ADE[i][n];
 		}
 		if (m_volt_ADE_On[i])
 		{
-			delete[] v_int_ADE[i];
-			delete[] v_ext_ADE[i];
+			if (v_int_ADE) delete[] v_int_ADE[i];
+			if (v_ext_ADE) delete[] v_ext_ADE[i];
 		}
 		if (m_curr_ADE_On[i])
 		{
-			delete[] i_int_ADE[i];
-			delete[] i_ext_ADE[i];
+			if (i_int_ADE) delete[] i_int_ADE[i];
+			if (i_ext_ADE) delete[] i_ext_ADE[i];
 		}
-		if (m_volt_Lor_ADE_On[i])
+		if (v_Lor_ADE && m_volt_Lor_ADE_On[i])
 			delete[] v_Lor_ADE[i];
-		if (m_curr_Lor_ADE_On[i])
+		if (i_Lor_ADE && m_curr_Lor_ADE_On[i])
 			delete[] i_Lor_ADE[i];
 	}
 	delete[] v_int_ADE;

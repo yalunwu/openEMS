@@ -9,6 +9,7 @@
 #endif
 
 #include <iostream>
+#include <iomanip>
 #include <cassert>
 #include <vector>
 #include <string>
@@ -31,6 +32,7 @@
 #include "FDTD/operator.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/extensions/operator_ext_upml.h"
+#include "FDTD/extensions/operator_ext_excitation.h"
 #include "FDTD/extensions/operator_ext_steadystate.h"
 #include "FDTD/extensions/engine_ext_steadystate.h"
 #include "FDTD/extensions/operator_ext_tfsf.h"
@@ -54,6 +56,9 @@
 #include "CSPropLumpedElement.h"
 #include "CSPropAbsorbingBC.h"
 #include "CSPrimBox.h"
+#include "CSPrimSphere.h"
+#include "CSPrimCylinder.h"
+#include "CSPropMetal.h"
 #include "CSPropLorentzMaterial.h"
 #include "CSPropDebyeMaterial.h"
 #include "CSPropConductingSheet.h"
@@ -3655,8 +3660,335 @@ void main() {
 #endif
 }
 
+bool Test_Vulkan_OperatorSetup()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (unsigned int fixture=0;fixture<22;++fixture) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+		auto* csx=CreateCustomGrid(17,13,19);
+		if (fixture>0) {
+			for (unsigned int n=0;n<3;++n) {
+				csx->GetGrid()->ClearLines(n);
+				for (unsigned int p=0;p<(n==0?17u:n==1?13u:19u);++p)
+					csx->GetGrid()->AddDiscLine(n,-20+1.3*p+0.03*p*p);
+			}
+			auto* material=new CSPropMaterial(csx->GetParameterSet());
+			material->SetIsotropy(false);
+			for (unsigned int n=0;n<3;++n) {
+				material->SetEpsilon(2+n,n); material->SetMue(1+0.2*n,n);
+				material->SetKappa(0.01*(n+1),n); material->SetSigma(0.02*(n+1),n);
+			}
+			if (fixture==13) {
+				auto* sphere=new CSPrimSphere(csx->GetParameterSet(),material);
+				sphere->SetCenter(-5,-5,-5); sphere->SetRadius(8);
+			} else if (fixture==14) {
+				auto* cylinder=new CSPrimCylinder(csx->GetParameterSet(),material);
+				for (int k=0;k<6;++k) cylinder->SetCoord(k,k%2?2:-8);
+				cylinder->SetRadius(4);
+			} else {
+				auto* box=new CSPrimBox(csx->GetParameterSet(),material);
+				for (int k=0;k<6;++k) box->SetCoord(k,k%2?5:-10);
+				if (fixture==15) { box->GetTransform()->RotateZ(0.2); double shift[3]={1,-2,0}; box->GetTransform()->Translate(shift); }
+			}
+			csx->AddProperty(material);
+		}
+		if ((fixture>=5 && fixture<=8)||fixture==12||fixture>=16) {
+			auto* excitation=new CSPropExcitation(csx->GetParameterSet());
+			excitation->SetExcitType(fixture>=12?0:fixture-5);
+			excitation->SetDelay(1.1e-11);
+			for (int n=0;n<3;++n) excitation->SetExcitation(n==1?0:1+n,n);
+			auto* box=new CSPrimBox(csx->GetParameterSet(),excitation);
+			for (int k=0;k<6;++k) box->SetCoord(k,k%2?0:-10);
+			csx->AddProperty(excitation);
+		}
+		if (fixture>=9 && fixture<=12) {
+			auto* rc=new CSPropLumpedElement(csx->GetParameterSet());
+			rc->SetDirection(fixture%3); rc->SetLEtype(CSPropLumpedElement::PARALLEL);
+			rc->SetResistance(fixture==10?0:50); rc->SetCapacity(1e-12); rc->SetCaps(true);
+			auto* box=new CSPrimBox(csx->GetParameterSet(),rc);
+			for (int k=0;k<6;++k) box->SetCoord(k,k%2?0:-10);
+			csx->AddProperty(rc);
+		}
+		if (fixture>=13) {
+			auto* metal=new CSPropMetal(csx->GetParameterSet());
+			auto* box=new CSPrimBox(csx->GetParameterSet(),metal);
+			box->SetPriority(3);
+			for (int k=0;k<6;++k) box->SetCoord(k,k/2==0?csx->GetGrid()->GetLine(0,8):(k%2?0:-10));
+			csx->AddProperty(metal);
+		}
+		fdtd.SetCSX(csx); fdtd.SetNumberOfTimeSteps(80); fdtd.SetGaussExcite(20e9,10e9);
+		if (fixture==18) fdtd.SetTimeStep(1e-12);
+		if (fixture==19) fdtd.SetTimeStepFactor(0.7);
+		if (fixture==20) fdtd.SetSinusExcite(20e9);
+		fdtd.SetEnableDumps(false);
+		for (unsigned int face=0;face<6;++face) {
+			if (fixture==16 || (fixture==17 && face%2==0)) fdtd.Set_BC_Type(face,2);
+			else if (fixture==4||fixture==12||fixture==17) fdtd.Set_BC_PML(face,3);
+			else fdtd.Set_BC_Type(face,face%2);
+		}
+		TEST_ASSERT(fdtd.SetupFDTD()==0,"CPU setup reference failed");
+		Operator* op=fdtd.GetOp();
+		if (fixture==2) { op->SetCellConstantMaterial(); op->SetTimestep(0); op->CalcECOperator(); }
+		if (fixture==3) { op->SetTimeStepMethod(1); op->SetTimestep(0); op->CalcECOperator(); }
+		std::vector<double> materialReference;
+		if (fixture==21) {
+			for (int type=0;type<4;++type) op->SetMaterialStoreFlags(type,true);
+			op->SetTimestep(0); op->CalcECOperator();
+			for (int type=0;type<4;++type) for (int n=0;n<3;++n)
+				for (unsigned int x=0;x<17;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+					unsigned int pos[3]={x,y,z}; materialReference.push_back(op->GetDiscMaterial(type,n,pos));
+				}
+		}
+		const double dt=op->GetTimestep();
+		const auto* source=op->GetExcitationExtension();
+		const unsigned int voltageCount=source?source->GetVoltCount():0, currentCount=source?source->GetCurrCount():0;
+		auto sourceIds=[](const Operator_Ext_Excitation* excitation) {
+			std::vector<unsigned int> result;
+			if (excitation) for (int magnetic=0;magnetic<2;++magnetic)
+				for (unsigned int q=0;q<(magnetic?excitation->Curr_Count:excitation->Volt_Count);++q) {
+					for (int axis=0;axis<3;++axis) result.push_back(magnetic?excitation->Curr_index[axis][q]:excitation->Volt_index[axis][q]);
+					result.push_back(magnetic?excitation->Curr_dir[q]:excitation->Volt_dir[q]);
+					result.push_back(magnetic?excitation->Curr_delay[q]:excitation->Volt_delay[q]);
+				}
+			return result;
+		};
+		const auto referenceIds=sourceIds(source);
+		const std::vector<unsigned int> referencePEC(op->m_Nr_PEC,op->m_Nr_PEC+3);
+		std::vector<VulkanCoefficients::Node> reference;
+		for (unsigned int x=0;x<17;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z)
+			reference.push_back(VulkanCoefficients::ReadNode(*op,x,y,z));
+		TEST_ASSERT(op->GetExcitationSignal()->buildExcitationSignal(80),"CPU source waveform failed");
+		fdtd.GetEng()->IterateTS(80);
+		std::vector<float> fields;
+		for (unsigned int n=0;n<3;++n) for (unsigned int x=0;x<17;++x)
+			for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+				fields.push_back(fdtd.GetEng()->GetVolt(n,x,y,z)); fields.push_back(fdtd.GetEng()->GetCurr(n,x,y,z));
+			}
+		op->SetTimestep(fixture==18?1e-12:0);
+		EngineVulkan gpu(op); std::string reason;
+		TEST_ASSERT(gpu.BuildOperator(*op,0,reason),reason);
+		source=op->GetExcitationExtension();
+		TEST_ASSERT(sourceIds(source)==referenceIds,"GPU source indices/directions/delays changed");
+		TEST_ASSERT(std::vector<unsigned int>(op->m_Nr_PEC,op->m_Nr_PEC+3)==referencePEC,"GPU PEC edge counts changed");
+		TEST_ASSERT((source?source->GetVoltCount():0)==voltageCount && (source?source->GetCurrCount():0)==currentCount,
+			"GPU source compaction changed point counts");
+		std::cout << std::setprecision(17) << "setup fixture=" << fixture << " CPU dt=" << dt << " GPU dt=" << op->GetTimestep() << std::endl;
+		TEST_ASSERT(std::abs(op->GetTimestep()-dt)<=dt*1e-12,"GPU construction changed stable timestep");
+		if (fixture==21) {
+			size_t materialIndex=0;
+			for (int type=0;type<4;++type) for (int n=0;n<3;++n)
+				for (unsigned int x=0;x<17;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+					unsigned int pos[3]={x,y,z}; const double expected=materialReference[materialIndex++];
+					TEST_ASSERT(std::abs(op->GetDiscMaterial(type,n,pos)-expected)<=1e-7+2e-6*std::abs(expected),
+						"GPU material compatibility mirror changed");
+				}
+		}
+		size_t index=0;
+		for (unsigned int x=0;x<17;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+			const auto actual=VulkanCoefficients::ReadNode(*op,x,y,z);
+			float expected[12], values[12];
+			std::memcpy(expected,reference[index].data(),sizeof(expected)); std::memcpy(values,actual.data(),sizeof(values));
+			for (unsigned int n=0;n<12;++n) if (std::abs(values[n]-expected[n])>1e-7+2e-6*std::abs(expected[n]))
+				std::cerr << "coefficient " << x << "," << y << "," << z << " n=" << n << " CPU=" << expected[n] << " GPU=" << values[n] << std::endl;
+			for (unsigned int n=0;n<12;++n) TEST_ASSERT(std::abs(values[n]-expected[n])<=1e-7+2e-6*std::abs(expected[n]),
+				"GPU setup coefficient mismatch");
+			++index;
+		}
+		TEST_ASSERT(op->GetExcitationSignal()->buildExcitationSignal(80),"GPU source waveform failed");
+		TEST_ASSERT(gpu.Initialize(),"GPU setup device could not be reused for stepping");
+		TEST_ASSERT(gpu.IterateTS(80) && gpu.SyncFieldsToHost(),"Prepared operator could not step");
+		index=0; double error=0,norm=0;
+		for (unsigned int n=0;n<3;++n) for (unsigned int x=0;x<17;++x)
+			for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+				const float values[2]={gpu.GetVolt(n,x,y,z),gpu.GetCurr(n,x,y,z)};
+				for (unsigned int field=0;field<2;++field) {
+					error+=std::pow(double(values[field])-fields[index],2); norm+=std::pow(double(fields[index]),2); ++index;
+				}
+			}
+		TEST_ASSERT(std::sqrt(error)<=1e-7+1e-3*std::sqrt(norm),"GPU construction changed propagated fields");
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_PhysicsSetup()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (unsigned int fixture=0;fixture<8;++fixture) {
+		std::vector<VulkanCoefficients::Node> coefficients;
+		std::vector<float> fields;
+		double referenceDt=0;
+		for (unsigned int mode=0;mode<2;++mode) {
+			TestFDTDAccess fdtd;
+			fdtd.SetLibraryArguments(mode?std::vector<std::string>{"--engine=vulkan","--vulkan-setup=gpu"}:
+				std::vector<std::string>{"--engine=basic","--numThreads=1"});
+			auto* csx=CreateCustomGrid(17,13,19);
+			CSProperties* property=nullptr;
+			if (fixture==0) {
+				auto* mat=new CSPropLorentzMaterial(csx->GetParameterSet());
+				mat->SetDispersionOrder(2); mat->SetEpsilon(2); mat->SetMue(1.2); mat->SetIsotropy(false);
+				for (int pole=0;pole<2;++pole) for (int n=0;n<3;++n) {
+					mat->SetEpsPlasmaFreq(pole,(pole+1)*2e9,n); mat->SetEpsRelaxTime(pole,1e-9,n);
+					mat->SetEpsLorPoleFreq(pole,pole==0?0:1e9,n);
+					mat->SetMuePlasmaFreq(pole,0.8e9,n); mat->SetMueRelaxTime(pole,0.5e-9,n);
+					mat->SetMueLorPoleFreq(pole,pole==0?0:0.5e9,n);
+				}
+				property=mat;
+			} else if (fixture==1) {
+				auto* mat=new CSPropDebyeMaterial(csx->GetParameterSet());
+				mat->SetDispersionOrder(3); mat->SetEpsilon(2); mat->SetIsotropy(false);
+				for (int pole=0;pole<3;++pole) for (int n=0;n<3;++n) {
+					mat->SetEpsDelta(pole,(pole+1)*(n+1),n); mat->SetEpsRelaxTime(pole,1e-9/(pole+1),n);
+				}
+				property=mat;
+			} else if (fixture==2) {
+				auto* abc=new CSPropAbsorbingBC(csx->GetParameterSet());
+				abc->SetPhaseVelocity(C0); abc->SetAbsorbingBoundaryType(CSPropAbsorbingBC::MUR_1ST_SA); property=abc;
+			} else if (fixture==3||fixture==4||fixture==7) {
+				auto* load=new CSPropLumpedElement(csx->GetParameterSet());
+				load->SetDirection(fixture%3); load->SetLEtype(fixture==3?CSPropLumpedElement::PARALLEL:CSPropLumpedElement::SERIES);
+				load->SetResistance(50); load->SetInductance(5e-9); if (fixture!=7) load->SetCapacity(1e-12);
+				load->SetCaps(true); property=load;
+			} else if (fixture==5) {
+				auto* sheet=new CSPropConductingSheet(csx->GetParameterSet());
+				sheet->SetConductivity(1e6); sheet->SetThickness(1e-6); property=sheet;
+			} else {
+				auto* source=new CSPropExcitation(csx->GetParameterSet()); source->SetExcitType(10);
+				source->SetPropagationDir(1,0); source->SetPropagationDir(0.2,1); source->SetPropagationDir(0.1,2);
+				source->SetExcitation(-0.2,0); source->SetExcitation(1,1); source->SetExcitation(0,2); property=source;
+			}
+			auto* box=new CSPrimBox(csx->GetParameterSet(),property);
+			for (int k=0;k<6;++k) box->SetCoord(k,(fixture==2||fixture==5)&&k/2==0?3:(k%2?4:-4));
+			if (fixture==3||fixture==4||fixture==7) {
+				for (int k=0;k<6;++k) box->SetCoord(k,k/2==int(fixture%3)?(k%2?2.5:-0.5):(k%2?0.5:-0.5));
+				fdtd.SetTimeStepFactor(0.25);
+			}
+			csx->AddProperty(property);
+			fdtd.SetCSX(csx); fdtd.SetNumberOfTimeSteps(96); fdtd.SetGaussExcite(1e9,500e6); fdtd.SetEnableDumps(false);
+			for (int face=0;face<6;++face) fdtd.Set_BC_PML(face,3);
+			TEST_ASSERT(fdtd.SetupFDTD()==0,"Physics construction fixture failed");
+			if (!mode) referenceDt=fdtd.GetOp()->GetTimestep();
+			else TEST_ASSERT(std::abs(fdtd.GetOp()->GetTimestep()-referenceDt)<=referenceDt*1e-12,"Physics timestep mismatch");
+			size_t index=0;
+			for (unsigned int x=0;x<17;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+				auto value=VulkanCoefficients::ReadNode(*fdtd.GetOp(),x,y,z);
+				if (!mode) coefficients.push_back(value);
+				else {
+					float expected[12],actual[12]; std::memcpy(expected,coefficients[index].data(),sizeof(expected)); std::memcpy(actual,value.data(),sizeof(actual));
+					for (int n=0;n<12;++n) TEST_ASSERT(std::abs(actual[n]-expected[n])<=1e-7+2e-6*std::abs(expected[n]),"Physics setup coefficient mismatch");
+				}
+				++index;
+			}
+			EngineBackend* backend=fdtd.GetBackend();
+			backend->SetVolt(2,8,6,9,1); backend->SetCurr(0,8,6,9,0.01f);
+			TEST_ASSERT(backend->IterateTS(96),"Physics setup propagation failed");
+			if (mode) {
+				auto* gpu=dynamic_cast<EngineVulkan*>(backend);
+				TEST_ASSERT(gpu && gpu->SyncFieldsToHost(),"Physics fixture silently fell back from Vulkan");
+			}
+			index=0; double error=0,norm=0;
+			for (unsigned int n=0;n<3;++n) for (unsigned int x=0;x<17;++x)
+				for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
+					const float values[2]={backend->GetVolt(n,x,y,z),backend->GetCurr(n,x,y,z)};
+					for (float value:values) {
+						TEST_ASSERT(std::isfinite(value),(mode?"GPU physics fixture became non-finite":"CPU physics reference became non-finite"));
+						if (!mode) fields.push_back(value);
+						else { error+=std::pow(double(value)-fields[index],2); norm+=std::pow(double(fields[index]),2); }
+						++index;
+					}
+				}
+			if (mode) {
+				std::cout << "Physics setup fixture=" << fixture << " relative L2=" << std::sqrt(error/std::max(norm,1e-30)) << std::endl;
+				TEST_ASSERT(std::sqrt(error)<=1e-7+1e-3*std::sqrt(norm),"GPU physics construction changed propagated fields");
+			}
+		}
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_SetupPolicy()
+{
+	std::vector<VulkanCoefficients::Node> reference;
+	for (unsigned int mode=0;mode<3;++mode) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=vulkan",mode==0?"--vulkan-setup=cpu":mode==1?"--vulkan-setup=auto":"--vulkan-setup=gpu"});
+		auto* csx=CreateCustomGrid(9,9,9);
+		auto* material=new CSPropMaterial(csx->GetParameterSet()); material->SetEpsilon(2);
+		material->SetEpsilonWeightFunction("1+0.001*x*x",0);
+		auto* box=new CSPrimBox(csx->GetParameterSet(),material);
+		for (int k=0;k<6;++k) box->SetCoord(k,k%2?4:-4);
+		csx->AddProperty(material); fdtd.SetCSX(csx); fdtd.SetNumberOfTimeSteps(8); fdtd.SetGaussExcite(1e9,0.5e9);
+		fdtd.SetEnableDumps(false);
+		bool rejected=false;
+		try { TEST_ASSERT(fdtd.SetupFDTD()==0,"CPU fallback could not construct the model"); }
+		catch (const std::runtime_error& error) {
+			rejected=true;
+			TEST_ASSERT(mode==2,"Automatic setup must fall back before propagating an unsupported-model error");
+			TEST_ASSERT(std::string(error.what()).find("GPU operator setup requested:")!=std::string::npos,"Strict rejection lost its diagnostic");
+		}
+		if (mode==2) { TEST_ASSERT(rejected,"Strict GPU setup must reject spatial weights"); continue; }
+		size_t index=0;
+		for (unsigned int x=0;x<9;++x) for (unsigned int y=0;y<9;++y) for (unsigned int z=0;z<9;++z) {
+			auto actual=VulkanCoefficients::ReadNode(*fdtd.GetOp(),x,y,z);
+			if (!mode) reference.push_back(actual);
+			else TEST_ASSERT(actual==reference[index],"CPU setup fallback changed the reference coefficients");
+			++index;
+		}
+	}
+	return true;
+}
+
+bool Test_Vulkan_SetupAllocationFailure()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd; fdtd.SetLibraryArguments({"--engine=basic","--numThreads=1"});
+	auto* csx=CreateCustomGrid(9,9,9);
+	auto* source=new CSPropExcitation(csx->GetParameterSet()); source->SetExcitType(1); source->SetExcitation(1,2);
+	auto* box=new CSPrimBox(csx->GetParameterSet(),source);
+	for (int k=0;k<6;++k) box->SetCoord(k,k%2?2:-2);
+	csx->AddProperty(source); fdtd.SetCSX(csx); fdtd.SetNumberOfTimeSteps(64); fdtd.SetGaussExcite(10e9,5e9); fdtd.SetEnableDumps(false);
+	TEST_ASSERT(fdtd.SetupFDTD()==0,"Allocation failure reference failed");
+	Operator* op=fdtd.GetOp(); const double timestep=op->GetTimestep(); const bool used=box->GetPrimitiveUsed();
+	EngineVulkan gpu(op); std::string reason;
+	gpu.m_setupMemoryLimit=1;
+	TEST_ASSERT(!gpu.BuildOperator(*op,0,reason) && reason.find("memory budget")!=std::string::npos,"GPU setup ignored its memory budget");
+	TEST_ASSERT(op->GetTimestep()==timestep && box->GetPrimitiveUsed()==used,"Failed setup changed timestep or primitive state");
+	gpu.m_setupMemoryLimit=UINT64_MAX; gpu.m_setupAllocationFailAfter=21;
+	TEST_ASSERT(!gpu.BuildOperator(*op,0,reason) && reason.find("allocation failure")!=std::string::npos,"Injected setup allocation failure was not handled");
+	TEST_ASSERT(op->GetTimestep()==timestep && box->GetPrimitiveUsed()==used,"Partial setup did not restore construction state");
+	gpu.m_setupAllocationFailAfter=UINT32_MAX;
+	TEST_ASSERT(gpu.BuildOperator(*op,0,reason),reason);
+	TEST_ASSERT(op->GetExcitationSignal()->buildExcitationSignal(64) && gpu.Initialize(),"GPU setup could not recover after failure");
+	TEST_ASSERT(gpu.IterateTS(32),"Recovered GPU setup could not step"); gpu.Reset();
+	TEST_ASSERT(gpu.Initialize() && gpu.IterateTS(32) && gpu.SyncFieldsToHost(),"Prepared-buffer reset/reinitialization failed");
+	return true;
+#endif
+}
+
 int main(int argc, char* argv[])
 {
+	if (argc>1 && std::string(argv[1])=="--physics-setup-tests") {
+		try { RUN_TEST(Test_Vulkan_PhysicsSetup); }
+		catch (const std::exception& error) { std::cerr << error.what() << std::endl; return 1; }
+		return tests_failed?1:0;
+	}
+	if (argc>1 && std::string(argv[1])=="--setup-tests") {
+		try {
+			RUN_TEST(Test_Vulkan_OperatorSetup);
+			RUN_TEST(Test_Vulkan_PhysicsSetup);
+			RUN_TEST(Test_Vulkan_SetupPolicy);
+			RUN_TEST(Test_Vulkan_SetupAllocationFailure);
+		} catch (const std::exception& error) { std::cerr << error.what() << std::endl; return 1; }
+		return tests_failed?1:0;
+	}
 	if (argc>1 && std::string(argv[1])=="--fd-phase-benchmark") {
 		RUN_TEST(Test_Vulkan_FDPhaseCandidate);
 		return tests_failed ? 1 : 0;

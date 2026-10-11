@@ -36,6 +36,7 @@ class OPENEMS_EXPORT Operator_Ext_Mur_ABC : public Operator_Extension
 {
 	friend class Engine_Ext_Mur_ABC;
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
 public:
 	Operator_Ext_Mur_ABC(Operator* op);
 	~Operator_Ext_Mur_ABC();

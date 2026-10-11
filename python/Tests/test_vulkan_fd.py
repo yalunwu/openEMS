@@ -1,5 +1,6 @@
 """Vulkan FD/TD output equivalence: fields, schedules and NF2FF."""
 import os
+import re
 import base64
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ class Test_VulkanFD(unittest.TestCase):
     def run_case(self, name, mode=0, accumulation='gpu', batch=32, engine='vulkan',
                  steps=129, mixed=False, nf2ff=False, legacy=False, end=0,
                  windows=True, directions=None, mirror=None, disabled=False, vtk=False,
-                 td_accumulation=None, td_only=False):
+                 td_accumulation=None, td_only=False, setup=None):
         path = os.path.join(self.temp.name, name)
         csx = gpu.ContinuousStructure()
         grid = csx.GetGrid()
@@ -73,6 +74,8 @@ class Test_VulkanFD(unittest.TestCase):
         tree.write(xml)
         self.assertEqual(csx.ReadFromXML(xml), '')
         options = {}
+        if setup is not None:
+            options['vulkan_setup'] = setup
         if accumulation is not None:
             options['vulkan_fd'] = accumulation
         if td_accumulation is not None:
@@ -82,6 +85,15 @@ class Test_VulkanFD(unittest.TestCase):
                  legacyHDF5Dumps=legacy, disable_dumps=disabled,
                  dump_statistics=end>0, cleanup=False)
         return path, recorder
+
+    def test_gpu_operator_setup_outputs(self):
+        """Construction modes preserve FD/TD schedules and angular NF2FF (0.1%)."""
+        reference, a = self.run_case('setup_reference', setup='cpu', nf2ff=True,
+                                     mixed=True, steps=257)
+        for setup in ('gpu', 'auto'):
+            actual, b = self.run_case('setup_' + setup, setup=setup, nf2ff=True,
+                                      mixed=True, steps=257)
+            self.compare_far_field(reference, a, actual, b)
 
     def test_automatic_fd_selection(self):
         reference, _ = self.run_case('auto_reference', accumulation='cpu')
@@ -197,7 +209,7 @@ class Test_VulkanFD(unittest.TestCase):
                 # Coordinate arrays have VTK-generated names containing object addresses.
                 def metadata(array):
                     return {k: v for k, v in array.attrib.items() if not k.startswith('Range')
-                            and not (k == 'Name' and v.startswith('Array 0x'))}
+                            and not (k == 'Name' and re.fullmatch(r'Array (?:0x)?[0-9a-fA-F]+', v))}
                 self.assertEqual(metadata(p), metadata(q))
                 u, v = self.read_vtk_array(a, p), self.read_vtk_array(b, q)
                 self.assertEqual(u.shape, v.shape)
@@ -243,8 +255,10 @@ class Test_VulkanFD(unittest.TestCase):
 
     def compare_far_field(self, reference, a, actual, b):
         self.compare_files(reference, actual)
-        x = a.CalcNF2FF(reference, [10e9, 20e9], [0, 30, 60, 90, 120, 150, 180], [0, 45, 90], read_cached=False)
-        y = b.CalcNF2FF(actual, [10e9, 20e9], [0, 30, 60, 90, 120, 150, 180], [0, 45, 90], read_cached=False)
+        x = a.CalcNF2FF(reference, [10e9, 20e9], [0, 30, 60, 90, 120, 150, 180], [0, 45, 90], read_cached=False,
+                        outfile=os.path.join(self.temp.name, os.path.basename(reference) + '_farfield.h5'))
+        y = b.CalcNF2FF(actual, [10e9, 20e9], [0, 30, 60, 90, 120, 150, 180], [0, 45, 90], read_cached=False,
+                        outfile=os.path.join(self.temp.name, os.path.basename(actual) + '_farfield.h5'))
         for name in ('E_theta', 'E_phi', 'E_cprh', 'E_cplh', 'Prad', 'Dmax'):
             p, q = np.asarray(getattr(x, name)), np.asarray(getattr(y, name))
             np.testing.assert_allclose(p, q, rtol=.001, atol=np.max(np.abs(p), initial=0)*1e-6 + 1e-20)

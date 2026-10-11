@@ -27,6 +27,7 @@ class OPENEMS_EXPORT Operator_Ext_Dispersive : public Operator_Extension
 {
 	friend class Engine_Ext_Dispersive;
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
 public:
 	virtual ~Operator_Ext_Dispersive();
 

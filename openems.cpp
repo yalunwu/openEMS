@@ -23,6 +23,7 @@
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
+#include <typeinfo>
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "FDTD/operator_cylinder.h"
@@ -296,6 +297,15 @@ void openEMS::collectCommandLineArguments()
 				m_vulkanCoefficients = val;
 			}),
 			"Vulkan coefficient storage: dense (default), palette, or analyze both layouts"
+		)
+		(
+			"vulkan-setup",
+			po::value<std::string>()->default_value("auto")->notifier([&](const std::string& val) {
+				if (val != "auto" && val != "cpu" && val != "gpu")
+					throw std::invalid_argument("vulkan-setup must be auto, cpu or gpu");
+				m_vulkanSetup = val;
+			}),
+			"Operator construction: auto GPU with fallback (default), cpu reference, or strict gpu"
 		)
 		(
 			"vulkan-fd",
@@ -1363,7 +1373,32 @@ int openEMS::SetupFDTD()
 	if (m_debugPEC)
 		debugFlags |= Operator::debugPEC;
 
-	FDTD_Op->CalcECOperator( debugFlags );
+	std::unique_ptr<EngineVulkan> preparedVulkan;
+	if (m_vulkanSetup=="gpu" && m_engine!=EngineType_Vulkan)
+		throw std::invalid_argument("vulkan-setup=gpu requires engine=vulkan");
+	if (m_engine==EngineType_Vulkan && m_vulkanSetup=="auto" && typeid(*FDTD_Op)!=typeid(Operator)) {
+		// Cylindrical grid initialization edits the CSX mesh. Use this already
+		// initialized CPU operator instead of initializing that mesh a second time.
+		cout << "[openEMS Vulkan] CPU operator setup fallback: only the basic Cartesian operator is supported" << endl;
+		FDTD_Op->CalcECOperator(debugFlags);
+	} else if (m_engine==EngineType_Vulkan && m_vulkanSetup!="cpu") {
+		std::string reason;
+		preparedVulkan.reset(new EngineVulkan(FDTD_Op));
+		preparedVulkan->SetBatchSize(m_vulkanBatchSize);
+		preparedVulkan->SetProfilingEnabled(m_vulkanProfile);
+		preparedVulkan->SetCoefficientMode(m_vulkanCoefficients);
+		if (!EngineVulkan::CheckModelSupport(FDTD_Op,m_CSX,reason) || !preparedVulkan->BuildOperator(*FDTD_Op,debugFlags,reason)) {
+			preparedVulkan.reset();
+			if (m_vulkanSetup=="gpu") throw std::runtime_error("GPU operator setup requested: "+reason);
+			cout << "[openEMS Vulkan] CPU operator setup fallback: " << reason << endl;
+			// Recreate all extensions after any partial GPU construction failure.
+			delete FDTD_Op; FDTD_Op=nullptr;
+			const std::string requestedMode=m_vulkanSetup; m_vulkanSetup="cpu";
+			try { const int result=SetupFDTD(); m_vulkanSetup=requestedMode; return result; }
+			catch (...) { m_vulkanSetup=requestedMode; throw; }
+		}
+		cout << "[openEMS Vulkan] Operator constructed on GPU." << endl;
+	} else FDTD_Op->CalcECOperator( debugFlags );
 	/*******************************************************************************/
 
 	//reset flags for material storage, if no dump-box resets it to true, it will be cleaned up...
@@ -1428,10 +1463,13 @@ int openEMS::SetupFDTD()
 		std::string unsupportedReason;
 		if (EngineVulkan::CheckModelSupport(FDTD_Op, m_CSX, unsupportedReason))
 		{
-			std::unique_ptr<EngineVulkan> vulkanBackend(new EngineVulkan(FDTD_Op));
-			vulkanBackend->SetBatchSize(m_vulkanBatchSize);
-			vulkanBackend->SetProfilingEnabled(m_vulkanProfile);
-			vulkanBackend->SetCoefficientMode(m_vulkanCoefficients);
+			std::unique_ptr<EngineVulkan> vulkanBackend=std::move(preparedVulkan);
+			if (!vulkanBackend) {
+				vulkanBackend.reset(new EngineVulkan(FDTD_Op));
+				vulkanBackend->SetBatchSize(m_vulkanBatchSize);
+				vulkanBackend->SetProfilingEnabled(m_vulkanProfile);
+				vulkanBackend->SetCoefficientMode(m_vulkanCoefficients);
+			}
 			if (vulkanBackend->Initialize())
 			{
 				m_EngineBackend = std::move(vulkanBackend);

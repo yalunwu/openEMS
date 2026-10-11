@@ -60,6 +60,7 @@ class OPENEMS_EXPORT Operator_Ext_DebyeMaterial : public Operator_Ext_Dispersive
 {
 	friend class Engine_Ext_DebyeMaterial;
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
 public:
 	Operator_Ext_DebyeMaterial(Operator* op);
 	virtual ~Operator_Ext_DebyeMaterial();

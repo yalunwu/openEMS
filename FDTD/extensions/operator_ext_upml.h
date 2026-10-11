@@ -36,6 +36,7 @@ class OPENEMS_EXPORT Operator_Ext_UPML : public Operator_Extension
 {
 	friend class Engine_Ext_UPML;
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
 public:
 	virtual ~Operator_Ext_UPML();
 

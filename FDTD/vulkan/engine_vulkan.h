@@ -10,6 +10,7 @@
 #include <iosfwd>
 #include <utility>
 #include <functional>
+#include <set>
 #include "tools/arraylib/array_nijk.h"
 
 #ifdef ENABLE_VULKAN
@@ -22,6 +23,8 @@ class ProcessFields;
 class ProcessFieldsTD;
 class Operator_Ext_Absorbing_BC;
 class Operator_CylinderMultiGrid;
+class VulkanOperatorSetup;
+class OperatorSetup;
 
 class OPENEMS_EXPORT EngineVulkan : public EngineBackend
 {
@@ -30,6 +33,7 @@ public:
 	~EngineVulkan() override;
 
 	bool Initialize() override;
+	bool BuildOperator(Operator& op, int debugFlags, std::string& reason);
 	void Reset() override;
 	bool IterateTS(unsigned int iterTS) override;
 	// Record future probe frames, then advance CPU processing with IterateTS().
@@ -99,6 +103,14 @@ public:
 	}
 
 private:
+	friend class VulkanOperatorSetup;
+	bool m_setupDeviceReady = false;
+	bool m_setupCoefficientsReady = false;
+	bool m_setupUpmlReady = false;
+	std::unique_ptr<OperatorSetup> m_operatorSetup;
+	uint64_t m_setupMemoryLimit = UINT64_MAX;
+	uint32_t m_setupAllocationFailAfter = UINT32_MAX;
+	friend bool Test_Vulkan_SetupAllocationFailure();
 	friend bool Test_Vulkan_OptionalResources();
 	friend bool Test_Vulkan_ProbeAllocationFailure();
 	friend bool Test_Vulkan_ExtensionIndexValidation();
@@ -214,6 +226,7 @@ private:
 		VkMemoryPropertyFlags memoryProperties = 0;
 		void* mapped = nullptr;
 	};
+	std::set<VulkanBuffer*> m_setupPreparedBuffers;
 
 	struct FDChunk {
 		uint32_t offset = 0, count = 0, frequency = 0;
@@ -460,7 +473,8 @@ private:
 	bool SyncHierarchyToDevice();
 
 	bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VulkanBuffer& outBuf);
-	bool UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf, bool* allocationFailed = nullptr);
+	bool UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf, bool* allocationFailed = nullptr,
+		VkBufferUsageFlags extraUsage = 0);
 	void DestroyBuffer(VulkanBuffer& buf);
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
 	VkShaderModule CreateShaderModule(const std::vector<uint32_t>& spirv);

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include "operator.h"
+#include "operator_setup.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_excitation.h"
@@ -989,7 +990,9 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	Init_EC();
 	InitDataStorage();
 
-	if (Calc_EC()==0)
+	if (m_setupBackend)
+		m_setupBackend->CalcEC(*this);
+	else if (Calc_EC()==0)
 		return -1;
 
 	m_InvaildTimestep = false;
@@ -1026,7 +1029,9 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 
 	unsigned int pos[3];
 
-	for (int n=0; n<3; ++n)
+	if (m_setupBackend)
+		m_setupBackend->CalcCoefficients(*this);
+	else for (int n=0; n<3; ++n)
 	{
 		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
 		{
@@ -1046,20 +1051,23 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	for (int n=0; n<6; ++n)
 		if (m_BC[n]==-1)
 			PEC[n] = false;
-	ApplyElectricBC(PEC);
+	if (!m_setupBackend) ApplyElectricBC(PEC);
 
-	CalcPEC();
+	if (m_setupBackend)
+		m_setupBackend->CalcPEC(*this);
+	else
+		CalcPEC();
 
 	Calc_LumpedElements();
 
 	bool PMC[6];
 	for (int n=0; n<6; ++n)
 		PMC[n] = m_BC[n]==1;
-	ApplyMagneticBC(PMC);
+	if (!m_setupBackend) ApplyMagneticBC(PMC);
 
 	//all information available for extension... create now...
 	for (size_t n=0; n<m_Op_exts.size(); ++n)
-		if (m_Op_exts.at(n)->BuildExtension()==false)
+		if ((m_setupBackend ? m_setupBackend->BuildExtension(*this,*m_Op_exts.at(n)) : m_Op_exts.at(n)->BuildExtension())==false)
 			m_Op_exts.at(n)->SetActive(false); //extension has nothing to do or failed to build, drop it below
 
 	//remove inactive extensions
@@ -1075,6 +1083,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 			++it;
 	}
 
+	if (m_setupBackend) m_setupBackend->SynchronizeOperator(*this);
 	if (debugFlags & debugMaterial)
 		DumpMaterial2File( "material_dump" );
 	if (debugFlags & debugOperator)
@@ -1644,7 +1653,9 @@ bool Operator::Calc_LumpedElements()
 				unsigned int pos[3];
 				double unitGC=0;
 				int ipos=0;
-				for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
+				if (m_setupBackend)
+					unitGC=m_setupBackend->LumpedGeometry(ny,uiStart,uiStop);
+				else for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
 				{
 					double unitGC_Plane=0;
 					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
@@ -1659,7 +1670,7 @@ bool Operator::Calc_LumpedElements()
 					//capacity/conductivity in series: add reciprocal values
 					unitGC += 1/unitGC_Plane;
 				}
-				unitGC = 1/unitGC;
+				if (!m_setupBackend) unitGC = 1/unitGC;
 
 				bool caps = PLE->GetCaps();
 				double kappa = 0;
@@ -1678,7 +1689,9 @@ bool Operator::Calc_LumpedElements()
 					}
 				}
 
-				for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
+				if (m_setupBackend)
+					m_setupBackend->ApplyLumpedRC(ny,uiStart,uiStop,C,R,epsilon,kappa,caps);
+				else for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
 				{
 					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
 					{
@@ -1702,7 +1715,7 @@ bool Operator::Calc_LumpedElements()
 				}
 
 				// setup metal caps
-				if (caps)
+				if (caps && !m_setupBackend)
 				{
 					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
 					{
@@ -1870,6 +1883,11 @@ void Operator::SetTimestepFactor(double factor)
 
 double Operator::CalcTimestep()
 {
+	if (m_setupBackend)
+	{
+		m_setupBackend->CalcTimestep(*this);
+		return 0;
+	}
 	if (m_TimeStepVar==3)
 		return CalcTimestep_Var3(); //the biggest one for cartesian meshes
 

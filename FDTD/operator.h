@@ -30,11 +30,14 @@ class Operator_Extension;
 class Operator_Ext_Excitation;
 class Engine;
 class TiXmlElement;
+class OperatorSetup;
 
 //! Basic FDTD-operator
 class OPENEMS_EXPORT Operator : public Operator_Base
 {
 	friend class Engine;
+	friend class VulkanOperatorSetup;
+	friend bool Test_Vulkan_OperatorSetup();
 	friend class Engine_Interface_FDTD;
 	friend class Operator_Ext_LorentzMaterial;
 	friend class Operator_Ext_ConductingSheet;
@@ -60,6 +63,8 @@ public:
 	virtual bool SetGeometryCSX(ContinuousStructure* geo);
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
+	void SetSetupBackend(OperatorSetup* backend) { m_setupBackend = backend; }
+	OperatorSetup* GetSetupBackend() const { return m_setupBackend; }
 
 	// the next four functions need to be reimplemented in a derived class
 	inline virtual FDTD_FLOAT GetVV(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
@@ -240,6 +245,7 @@ public:
 	) const;
 
 protected:
+	OperatorSetup* m_setupBackend = NULL; // borrowed during CalcECOperator only
 	//! use New() for creating a new Operator
 	Operator();
 

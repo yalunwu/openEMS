@@ -237,6 +237,7 @@ if(BUILD_TESTING)
   ADD_EXECUTABLE( test_backend test_backend.cpp test_vulkan_performance.cpp )
   TARGET_LINK_LIBRARIES( test_backend openEMS ${CSXCAD_LIBRARIES} ${VULKAN_LIBRARIES} )
   ADD_TEST(NAME backend COMMAND test_backend)
+  ADD_TEST(NAME vulkan-operator-setup COMMAND test_backend --setup-tests)
   option(OPENEMS_VULKAN_SYNC_TESTS "Run GPU tests with installed Khronos synchronization validation" OFF)
   if(ENABLE_VULKAN AND OPENEMS_VULKAN_SYNC_TESTS)
     ADD_TEST(NAME vulkan-synchronization COMMAND ${CMAKE_COMMAND}
@@ -252,7 +253,7 @@ if(BUILD_TESTING)
   ADD_TEST(NAME vulkan-coefficients-invalid COMMAND ${CMAKE_COMMAND}
     "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>"
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_coefficient_rejection.cmake)
-  foreach(domain fd td)
+  foreach(domain fd td setup)
     ADD_TEST(NAME vulkan-${domain}-invalid COMMAND ${CMAKE_COMMAND}
       "-DOPENEMS_EXECUTABLE=$<TARGET_FILE:openEMS_bin>" -DDUMP_DOMAIN=${domain}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tests/check_vulkan_dump_rejection.cmake)

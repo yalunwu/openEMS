@@ -39,11 +39,25 @@ openEMS` picks up the unbuilt source tree instead of the installed module.
 
 ### Vulkan integration tests
 
+GPU operator construction is covered by
+`test_gpu_engine.Test_GPUEngine.test_operator_setup_modes_and_reuse` and
+`test_vulkan_fd.Test_VulkanFD.test_gpu_operator_setup_outputs`. They check the
+`vulkan_setup` option, repeated runs, invalid modes, FD/TD sample schedules,
+complex NF2FF surfaces and angular far fields with a 0.1% numerical tolerance.
+Use a matching native build/Python wheel and set `OPENEMS_INSTALL_PATH` when
+testing an isolated install. Native construction fixtures additionally run with
+`test_backend --setup-tests`.
+
 Requires a Vulkan-enabled native build, compatible device and matching rebuilt bindings.
 
 ```bash
 python3 run_testsuite.py --only-unittests test_vulkan_fd
 ```
+
+On Windows, the GPU tests first load an explicitly selected
+`OPENEMS_INSTALL_PATH` library, then add development search paths. Without that
+setting, they load `openEMS/build/libopenEMS.dll` when present. Supply matching
+dependency DLLs and record the actual build/library and device used for results.
 
 The GPU-engine module checks solver physics, probes and scheduling. The field-dump
 module compares automatic/CPU/GPU selection, complex E/H spectra, TD volume/plane/line

@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "FDTD/operator.h"
+#include "FDTD/operator_setup.h"
 #include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/engine.h"
 #include "FDTD/excitation.h"
@@ -540,8 +541,8 @@ bool EngineVulkan::Initialize()
 #ifdef ENABLE_VULKAN
 	try
 	{
-		if (m_device) Reset();
-		if (!m_level->m_dimensionsValid || !InitVulkan() || !InitializeLevel())
+		if (m_device && !m_setupDeviceReady) Reset();
+		if (!m_level->m_dimensionsValid || (!m_setupDeviceReady && !InitVulkan()) || !InitializeLevel())
 		{
 			std::cerr << "[openEMS Vulkan] Failed to initialize the GPU grid hierarchy." << std::endl;
 			Reset();
@@ -556,6 +557,11 @@ bool EngineVulkan::Initialize()
 	}
 
 	SetHierarchyTimestep(0u);
+	m_operatorSetup.reset();
+	m_setupDeviceReady = false;
+	m_setupCoefficientsReady = false;
+	m_setupUpmlReady = false;
+	m_setupPreparedBuffers.clear();
 	// A reused CPU hierarchy may still contain fields from its previous run.
 	MarkHierarchyHostInvalid();
 	if (!SyncFieldsToHost())
@@ -716,6 +722,7 @@ uint32_t EngineVulkan::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags
 
 bool EngineVulkan::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VulkanBuffer& outBuf)
 {
+	if (m_setupDeviceReady && m_setupPreparedBuffers.count(&outBuf)) return outBuf.size==size;
 	VkPhysicalDeviceProperties limits = {};
 	vkGetPhysicalDeviceProperties(m_physicalDevice, &limits);
 	if (size == 0 || ((usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && size > limits.limits.maxStorageBufferRange))
@@ -786,11 +793,16 @@ bool EngineVulkan::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkM
 	return true;
 }
 
-bool EngineVulkan::UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf, bool* allocationFailed)
+bool EngineVulkan::UploadStorageBuffer(const void* data, VkDeviceSize size, VulkanBuffer& outBuf, bool* allocationFailed,
+	VkBufferUsageFlags extraUsage)
 {
+	if (m_setupDeviceReady && m_setupPreparedBuffers.count(&outBuf)) {
+		if (allocationFailed) *allocationFailed=false;
+		return outBuf.size==size;
+	}
 	if (allocationFailed) *allocationFailed = true;
 	if (!data || !size) return false;
-	if (!CreateBuffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	if (!CreateBuffer(size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | extraUsage,
 	                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, outBuf))
 		return false;
 	VulkanBuffer staging;
@@ -1065,6 +1077,11 @@ bool EngineVulkan::AllocateBuffers()
 	VkMemoryPropertyFlags devLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	if (stats.palette) {
+		if (m_setupCoefficientsReady) {
+			m_level->m_bufVv.Release(); m_level->m_bufVi.Release();
+			m_level->m_bufIi.Release(); m_level->m_bufIv.Release();
+			m_setupCoefficientsReady=false;
+		}
 		bool allocationFailed = false;
 		if (!UploadStorageBuffer(palette.tuples.data(), palette.tuples.size() * 48ull, m_level->m_bufVv, &allocationFailed) ||
 		    !UploadStorageBuffer(palette.indices.data(), palette.indices.size() * 4ull, m_level->m_bufVi, &allocationFailed)) {
@@ -1076,7 +1093,7 @@ bool EngineVulkan::AllocateBuffers()
 			std::cerr << "[openEMS Vulkan] Palette allocation failed; retaining dense coefficients." << std::endl;
 		}
 	}
-	if (!stats.palette) {
+	if (!stats.palette && !m_setupCoefficientsReady) {
 		if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVv)) return false;
 		if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufVi)) return false;
 		if (!CreateBuffer(fieldBytes, storageUsage, devLocal, m_level->m_bufIi)) return false;
@@ -1103,7 +1120,7 @@ bool EngineVulkan::AllocateBuffers()
 	if (!AllocateFieldStagingBuffer()) return false;
 
 	// Upload initial material coefficient matrices if operator is present
-	if (m_level->m_op && !stats.palette)
+	if (m_level->m_op && !stats.palette && !m_setupCoefficientsReady)
 	{
 		std::cout << "[openEMS Vulkan] Uploading operator material matrices (vv, vi, ii, iv) to GPU..." << std::endl;
 		std::vector<float> hostCoeff(3 * m_level->m_grid.numCells, 0.0f);
@@ -1901,7 +1918,10 @@ bool EngineVulkan::AllocateExcitationBuffers()
 	auto allocate = [&](const std::vector<GpuExcPoint>& points, VulkanBuffer& pointBuffer,
 	                    VulkanBuffer& fields, VkDescriptorSet& set) {
 		if (points.empty()) return true;
-		if (!UploadStorageBuffer(points.data(), points.size() * sizeof(GpuExcPoint), pointBuffer))
+		if (m_operatorSetup) {
+			m_operatorSetup->CompleteExcitation(&pointBuffer==&m_level->m_bufCurrExcPoints,uint32_t(points.size()),
+				points[0].signalOffset,points[0].signalLength,points[0].period);
+		} else if (!UploadStorageBuffer(points.data(), points.size() * sizeof(GpuExcPoint), pointBuffer))
 			return false;
 		VkDescriptorSetAllocateInfo alloc = {};
 		alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -2142,7 +2162,7 @@ uint32_t EngineVulkan::GetCheckedLinearIndex(unsigned int n, unsigned int x, uns
 
 bool EngineVulkan::AllocateUpmlBuffers()
 {
-	m_level->m_numUpmlCells = 0;
+	if (!m_setupUpmlReady) m_level->m_numUpmlCells = 0;
 	if (!m_level->m_op) return true;
 
 	std::vector<Operator_Ext_UPML*> upmlExts;
@@ -2160,7 +2180,7 @@ bool EngineVulkan::AllocateUpmlBuffers()
 	std::vector<float> hostVoltCoeffs; // 4 floats per cell: vv, vvfo, vvfn, 0
 	std::vector<float> hostCurrCoeffs; // 4 floats per cell: ii, iifo, iifn, 0
 
-	for (Operator_Ext_UPML* upml : upmlExts)
+	if (!m_setupUpmlReady) for (Operator_Ext_UPML* upml : upmlExts)
 	{
 		const unsigned int dims[] = {m_level->m_grid.dimX, m_level->m_grid.dimY, m_level->m_grid.dimZ};
 		for (unsigned int n = 0; n < 3; ++n)
@@ -2196,7 +2216,7 @@ bool EngineVulkan::AllocateUpmlBuffers()
 		}
 	}
 
-	m_level->m_numUpmlCells = static_cast<uint32_t>(hostIndices.size());
+	if (!m_setupUpmlReady) m_level->m_numUpmlCells = static_cast<uint32_t>(hostIndices.size());
 	if (m_level->m_numUpmlCells == 0)
 		return true;
 
@@ -2211,9 +2231,11 @@ bool EngineVulkan::AllocateUpmlBuffers()
 	VkBufferUsageFlags storageUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	VkMemoryPropertyFlags devLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-	if (!CreateBuffer(idxBytes, storageUsage, devLocal, m_level->m_bufUpmlIndices)) return false;
-	if (!CreateBuffer(coeffBytes, storageUsage, devLocal, m_level->m_bufUpmlVoltCoeffs)) return false;
-	if (!CreateBuffer(coeffBytes, storageUsage, devLocal, m_level->m_bufUpmlCurrCoeffs)) return false;
+	if (!m_setupUpmlReady) {
+		if (!CreateBuffer(idxBytes, storageUsage, devLocal, m_level->m_bufUpmlIndices)) return false;
+		if (!CreateBuffer(coeffBytes, storageUsage, devLocal, m_level->m_bufUpmlVoltCoeffs)) return false;
+		if (!CreateBuffer(coeffBytes, storageUsage, devLocal, m_level->m_bufUpmlCurrCoeffs)) return false;
+	}
 	if (!CreateBuffer(fluxBytes, storageUsage, devLocal, m_level->m_bufUpmlVoltFlux)) return false;
 	if (!CreateBuffer(fluxBytes, storageUsage, devLocal, m_level->m_bufUpmlCurrFlux)) return false;
 
@@ -2222,6 +2244,7 @@ bool EngineVulkan::AllocateUpmlBuffers()
 	VkBufferUsageFlags stageUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 	VkMemoryPropertyFlags stageProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
+	if (!m_setupUpmlReady) {
 	if (!CreateBuffer(idxBytes, stageUsage, stageProps, stageIndices)) return false;
 	if (!CreateBuffer(coeffBytes, stageUsage, stageProps, stageVoltCoeffs)) return false;
 	if (!CreateBuffer(coeffBytes, stageUsage, stageProps, stageCurrCoeffs)) return false;
@@ -2229,6 +2252,7 @@ bool EngineVulkan::AllocateUpmlBuffers()
 	std::memcpy(stageIndices.mapped, hostIndices.data(), idxBytes);
 	std::memcpy(stageVoltCoeffs.mapped, hostVoltCoeffs.data(), coeffBytes);
 	std::memcpy(stageCurrCoeffs.mapped, hostCurrCoeffs.data(), coeffBytes);
+	}
 
 	vkWaitForFences(m_device, 1, &m_level->m_fence, VK_TRUE, UINT64_MAX);
 	vkResetFences(m_device, 1, &m_level->m_fence);
@@ -2238,12 +2262,14 @@ bool EngineVulkan::AllocateUpmlBuffers()
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 
+	if (!m_setupUpmlReady) {
 	VkBufferCopy copyIdx = { 0, 0, idxBytes };
 	vkCmdCopyBuffer(m_level->m_cmdBuffer, stageIndices.buffer, m_level->m_bufUpmlIndices.buffer, 1, &copyIdx);
 
 	VkBufferCopy copyCoeff = { 0, 0, coeffBytes };
 	vkCmdCopyBuffer(m_level->m_cmdBuffer, stageVoltCoeffs.buffer, m_level->m_bufUpmlVoltCoeffs.buffer, 1, &copyCoeff);
 	vkCmdCopyBuffer(m_level->m_cmdBuffer, stageCurrCoeffs.buffer, m_level->m_bufUpmlCurrCoeffs.buffer, 1, &copyCoeff);
+	}
 
 	// Zero flux buffers
 	vkCmdFillBuffer(m_level->m_cmdBuffer, m_level->m_bufUpmlVoltFlux.buffer, 0, VK_WHOLE_SIZE, 0);
@@ -2386,6 +2412,7 @@ bool EngineVulkan::AllocateMurBuffers()
 		}
 
 		face.count = static_cast<uint32_t>(hostPoints.size()) - face.offset;
+		if (m_operatorSetup) m_operatorSetup->CompleteMur(face.offset,face.count,start_TS);
 		m_level->m_murFaces.push_back(face);
 	}
 
@@ -2422,7 +2449,7 @@ bool EngineVulkan::AllocateMurBuffers()
 	vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 
 	VkBufferCopy copyRegion = { 0, 0, paramsBytes };
-	vkCmdCopyBuffer(m_level->m_cmdBuffer, stageParams.buffer, m_level->m_bufMurParams.buffer, 1, &copyRegion);
+	if (!m_setupPreparedBuffers.count(&m_level->m_bufMurParams)) vkCmdCopyBuffer(m_level->m_cmdBuffer, stageParams.buffer, m_level->m_bufMurParams.buffer, 1, &copyRegion);
 
 	// Zero store buffer
 	vkCmdFillBuffer(m_level->m_cmdBuffer, m_level->m_bufMurStore.buffer, 0, VK_WHOLE_SIZE, 0);
@@ -2633,7 +2660,7 @@ bool EngineVulkan::AllocateTfsfBuffers()
 		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 		VkBufferCopy copyRegion = { 0, 0, bytes };
-		vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufTfsfVoltParams.buffer, 1, &copyRegion);
+		if (!m_setupPreparedBuffers.count(&m_level->m_bufTfsfVoltParams)) vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufTfsfVoltParams.buffer, 1, &copyRegion);
 		vkEndCommandBuffer(m_level->m_cmdBuffer);
 
 		VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -2664,7 +2691,7 @@ bool EngineVulkan::AllocateTfsfBuffers()
 		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 		VkBufferCopy copyRegion = { 0, 0, bytes };
-		vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufTfsfCurrParams.buffer, 1, &copyRegion);
+		if (!m_setupPreparedBuffers.count(&m_level->m_bufTfsfCurrParams)) vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufTfsfCurrParams.buffer, 1, &copyRegion);
 		vkEndCommandBuffer(m_level->m_cmdBuffer);
 
 		VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -2872,7 +2899,7 @@ bool EngineVulkan::AllocateRlcBuffers()
 		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 		VkBufferCopy copyRegion = { 0, 0, paramsBytes };
-		vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufRlcParams.buffer, 1, &copyRegion);
+		if (!m_setupPreparedBuffers.count(&m_level->m_bufRlcParams)) vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufRlcParams.buffer, 1, &copyRegion);
 		vkEndCommandBuffer(m_level->m_cmdBuffer);
 
 		VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -3092,7 +3119,7 @@ bool EngineVulkan::AllocateAbsorbingBCBuffers()
 		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 		VkBufferCopy copyRegion = { 0, 0, paramBytes };
-		vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufAbcVoltParams.buffer, 1, &copyRegion);
+		if (!m_setupPreparedBuffers.count(&m_level->m_bufAbcVoltParams)) vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufAbcVoltParams.buffer, 1, &copyRegion);
 		vkCmdFillBuffer(m_level->m_cmdBuffer, m_level->m_bufAbcVoltStore.buffer, 0, storeBytes, 0);
 		vkEndCommandBuffer(m_level->m_cmdBuffer);
 
@@ -3154,7 +3181,7 @@ bool EngineVulkan::AllocateAbsorbingBCBuffers()
 		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 		VkBufferCopy copyRegion = { 0, 0, paramBytes };
-		vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufAbcCurrParams.buffer, 1, &copyRegion);
+		if (!m_setupPreparedBuffers.count(&m_level->m_bufAbcCurrParams)) vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufAbcCurrParams.buffer, 1, &copyRegion);
 		vkCmdFillBuffer(m_level->m_cmdBuffer, m_level->m_bufAbcCurrStore.buffer, 0, storeBytes, 0);
 		vkEndCommandBuffer(m_level->m_cmdBuffer);
 
@@ -3322,7 +3349,7 @@ bool EngineVulkan::AllocateDispersiveBuffers()
 		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 		VkBufferCopy copyRegion = { 0, 0, paramBytes };
-		vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufDispVoltParams.buffer, 1, &copyRegion);
+		if (!m_setupPreparedBuffers.count(&m_level->m_bufDispVoltParams)) vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufDispVoltParams.buffer, 1, &copyRegion);
 		vkCmdFillBuffer(m_level->m_cmdBuffer, m_level->m_bufDispVoltState.buffer, 0, stateBytes, 0);
 		vkEndCommandBuffer(m_level->m_cmdBuffer);
 
@@ -3385,7 +3412,7 @@ bool EngineVulkan::AllocateDispersiveBuffers()
 		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		vkBeginCommandBuffer(m_level->m_cmdBuffer, &beginInfo);
 		VkBufferCopy copyRegion = { 0, 0, paramBytes };
-		vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufDispCurrParams.buffer, 1, &copyRegion);
+		if (!m_setupPreparedBuffers.count(&m_level->m_bufDispCurrParams)) vkCmdCopyBuffer(m_level->m_cmdBuffer, stage.buffer, m_level->m_bufDispCurrParams.buffer, 1, &copyRegion);
 		vkCmdFillBuffer(m_level->m_cmdBuffer, m_level->m_bufDispCurrState.buffer, 0, stateBytes, 0);
 		vkEndCommandBuffer(m_level->m_cmdBuffer);
 
@@ -4997,9 +5024,14 @@ void EngineVulkan::SetCurr(unsigned int n, unsigned int x, unsigned int y, unsig
 
 void EngineVulkan::Reset()
 {
+	m_setupDeviceReady = false;
+	m_setupCoefficientsReady = false;
 #ifdef ENABLE_VULKAN
 	if (m_device != VK_NULL_HANDLE && m_ownsVulkanDevice)
 		vkDeviceWaitIdle(m_device);
+	m_operatorSetup.reset();
+	m_setupUpmlReady = false;
+	m_setupPreparedBuffers.clear();
 
 	// Children share the device and must release their level resources first.
 	m_level->m_innerGrid.reset();

@@ -156,6 +156,7 @@ protected:
 	std::string m_vulkanCoefficients = "dense";
 	std::string m_vulkanFD = "auto";
 	std::string m_vulkanTD = "auto";
+	std::string m_vulkanSetup = "auto";
 
 	double endCrit;
 	int m_OverSampling;

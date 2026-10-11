@@ -56,11 +56,13 @@ void Operator_Ext_DebyeMaterial::DeleteArrays()
 		if (v_relax_ADE!=NULL)
 		{
 			for (int n=0; n<3; ++n)
-			{
-				delete[] v_relax_ADE[o][n];
-				delete[] v_drive_ADE[o][n];
-			}
+				if (v_relax_ADE[o]) delete[] v_relax_ADE[o][n];
 			delete[] v_relax_ADE[o];
+		}
+		if (v_drive_ADE!=NULL)
+		{
+			for (int n=0; n<3; ++n)
+				if (v_drive_ADE[o]) delete[] v_drive_ADE[o][n];
 			delete[] v_drive_ADE[o];
 		}
 	}

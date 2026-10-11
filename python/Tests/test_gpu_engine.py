@@ -26,6 +26,19 @@ repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 # process. Test runners supply the build/install locations through PATH.
 _dll_directory_handles = []
 if hasattr(os, 'add_dll_directory'):
+    # Resolve an explicitly selected install before adding development trees
+    # and PATH entries, which may contain other copies of its dependencies.
+    _explicit_backend = None
+    if os.environ.get('OPENEMS_INSTALL_PATH'):
+        for env_name in ('OPENEMS_INSTALL_PATH', 'CSXCAD_INSTALL_PATH'):
+            prefix = os.environ.get(env_name)
+            if prefix and os.path.isdir(os.path.join(prefix, 'bin')):
+                _dll_directory_handles.append(os.add_dll_directory(os.path.join(prefix, 'bin')))
+        _explicit_backend = next((os.path.join(os.environ['OPENEMS_INSTALL_PATH'], folder, name)
+                                  for folder in ('bin', '') for name in ('openEMS.dll', 'libopenEMS.dll')
+                                  if os.path.isfile(os.path.join(os.environ['OPENEMS_INSTALL_PATH'], folder, name))), None)
+        if _explicit_backend:
+            _dll_directory_handles.append(ctypes.CDLL(_explicit_backend))
     candidate_paths = [
         os.path.join(repo_root, 'build'),
         os.path.join(os.path.dirname(repo_root), 'CSXCAD', 'build', 'src'),
@@ -46,7 +59,7 @@ if hasattr(os, 'add_dll_directory'):
     # Resolve the local backend before the installed Python bindings can load
     # another libopenEMS.dll through their dependency search directories.
     _local_backend = os.path.join(repo_root, 'build', 'libopenEMS.dll')
-    if os.path.isfile(_local_backend):
+    if not _explicit_backend and os.path.isfile(_local_backend):
         _dll_directory_handles.append(ctypes.CDLL(_local_backend))
 
 from CSXCAD import ContinuousStructure
@@ -174,6 +187,22 @@ class Test_GPUEngine(unittest.TestCase):
 
         ret = fdtd.Run(self.sim_dir, setup_only=True, engine='vulkan')
         self.assertEqual(ret, 0)
+
+    def test_operator_setup_modes_and_reuse(self):
+        """Setup selection survives repeated Run/reset and rejects misspellings."""
+        fdtd = openEMS(NrTS=65, EndCriteria=0)
+        csx = _make_grid()
+        source = csx.AddExcitation('source', exc_type=0, exc_val=[0, 0, 1])
+        source.AddBox([0, 0, -2.5], [0, 0, 2.5])
+        fdtd.SetCSX(csx)
+        fdtd.SetGaussExcite(20e9, 10e9)
+        fdtd.SetBoundaryCond(['PEC']*6)
+        for mode in ('cpu', 'gpu', 'auto', 'gpu'):
+            self.assertIsNone(fdtd.Run(self._sim_path('setup_' + mode), engine='vulkan',
+                                      vulkan_setup=mode, cleanup=False))
+        with self.assertRaises((ValueError, RuntimeError)):
+            fdtd.Run(self._sim_path('invalid_setup'), engine='vulkan',
+                     vulkan_setup='invalid', setup_only=True)
 
     def test_different_grid_sizes(self):
         """Verify Vulkan engine on a range of grid sizes (sub-warp, asymmetric, thin slab)."""

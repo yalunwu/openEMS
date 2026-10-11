@@ -19,6 +19,12 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Vulkan operator construction with `--vulkan-setup=auto|cpu|gpu` (Python
+  `vulkan_setup`, MATLAB/Octave options string). Basic Cartesian geometry,
+  material averaging, timestep reduction, boundary conditions and extension
+  coefficients can be constructed on the GPU. Automatic mode is the Vulkan
+  default and falls back to CPU construction; strict GPU mode reports
+  unsupported models or resources.
 - Vulkan frequency-domain E/H accumulation with `--vulkan-fd=gpu`
   (Python `vulkan_fd='gpu'`, MATLAB/Octave options string). Basic Cartesian
   native, node and cell dumps, including FD NF2FF surfaces, retain their output

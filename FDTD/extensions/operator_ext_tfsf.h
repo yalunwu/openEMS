@@ -29,6 +29,7 @@ class OPENEMS_EXPORT Operator_Ext_TFSF : public Operator_Extension
 {
 	friend class Engine_Ext_TFSF;
 	friend class EngineVulkan;
+	friend class VulkanOperatorSetup;
 public:
 	Operator_Ext_TFSF(Operator* op);
 	~Operator_Ext_TFSF();
