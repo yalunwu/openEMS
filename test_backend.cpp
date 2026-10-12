@@ -439,6 +439,8 @@ bool Test_EngineVulkan_Lifecycle()
 
 	bool init = engine.Initialize();
 	TEST_ASSERT(init, "EngineVulkan initialization should succeed");
+	for (const std::string mode : {"direct", "regions", "fused", "fused-boxes"})
+		TEST_ASSERT(engine.SetPmlMode(mode) && engine.GetPmlMode() == "indexed", "No-PML engine did not retain reference");
 
 	engine.SetVolt(0, 5, 5, 2, 42.0f);
 	engine.SetCurr(1, 3, 3, 1, 10.5f);
@@ -1493,6 +1495,7 @@ bool Test_Vulkan_Multigrid_InvalidMetadata()
 	TEST_ASSERT(!gpu.Initialize(), "Non-finite interpolation coefficient must reject Vulkan");
 	VulkanMultigridTestAccess::Coefficient(*op) = originalCoefficient;
 	TEST_ASSERT(gpu.Initialize(), "Valid hierarchy must initialize after failed attempts");
+	TEST_ASSERT(gpu.SetPmlMode("fused") && gpu.GetPmlMode() == "indexed", "Multigrid fusion did not fall back");
 	TEST_ASSERT(gpu.IterateTS(3) && gpu.SyncFieldsToHost(), "Reinitialized hierarchy did not execute");
 	return true;
 #endif
@@ -1519,6 +1522,9 @@ bool Test_Vulkan_Cylinder_Equivalence()
 
 	int ec = fdtd.SetupFDTD();
 	TEST_ASSERT(ec == 0, "SetupFDTD failed with Cylindrical coordinates");
+	auto* pmlGpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+	TEST_ASSERT(pmlGpu && pmlGpu->SetPmlMode("direct") && pmlGpu->GetPmlMode() == "indexed" &&
+	            pmlGpu->SetPmlMode("fused-boxes") && pmlGpu->GetPmlMode() == "indexed", "Cylindrical PML did not fall back");
 
 	Engine* cpuEng = fdtd.GetEng();
 	EngineBackend* gpuEng = fdtd.GetBackend();
@@ -2017,6 +2023,12 @@ bool Test_Vulkan_BatchingAndProfiling()
 		TEST_ASSERT(gpu && gpu->GetBatchSize() == size && gpu->IsProfilingEnabled(), "Vulkan options were not applied");
 		TEST_ASSERT(!gpu->SetBatchSize(0) && !gpu->SetBatchSize(65), "Invalid batch sizes must be rejected");
 		TEST_ASSERT(gpu->ClearProfile(), "Profile reset failed");
+		if (size == 1u) {
+			// Exercise timestamp profiling with optional debug entry points absent.
+			gpu->m_setDebugName = nullptr;
+			gpu->m_beginDebugLabel = nullptr;
+			gpu->m_endDebugLabel = nullptr;
+		}
 		const unsigned int batches[] = {0, 1, 7, 33, 65};
 		unsigned int completed = 0;
 		for (unsigned int count : batches)
@@ -2035,6 +2047,21 @@ bool Test_Vulkan_BatchingAndProfiling()
 			const auto profile = gpu->GetProfile();
 			TEST_ASSERT(profile.timesteps == count && profile.submissions == (count + size - 1u) / size, "Unexpected timestep submission count");
 			TEST_ASSERT(profile.downloadedBytes == 0, "Stepping unexpectedly downloaded fields");
+			uint64_t extensionDispatches = 0, extensionSamples = 0;
+			double extensionSeconds = 0;
+			for (unsigned int c = EngineVulkan::ProfileUpmlPreVoltage; c <= EngineVulkan::ProfileOtherExtension; ++c) {
+				extensionDispatches += profile.categoryDispatches[c];
+				extensionSamples += profile.gpuSamples[c];
+				extensionSeconds += profile.gpuSeconds[c];
+			}
+			TEST_ASSERT(extensionDispatches == profile.categoryDispatches[EngineVulkan::ProfileExtension] &&
+			            extensionSamples == profile.gpuSamples[EngineVulkan::ProfileExtension] &&
+			            std::abs(extensionSeconds - profile.gpuSeconds[EngineVulkan::ProfileExtension]) <= 1e-12,
+			            "Extension aggregate differs from detailed categories");
+			for (auto c : {EngineVulkan::ProfileUpmlPreVoltage, EngineVulkan::ProfileUpmlPostVoltage,
+			               EngineVulkan::ProfileUpmlPreCurrent, EngineVulkan::ProfileUpmlPostCurrent,
+			               EngineVulkan::ProfileExcitation})
+				TEST_ASSERT(profile.categoryDispatches[c] == count, "PML/excitation dispatch attribution is incorrect");
 			TEST_ASSERT(std::isfinite(profile.recordSeconds) && std::isfinite(profile.waitSeconds), "Non-finite CPU profiling result");
 			if (profile.gpuSamples[EngineVulkan::ProfileBatch]) {
 				TEST_ASSERT(profile.gpuSamples[EngineVulkan::ProfileBatch] == profile.submissions, "Timestamp results were lost between submissions");
@@ -2069,7 +2096,15 @@ bool Test_Vulkan_BatchingAndProfiling()
 		TEST_ASSERT(gpu->IterateTS(1) && gpu->SyncFieldsToHost(), "Edited GPU iteration failed");
 		TEST_ASSERT(std::abs(gpu->GetVolt(2, 17, 11, 20) - expected) < 1e-4f, "Field edits were not uploaded before stepping");
 		TEST_ASSERT(gpu->GetProfile().uploadedBytes == 2ull * 3u * 35u * 23u * 41u * sizeof(float), "Edited field upload count is incorrect");
-		TEST_ASSERT(gpu->SetProfilingEnabled(false) && gpu->SetProfilingEnabled(true), "Profiling toggle failed");
+		std::ostringstream output;
+		gpu->WriteProfile(output);
+		TEST_ASSERT(output.str().find("gpu_upml_pre_voltage_ms=") != std::string::npos &&
+		            output.str().find("gpu_extension_ms=") != std::string::npos,
+		            "Profile output omitted detailed or legacy categories");
+		TEST_ASSERT(gpu->SetProfilingEnabled(false) && gpu->IterateTS(1) && gpu->Synchronize(), "Disabled profiling failed");
+		TEST_ASSERT(!gpu->m_queryPool && gpu->m_queryCount == 0 && gpu->GetProfile().dispatches == 0,
+		            "Disabled profiling recorded queries or counters");
+		TEST_ASSERT(gpu->SetProfilingEnabled(true), "Profiling toggle failed");
 		TEST_ASSERT(gpu->IterateTS(5), "Pending reset setup failed");
 		gpu->Reset();
 		TEST_ASSERT(gpu->Initialize() && gpu->GetNumberOfTimesteps() == 0, "Pending batch did not reset");
@@ -2965,6 +3000,7 @@ bool Test_Vulkan_SynchronizationDependencies(bool dispersive = true)
 		TEST_ASSERT(optimized.SetBarrierCoalescingEnabled(true) && reference.SetDispersivePreFusionEnabled(false) &&
 		            optimized.SetDispersivePreFusionEnabled(false), "Could not isolate synchronization candidates");
 		TEST_ASSERT(reference.Initialize() && optimized.Initialize() && fused.Initialize(), "Synchronization engines failed to initialize");
+		TEST_ASSERT(fused.SetPmlMode("fused") && fused.GetPmlMode() == "indexed", "Unproven extension fusion did not fall back");
 		TEST_ASSERT(reference.SetProfilingEnabled(true) && optimized.SetProfilingEnabled(true) && fused.SetProfilingEnabled(true),
 		            "Could not profile synchronization");
 		for (EngineBackend* engine : {static_cast<EngineBackend*>(&reference), static_cast<EngineBackend*>(&optimized),
@@ -3588,7 +3624,7 @@ void main() {
 		}
 	} resources;
 	resources.device=gpu.m_device;
-	resources.module=gpu.CreateShaderModule({compiled.begin(),compiled.end()});
+	resources.module=gpu.CreateShaderModule({compiled.begin(),compiled.end()}, "fd_phase_candidate.comp");
 	TEST_ASSERT(resources.module,"Phase module failed");
 	VkDescriptorSetLayoutBinding bindings[2]={};
 	for(uint32_t i=0;i<2;++i) { bindings[i]={i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}; }
@@ -4101,6 +4137,234 @@ bool Test_Vulkan_SetupAllocationFailure()
 #endif
 }
 
+bool Test_PmlRegionMapping()
+{
+	const uint32_t dims[] = {17, 11, 9};
+	std::vector<VulkanPml::Region> regions;
+	for (uint32_t component = 0; component < 3u; ++component)
+		for (uint32_t start : {0u, 9u}) {
+			VulkanPml::Region region = {};
+			region.component = component;
+			region.origin[0] = start;
+			region.extent[0] = 8;
+			region.extent[1] = dims[1];
+			region.extent[2] = dims[2];
+			regions.push_back(region);
+		}
+	TEST_ASSERT(VulkanPml::Validate(regions, dims) == 6u * 8u * 11u * 9u, "PML coverage differs");
+	std::set<uint32_t> writers;
+	for (const auto& region : regions)
+		for (uint32_t x = 0, local = 0; x < region.extent[0]; ++x)
+		for (uint32_t y = 0; y < region.extent[1]; ++y)
+		for (uint32_t z = 0; z < region.extent[2]; ++z, ++local) {
+			const uint32_t reference = region.component * 17u * 11u * 9u + (region.origin[0] + x) * 11u * 9u + y * 9u + z;
+			TEST_ASSERT(VulkanPml::FieldIndex(region, local) == reference, "Direct PML address differs from indexed order");
+			TEST_ASSERT(writers.insert(reference).second, "PML has multiple writers");
+		}
+	for (unsigned int bad = 0; bad < 5u; ++bad) {
+		auto invalid = regions;
+		if (bad == 0) invalid[1].origin[0] = 7; // shared endpoint of inclusive slabs
+		if (bad == 1) invalid[0].extent[0] = 0;
+		if (bad == 2) invalid[0].origin[0] = UINT32_MAX;
+		if (bad == 3) invalid[0].extent[1] = UINT32_MAX;
+		if (bad == 4) invalid[0].component = 3;
+		bool rejected = false;
+		try { VulkanPml::Validate(invalid, dims); } catch (const std::out_of_range&) { rejected = true; }
+		TEST_ASSERT(rejected, "Invalid/overlapping PML was accepted");
+	}
+	const uint32_t overflowing[] = {UINT32_MAX, UINT32_MAX, 2};
+	bool rejected = false;
+	try { VulkanPml::Validate(regions, overflowing); } catch (const std::out_of_range&) { rejected = true; }
+	TEST_ASSERT(rejected, "Overflowing PML grid was accepted");
+	// Region descriptors are grouped by box, then component in the production uploader.
+	regions.clear();
+	for (uint32_t start : {0u, 9u})
+		for (uint32_t component = 0; component < 3u; ++component) {
+			VulkanPml::Region r = {};
+			r.component = component; r.origin[0] = start;
+			r.extent[0] = 8; r.extent[1] = dims[1]; r.extent[2] = dims[2]; regions.push_back(r);
+		}
+	VulkanPml::Validate(regions, dims);
+	const auto interior = VulkanPml::Interior(regions, dims);
+	writers.clear();
+	for (const auto& box : interior)
+		for (uint32_t x = box.origin[0]; x < box.origin[0] + box.extent[0]; ++x)
+		for (uint32_t y = box.origin[1]; y < box.origin[1] + box.extent[1]; ++y)
+		for (uint32_t z = box.origin[2]; z < box.origin[2] + box.extent[2]; ++z)
+			TEST_ASSERT(writers.insert(x * dims[1] * dims[2] + y * dims[2] + z).second, "Overlapping interior writers");
+	for (size_t i = 0; i < regions.size(); i += 3u)
+		for (uint32_t local = 0; local < regions[i].count; ++local)
+			TEST_ASSERT(writers.insert(VulkanPml::FieldIndex(regions[i], local)).second, "Interior/PML writers overlap");
+	TEST_ASSERT(writers.size() == 17u * 11u * 9u, "Fusion partition leaves holes");
+	return true;
+}
+
+bool Test_Vulkan_PmlMemory()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	for (const std::string coefficients : {"dense", "palette"}) {
+	for (unsigned int fixture = 0; fixture < 2u; ++fixture) {
+		TestFDTDAccess fdtd;
+		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+		auto* csx = CreateCustomGrid(23, 19, 17);
+		if (fixture) {
+			auto* grid = csx->GetGrid();
+			for (unsigned int d = 0; d < 3u; ++d) {
+				const unsigned int count = grid->GetQtyLines(d);
+				grid->ClearLines(d);
+				for (unsigned int i = 0; i < count; ++i) grid->AddDiscLine(d, -20.0 + 40.0 * std::pow(double(i) / (count - 1u), 1.2));
+			}
+			auto box = [csx](CSProperties* property, const std::array<double, 6>& bounds) {
+				auto* primitive = new CSPrimBox(csx->GetParameterSet(), property);
+				for (unsigned int i = 0; i < 6u; ++i) primitive->SetCoord(i, bounds[i]);
+				csx->AddProperty(property);
+			};
+			auto* material = new CSPropMaterial(csx->GetParameterSet());
+			material->SetEpsilon(2.7); material->SetKappa(0.03);
+			box(material, {{-20, 20, -20, 20, -20, 20}});
+			auto* rlc = new CSPropLumpedElement(csx->GetParameterSet());
+			rlc->SetDirection(2); rlc->SetLEtype(CSPropLumpedElement::PARALLEL);
+			rlc->SetResistance(50); rlc->SetInductance(1e-9); rlc->SetCapacity(1e-12); rlc->SetCaps(false);
+			const double x = grid->GetLine(0, 11), y = grid->GetLine(1, 9);
+			const double z = grid->GetLine(2, 8), endZ = grid->GetLine(2, 10);
+			box(rlc, {{x - 0.1, x + 0.1, y - 0.1, y + 0.1, z, endZ}});
+			auto* excitation = new CSPropExcitation(csx->GetParameterSet());
+			excitation->SetExcitType(0); excitation->SetExcitation(1.0, 2);
+			box(excitation, {{x, x, y, y, z, endZ}});
+		}
+		fdtd.SetCSX(csx);
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetNumberOfTimeSteps(160);
+		fdtd.SetEnableDumps(false);
+		for (unsigned int face = 0; face < 6; ++face) { fdtd.Set_BC_Type(face, 3); fdtd.Set_BC_PML(face, 3); }
+		if (fixture) { fdtd.Set_BC_Type(0, 0); fdtd.Set_BC_Type(1, 1); } // PEC/PMC mixed with four PML faces
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "PML memory model setup failed");
+		for (const std::string mode : {"direct", "regions", "fused", "fused-boxes"}) {
+			EngineVulkan reference(fdtd.GetOp()), candidate(fdtd.GetOp());
+			TEST_ASSERT(reference.SetCoefficientMode(coefficients) && candidate.SetCoefficientMode(coefficients) &&
+			            reference.Initialize() && candidate.Initialize(), "PML memory engines failed");
+			if (fixture) TEST_ASSERT(candidate.m_level->m_rlcCount && !candidate.m_level->m_voltExcPoints.empty(),
+			                         "Mixed PML fixture must exercise both RLC and excitation");
+			candidate.m_pmlMemoryLimit = 0;
+			TEST_ASSERT(candidate.SetPmlMode(mode) && candidate.GetPmlMode() == "indexed", "PML resource exhaustion did not fall back");
+			candidate.m_pmlMemoryLimit = UINT64_MAX;
+			TEST_ASSERT(!candidate.CheckOptionalResult(VK_ERROR_OUT_OF_DEVICE_MEMORY) && !candidate.m_runtimeFailed,
+			            "Optional allocation failure became an execution failure");
+			TEST_ASSERT(!candidate.CheckOptionalResult(VK_ERROR_DEVICE_LOST) && candidate.m_runtimeFailed && !candidate.SetPmlMode(mode),
+			            "Device loss silently selected a fallback");
+			candidate.m_runtimeFailed = false;
+			TEST_ASSERT(candidate.SetPmlMode(mode) && candidate.GetPmlMode() == mode, "PML candidate did not select");
+			TEST_ASSERT(!candidate.SetPmlMode("invalid"), "Unknown PML mode accepted");
+			for (EngineVulkan* gpu : {&reference, &candidate}) {
+				for (uint32_t n = 0; n < 3u; ++n)
+				for (uint32_t x = 0; x < 23u; ++x)
+				for (uint32_t y = 0; y < 19u; ++y)
+				for (uint32_t z = 0; z < 17u; ++z) {
+					const float value = 0.001f * std::sin(float(n * 19u + x * 13u + y * 7u + z));
+					gpu->SetVolt(n, x, y, z, value);
+					gpu->SetCurr(n, x, y, z, value * 0.71f);
+				}
+				TEST_ASSERT(gpu->SyncFieldsToDevice(), "PML initial field upload failed");
+			}
+			auto snapshot = [](EngineVulkan& gpu, std::vector<float>& values) {
+				gpu.m_level->m_hostFieldsValid = false;
+				if (!gpu.SyncFieldsToHost()) return false;
+				values = gpu.m_level->m_hostVolt;
+				values.insert(values.end(), gpu.m_level->m_hostCurr.begin(), gpu.m_level->m_hostCurr.end());
+				const VkDeviceSize bytes = gpu.m_level->m_bufUpmlVoltFlux.size;
+				EngineVulkan::VulkanBuffer staging;
+				if (!gpu.CreateBuffer(2u * bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging) || !gpu.WaitForFence()) return false;
+				vkResetCommandBuffer(gpu.m_level->m_cmdBuffer, 0);
+				VkCommandBufferBeginInfo begin = {};
+				begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+				begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+				if (vkBeginCommandBuffer(gpu.m_level->m_cmdBuffer, &begin) != VK_SUCCESS) return false;
+				VkMemoryBarrier barrier = {};
+				barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+				barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+				barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+				vkCmdPipelineBarrier(gpu.m_level->m_cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+				VkBufferCopy copy = {0, 0, bytes};
+				vkCmdCopyBuffer(gpu.m_level->m_cmdBuffer, gpu.m_level->m_bufUpmlVoltFlux.buffer, staging.buffer, 1, &copy);
+				copy.dstOffset = bytes;
+				vkCmdCopyBuffer(gpu.m_level->m_cmdBuffer, gpu.m_level->m_bufUpmlCurrFlux.buffer, staging.buffer, 1, &copy);
+				barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+				barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+				vkCmdPipelineBarrier(gpu.m_level->m_cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                     VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+				if (vkEndCommandBuffer(gpu.m_level->m_cmdBuffer) != VK_SUCCESS || !gpu.SubmitCommandBuffer() || !gpu.WaitForFence()) return false;
+				const auto* data = static_cast<const float*>(staging.mapped);
+				values.insert(values.end(), data, data + 2u * bytes / sizeof(float));
+				return true;
+			};
+			auto compare = [&]() {
+				std::vector<float> expected, actual;
+				if (!snapshot(reference, expected) || !snapshot(candidate, actual) || expected.size() != actual.size()) return false;
+				double peak = 0, error = 0;
+				for (size_t i = 0; i < expected.size(); ++i) {
+					if (!std::isfinite(actual[i])) return false;
+					peak = std::max(peak, std::abs(double(expected[i])));
+					error = std::max(error, std::abs(double(expected[i]) - actual[i]));
+				}
+				std::cout << "PML_MEMORY mode=" << mode << " coefficients=" << coefficients << " error=" << error << " peak=" << peak << std::endl;
+				return error <= peak * 1e-7;
+			};
+			for (bool voltage : {true, false}) {
+				for (EngineVulkan* gpu : {&reference, &candidate}) {
+					TEST_ASSERT(gpu->WaitForFence(), "PML phase fence failed");
+					vkResetCommandBuffer(gpu->m_level->m_cmdBuffer, 0);
+					VkCommandBufferBeginInfo begin = {};
+					begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+					begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+					TEST_ASSERT(vkBeginCommandBuffer(gpu->m_level->m_cmdBuffer, &begin) == VK_SUCCESS, "PML phase recording failed");
+					if (voltage) gpu->RecordVoltagePhase(gpu->m_level->m_cmdBuffer, false, 0);
+					else gpu->RecordCurrentPhase(gpu->m_level->m_cmdBuffer, false, 0);
+					TEST_ASSERT(vkEndCommandBuffer(gpu->m_level->m_cmdBuffer) == VK_SUCCESS && gpu->SubmitCommandBuffer() && gpu->WaitForFence(), "PML phase execution failed");
+				}
+				TEST_ASSERT(compare(), "Per-phase PML field/flux state differs");
+			}
+			for (unsigned int batch : {1u, 32u, 64u}) {
+				TEST_ASSERT(reference.SetBatchSize(batch) && candidate.SetBatchSize(batch) && reference.IterateTS(batch + 1u) &&
+				            candidate.IterateTS(batch + 1u) && compare(), "PML batched state differs");
+			}
+			TEST_ASSERT(!candidate.SetPmlMode("indexed"), "PML selection changed during stepping");
+			candidate.Reset();
+			TEST_ASSERT(candidate.GetPmlMode() == "indexed" && candidate.Initialize() && candidate.SetPmlMode(mode), "PML reset/reuse failed");
+		}
+	}
+	}
+	return true;
+#endif
+}
+
+bool Test_Vulkan_PipelineInspection()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	TestFDTDAccess fdtd;
+	fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
+	fdtd.SetCSX(CreateCustomGrid(23, 19, 17));
+	fdtd.SetGaussExcite(20e9, 10e9);
+	fdtd.SetEnableDumps(false);
+	fdtd.Set_BC_Type(0, 3);
+	fdtd.Set_BC_PML(0, 3);
+	TEST_ASSERT(fdtd.SetupFDTD() == 0, "Pipeline inspection model failed");
+	for (const std::string coefficients : {"dense", "palette"}) {
+		EngineVulkan gpu(fdtd.GetOp());
+		TEST_ASSERT(gpu.SetCoefficientMode(coefficients) && gpu.SetPipelineInspectionEnabled(true) &&
+		            gpu.SetProfilingEnabled(true) && gpu.Initialize(), "Pipeline inspection initialization failed");
+		TEST_ASSERT(gpu.SetPmlMode("direct"), "Pipeline inspection direct candidate failed");
+		TEST_ASSERT(gpu.SetPmlMode("fused"), "Pipeline inspection fusion candidate failed");
+	}
+	return true;
+#endif
+}
+
 int main(int argc, char* argv[])
 {
 	if (argc>1 && std::string(argv[1])=="--cpu-setup-tests") {
@@ -4156,6 +4420,17 @@ int main(int argc, char* argv[])
 	}
 	if (argc > 1 && std::string(argv[1]) == "--vulkan-benchmark")
 		return RunVulkanPerformanceBenchmarks(argc, argv);
+	if (argc > 1 && std::string(argv[1]) == "--vulkan-memory-model")
+		return RunVulkanMemoryModel(argc, argv);
+	if (argc > 1 && std::string(argv[1]) == "--pml-memory-tests") {
+		RUN_TEST(Test_PmlRegionMapping);
+		RUN_TEST(Test_Vulkan_PmlMemory);
+		return tests_failed ? 1 : 0;
+	}
+	if (argc > 1 && std::string(argv[1]) == "--vulkan-memory-inspect") {
+		RUN_TEST(Test_Vulkan_PipelineInspection);
+		return tests_failed ? 1 : 0;
+	}
 	if (argc > 1 && std::string(argv[1]) == "--batching-tests") {
 		RUN_TEST(Test_ProcessingFutureInterval);
 		RUN_TEST(Test_DelayedExcitation);
@@ -4218,6 +4493,8 @@ int main(int argc, char* argv[])
 	std::cout << " Grid Sizes & Corner Cases Tests" << std::endl;
 	std::cout << "----------------------------------------" << std::endl;
 	RUN_TEST(Test_CoefficientPalette_Bits);
+	RUN_TEST(Test_PmlRegionMapping);
+	RUN_TEST(Test_Vulkan_PmlMemory);
 	RUN_TEST(Test_Vulkan_CoefficientEquivalence);
 	RUN_TEST(Test_Vulkan_CoefficientMultigrid);
 	RUN_TEST(Test_Vulkan_SubWarpGrid);

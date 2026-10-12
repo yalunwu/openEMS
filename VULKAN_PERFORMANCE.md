@@ -1,5 +1,13 @@
 # Vulkan batching, readbacks and profiling
 
+Experimental memory candidates are available in the native harness through
+`test_backend --vulkan-benchmark --pml=indexed|direct|regions|fused|fused-boxes`
+and `--vulkan-memory-model model.xml --pml=...`. The indexed default is retained.
+See [scope, fallback rules and validation](VULKAN_MEMORY_M123_RESULTS.md).
+`--vulkan-memory-inspect` optionally queries compiled pipeline statistics;
+unsupported drivers continue without them. Fused voltage/current timing includes
+the entire corresponding PML/Yee phase.
+
 The Vulkan backend records up to 32 timesteps per queue submission by default.
 The limit controls submission size. Ordinary V/I/E/H probes can keep their sample
 intervals while the GPU records several steps: a mapped buffer retains each
@@ -212,8 +220,12 @@ only when profiling is enabled.
 
 GPU timestamps measure each timestep submission and sampled dispatches from the
 first step in that submission, plus final multigrid projection, probe gathering
-and field/energy readbacks. Dispatch categories are voltage, current, extension and
-multigrid. GPU category totals describe their measured samples; do not add them
+and field/energy readbacks. The `extension` aggregate is split into
+`upml_pre_voltage`, `upml_post_voltage`, `upml_pre_current`, `upml_post_current`,
+`excitation` and `other_extension`. Its time, sample count and dispatch count
+are sums of those detailed categories using the same timestamp samples; do not
+add the aggregate to its parts. Voltage, current and multigrid remain separate.
+GPU category totals describe their measured samples; do not add them
 to the batch total or extrapolate them without using sample counts. A bounded
 query pool can omit later dispatch samples in unusually deep/complex hierarchies.
 Dispatch timestamps can include scheduling/overlap costs and are approximate.
@@ -228,6 +240,15 @@ See [Synchronization dependencies](#synchronization-dependencies) for the
 recording invariants and their validation.
 GPU timing instrumentation itself can alter scheduling; use profiling-disabled
 runs for speed comparisons. Unsupported timestamps retain CPU diagnostics.
+
+Enabling profiling before initialization also requests optimized shader debug
+information, optional `VK_EXT_debug_utils` object names and dispatch labels.
+Unavailable debug utilities do not prevent execution or timestamp profiling.
+`VULKAN_SHADER` records source/SPIR-V FNV-1a identities and `VULKAN_PIPELINE`
+records pipeline names/handles for capture attribution; these identities are
+not Nsight hashes. `debug_utils` and `shader_debug_info` in the profile report
+describe initialization. Enabling profiling later does not rebuild shaders or
+recreate the Vulkan instance; source correlation must be verified in the profiler.
 
 The backend checks the compute queue's timestamp support, scales ticks with the
 device period, masks timestamp wraparound, and collects available results after

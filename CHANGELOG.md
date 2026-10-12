@@ -19,6 +19,12 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Native Vulkan memory experiments for direct PML addressing and same-phase
+  PML/Yee fusion, with ownership validation, explicit fallback metadata and
+  optional compiled pipeline statistics. The indexed release default is retained.
+- Detailed Vulkan profiling for PML pre/post voltage/current passes, excitation
+  and other extensions, with optional shader source information and Vulkan debug
+  object names/pass labels. Existing extension totals remain available.
 - Multithreaded CPU construction feeding Vulkan stepping. `--vulkan-setup=cpu`
   and automatic CPU fallback parallelize material averaging, core coefficients
   and PEC scanning; `--numThreads` (Python `numThreads`) selects the workers,

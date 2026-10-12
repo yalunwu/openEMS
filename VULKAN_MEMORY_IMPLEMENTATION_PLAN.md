@@ -2,7 +2,12 @@
 
 Selected on 2026-10-10: direct PML addressing (discussion item 2), PML/Yee
 same-phase fusion (item 3), and compiled core-load tuning (item 4).
-Status: planned; no execution changes or new performance claims in this document.
+Status as of 2026-10-11: M0 instrumentation and M1/M3 candidates are implemented
+and locally validated. M2 inspection retains the existing core shader; explicit
+center-load reuse is included in the new fused current shader. The
+[M1–M3 evidence record](VULKAN_MEMORY_M123_RESULTS.md) distinguishes numerical
+acceptance, measured performance and hardware coverage. Release defaults remain
+indexed; candidates are selectable in the native experiment harness.
 
 ## Objective and evidence
 
@@ -246,10 +251,25 @@ small/overlapping gains. Do not predict a percentage speedup from stall samples.
 
 ## Delivery record
 
+M0 implementation and local validation owner: Codex. Independent review,
+Linux and additional GPU/vendor coverage remain unassigned/unverified.
+The [M0 evidence record](VULKAN_MEMORY_M0_RESULTS.md) identifies the exact
+source diff/binary, named pass costs, optimized SPIR-V dependency inventory,
+numerical comparisons and available build matrix. Instrumentation and
+pass attribution are available. Optimized SPIR-V load inspection and native
+executable register statistics are recorded; native producer instructions,
+reliable spill/occupancy metrics and verified source-line correlation remain
+open. M1 and M3 candidates are implemented; M2 retains the existing core after
+compiled-code inspection and removes repeated center loads in the new fused
+current candidate.
+The [M1–M3 evidence record](VULKAN_MEMORY_M123_RESULTS.md) tracks correctness,
+timing, build coverage and remaining acceptance gaps independently. Release
+defaults remain unchanged.
+
 For M0-M3, record implementation owner, validation owner, exact scope, baseline
 revision, code/correctness/performance/hardware statuses, evidence paths and
-remaining gaps before claiming completion. Owners are assigned when execution
-starts; this planning update does not start builds, captures or simulations.
+remaining gaps before claiming completion. Assign owners when each milestone
+starts; documentation alone does not establish execution or validation.
 Prototype/reference switches belong in the native harness initially. Any public
 selection added later must include CLI, Python and MATLAB/Octave integration,
 documentation and the required changelog entry. Keep release defaults unchanged

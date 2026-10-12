@@ -55,6 +55,16 @@ CPU construction and worker limits in both Vulkan and CPU-only builds.
 
 Requires a Vulkan-enabled native build, compatible device and matching rebuilt bindings.
 
+`Rect_Waveguide_PML.py` independently checks TE10 impedance, propagation phase,
+reflection and lossless power balance in all three Cartesian directions. The
+`Dielectric_Waveguide_PML.py` test checks complex impedance, attenuation and
+phase against continuum formulas using the antenna's RO3003/FR4 constants. The
+Windows native runner in `tools/validate_vulkan_physics.py` can run analytical
+scripts with CPU stepping or an explicitly selected experimental PML path; it
+rejects silent fallback and unaligned exported source planes. See
+[the physics validation report](../../VULKAN_PHYSICS_VALIDATION.md) for full
+antenna CPU comparisons, convergence checks and retained commands.
+
 ```bash
 python3 run_testsuite.py --only-unittests test_vulkan_fd
 ```
@@ -147,9 +157,11 @@ rather than a shell, and captured output is decoded with replacement so a
 console encoding cannot end a run. Of the behaviour above, only the
 `DISPLAY`/`WAYLAND_DISPLAY` removal is specific to X11 and Wayland.
 
-The full-simulation tests themselves have only ever been run on Linux, though --
-CI runs `test_*.py` everywhere but no simulation, so expect to adjust a
-tolerance when you first run them on Windows or macOS.
+The full simulation suite was originally validated on Linux. Selected analytical
+waveguide, coax and NF2FF cases have also been exercised on Windows in the
+[Vulkan physics audit](../../VULKAN_PHYSICS_VALIDATION.md). The remaining full
+suite on Windows/macOS was not verified by that audit; numerical tolerances
+should retain their stated physical justification.
 
 ## No engine selection
 

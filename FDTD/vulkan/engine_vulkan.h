@@ -2,6 +2,7 @@
 #define ENGINE_VULKAN_H
 
 #include "FDTD/engine_backend.h"
+#include "pml_regions.h"
 #include <vector>
 #include <string>
 #include <memory>
@@ -65,7 +66,10 @@ public:
 
 	enum GpuProfileCategory { ProfileBatch, ProfileVoltage, ProfileCurrent,
 	                          ProfileExtension, ProfileMultigrid, ProfileProbe,
-	                          ProfileReadback, ProfileEnergy, ProfileBarrier, ProfileFD, ProfileTD, ProfileCategoryCount };
+	                          ProfileReadback, ProfileEnergy, ProfileBarrier, ProfileFD, ProfileTD,
+	                          ProfileUpmlPreVoltage, ProfileUpmlPostVoltage,
+	                          ProfileUpmlPreCurrent, ProfileUpmlPostCurrent,
+	                          ProfileExcitation, ProfileOtherExtension, ProfileCategoryCount };
 	struct ProfileStatistics {
 		uint64_t submissions = 0, dispatches = 0, timesteps = 0, sampledSteps = 0;
 		uint64_t uploadedBytes = 0, downloadedBytes = 0, probeBytes = 0;
@@ -91,6 +95,11 @@ public:
 	void WriteProfile(std::ostream& stream);
 	std::string GetDeviceDescription() const;
 	bool SetCoefficientMode(const std::string& mode); // dense, palette, analyze; before Initialize()
+	// Native experiment harness only; selection is permitted before the first step.
+	bool SetPmlMode(const std::string& mode);
+	std::string GetPmlMode() const { return m_pmlSelected; }
+	std::string GetPmlReason() const { return m_pmlReason; }
+	bool SetPipelineInspectionEnabled(bool enabled);
 	struct CoefficientStatistics {
 		uint64_t nodes = 0, uniqueNodes = 0, denseBytes = 0, storageBytes = 0;
 		uint64_t allocatedBytes = 0;
@@ -103,6 +112,7 @@ public:
 	}
 
 private:
+	std::string m_pmlRequested = "indexed", m_pmlSelected = "indexed", m_pmlReason = "reference";
 	friend class VulkanOperatorSetup;
 	bool m_setupDeviceReady = false;
 	bool m_setupCoefficientsReady = false;
@@ -120,6 +130,8 @@ private:
 	friend bool Test_Vulkan_TimeDomainGather();
 	friend bool Test_Vulkan_FDPhaseCandidate();
 	friend bool Test_Vulkan_SynchronizationDependencies(bool);
+	friend bool Test_Vulkan_BatchingAndProfiling();
+	friend bool Test_Vulkan_PmlMemory();
 
 	struct GridDimensions {
 		uint32_t dimX = 0;
@@ -170,6 +182,14 @@ private:
 	float m_timestampPeriod = 0;
 	bool m_queriesPending = false, m_sampleDispatches = false, m_runtimeFailed = false;
 	bool m_computeBarrierEmitted = false;
+	bool m_debugUtilsEnabled = false, m_shaderDebugInfo = false;
+	bool m_inspectPipelines = false, m_pipelineInfoEnabled = false;
+	VkPipelineCreateFlags InspectionFlags() const;
+	void InspectPipeline(VkPipeline pipeline, const char* name);
+	PFN_vkSetDebugUtilsObjectNameEXT m_setDebugName = nullptr;
+	PFN_vkCmdBeginDebugUtilsLabelEXT m_beginDebugLabel = nullptr;
+	PFN_vkCmdEndDebugUtilsLabelEXT m_endDebugLabel = nullptr;
+	void NameDebugObject(VkObjectType type, uint64_t handle, const char* name);
 	EngineVulkan& ProfileOwner();
 	bool InitProfiling();
 	void CollectProfile();
@@ -177,7 +197,7 @@ private:
 	uint32_t BeginGpuSpan(VkCommandBuffer cmd, GpuProfileCategory category);
 	void EndGpuSpan(VkCommandBuffer cmd, uint32_t first);
 	void Dispatch(VkCommandBuffer cmd, uint32_t x, uint32_t y, uint32_t z,
-	              GpuProfileCategory category = ProfileExtension);
+	              GpuProfileCategory category = ProfileOtherExtension);
 	void MemoryBarrier(VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst,
 	                   const VkMemoryBarrier& barrier);
 	void CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst,
@@ -317,6 +337,16 @@ private:
 	VkPipelineLayout m_pipelineLayoutUpml = VK_NULL_HANDLE;
 	VkPipeline m_pipelineUpmlPre = VK_NULL_HANDLE;
 	VkPipeline m_pipelineUpmlPost = VK_NULL_HANDLE;
+	VkPipeline m_pipelineUpmlDirectPre = VK_NULL_HANDLE, m_pipelineUpmlDirectPost = VK_NULL_HANDLE;
+	bool CreatePmlCandidates();
+	uint64_t m_pmlMemoryLimit = UINT64_MAX;
+	bool CheckOptionalResult(VkResult result);
+	void RecordPmlPass(VkCommandBuffer cmd, bool voltage, bool pre);
+	VkDescriptorSetLayout m_descLayoutPmlFused = VK_NULL_HANDLE;
+	VkPipelineLayout m_pipelineLayoutPmlFused = VK_NULL_HANDLE;
+	VkPipeline m_pipelinePmlFusedVolt = VK_NULL_HANDLE, m_pipelinePmlFusedCurr = VK_NULL_HANDLE;
+	bool CreatePmlFusion();
+	void RecordPmlFusion(VkCommandBuffer cmd, bool voltage);
 
 	// Mur ABC Buffers & Pipelines
 	struct MurFace {
@@ -477,7 +507,7 @@ private:
 		VkBufferUsageFlags extraUsage = 0);
 	void DestroyBuffer(VulkanBuffer& buf);
 	uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
-	VkShaderModule CreateShaderModule(const std::vector<uint32_t>& spirv);
+	VkShaderModule CreateShaderModule(const std::vector<uint32_t>& spirv, const char* name);
 
 	void RecordVoltagePhase(VkCommandBuffer cmd, bool hasVoltExc, unsigned int timestep);
 	void RecordCurrentPhase(VkCommandBuffer cmd, bool hasCurrExc, unsigned int timestep);
@@ -532,6 +562,12 @@ private:
 		VulkanBuffer m_bufUpmlCurrCoeffs;
 		VulkanBuffer m_bufUpmlVoltFlux;
 		VulkanBuffer m_bufUpmlCurrFlux;
+		std::vector<VulkanPml::Region> m_pmlRegions;
+		VulkanBuffer m_bufPmlRegions;
+		bool m_pmlRegionsUploaded = false;
+		VkDescriptorSet m_descPmlDirectVolt = VK_NULL_HANDLE, m_descPmlDirectCurr = VK_NULL_HANDLE;
+		VkDescriptorSet m_descPmlFusedVolt = VK_NULL_HANDLE, m_descPmlFusedCurr = VK_NULL_HANDLE;
+		std::vector<VulkanPml::Box> m_pmlInterior;
 		VkDescriptorSet m_descSetFields = VK_NULL_HANDLE;
 		VkDescriptorSet m_descSetVoltExc = VK_NULL_HANDLE;
 		VkDescriptorSet m_descSetCurrExc = VK_NULL_HANDLE;

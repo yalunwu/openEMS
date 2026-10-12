@@ -247,6 +247,36 @@ unsigned int Number(const std::string& text, unsigned int maximum)
 }
 }
 
+int RunVulkanMemoryModel(int argc, char* argv[])
+{
+	try {
+		Require(argc >= 3, "Memory model requires an XML path");
+		std::string pml = "indexed";
+		std::vector<std::string> args = {"--engine=vulkan"};
+		for (int i = 3; i < argc; ++i) {
+			const std::string argument(argv[i]);
+			if (argument.find("--pml=") == 0) pml = argument.substr(6);
+			else args.push_back(argument);
+		}
+		BenchmarkFDTD fdtd;
+		fdtd.SetLibraryArguments(args);
+		const auto setup = Clock::now();
+		Require(fdtd.ParseFDTDSetup(argv[2]) && fdtd.SetupFDTD() == 0, "Memory model setup failed");
+		Require(fdtd.GPU() && fdtd.GPU()->SetPmlMode(pml), "Memory candidate selection failed");
+		const double setupSeconds = Seconds(setup);
+		const auto start = Clock::now();
+		fdtd.RunFDTD();
+		Require(fdtd.GPU()->Synchronize(), "Memory model execution failed");
+		std::cout << "VULKAN_MEMORY_RESULT requested=" << pml << " selected=" << fdtd.GPU()->GetPmlMode()
+		          << " steps=" << fdtd.GPU()->GetNumberOfTimesteps() << " run_s=" << Seconds(start)
+		          << " setup_s=" << setupSeconds << std::endl;
+		return 0;
+	} catch (const std::exception& error) {
+		std::cerr << error.what() << std::endl;
+		return 1;
+	}
+}
+
 int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 {
 #ifndef ENABLE_VULKAN
@@ -256,13 +286,14 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 	try {
 		unsigned int steps = 256, repeats = 5;
 		bool profile = false, referenceReadback = false, referenceBarriers = true, referenceDispersive = false, verifyEnergy = false;
-		std::string selected, csvPath, coefficients = "dense";
+		std::string selected, csvPath, coefficients = "dense", pml = "indexed";
 		std::string fdMode="auto",tdMode="auto";
 		unsigned int fdFrequencies=1, fdOverSampling=1, fdDumpMode=0;
 		std::vector<unsigned int> batches = {1, 8, 16, 32, 64};
 		for (int i = 2; i < argc; ++i) {
 			std::string arg(argv[i]);
 			if (arg == "--profile") profile = true;
+			else if (arg.find("--pml=") == 0) pml = arg.substr(6);
 			else if (arg.find("--fd=")==0) {
 				fdMode=arg.substr(5); Require(fdMode=="auto" || fdMode=="cpu" || fdMode=="gpu","fd must be auto, cpu or gpu");
 			}
@@ -325,7 +356,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 		if (!csvPath.empty()) {
 			csv.open(csvPath);
 			Require(csv.good(), "Could not open benchmark CSV");
-			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback,coefficient_mode,root_coefficient_bytes,root_allocated_bytes,root_dense_bytes,root_unique_tuples,root_palette,reference_barriers,barriers,coalesced_barriers,voltage_dispatches,current_dispatches,extension_dispatches,multigrid_dispatches,probe_dispatches,gpu_barrier_s,gpu_barrier_samples,reference_dispersive_pre,fd_mode,fd_frequencies,fd_over_sampling,fd_dump_mode,fd_samples,fd_download_bytes,fd_phase_bytes,fd_accumulator_bytes,fd_mapping_bytes,gpu_fd_s,fd_dispatches,fd_phase_s,fd_download_s,td_mode,td_samples,td_download_bytes,gpu_td_s\n";
+			csv << "case,batch,profile,repeat,steps,stored_nodes,active_voltage_nodes,operator_cells,initialization_s,iteration_s,synchronization_s,total_s,submissions,dispatches,uploaded_bytes,downloaded_bytes,probe_bytes,record_s,submit_s,wait_s,gpu_batch_s,energy_bytes,reference_readback,coefficient_mode,root_coefficient_bytes,root_allocated_bytes,root_dense_bytes,root_unique_tuples,root_palette,reference_barriers,barriers,coalesced_barriers,voltage_dispatches,current_dispatches,extension_dispatches,multigrid_dispatches,probe_dispatches,gpu_barrier_s,gpu_barrier_samples,reference_dispersive_pre,fd_mode,fd_frequencies,fd_over_sampling,fd_dump_mode,fd_samples,fd_download_bytes,fd_phase_bytes,fd_accumulator_bytes,fd_mapping_bytes,gpu_fd_s,fd_dispatches,fd_phase_s,fd_download_s,td_mode,td_samples,td_download_bytes,gpu_td_s,upml_pre_voltage_dispatches,gpu_upml_pre_voltage_s,gpu_upml_pre_voltage_samples,upml_post_voltage_dispatches,gpu_upml_post_voltage_s,gpu_upml_post_voltage_samples,upml_pre_current_dispatches,gpu_upml_pre_current_s,gpu_upml_pre_current_samples,upml_post_current_dispatches,gpu_upml_post_current_s,gpu_upml_post_current_samples,excitation_dispatches,gpu_excitation_s,gpu_excitation_samples,other_extension_dispatches,gpu_other_extension_s,gpu_other_extension_samples,pml_requested,pml_selected,pml_reason\n";
 			csv << std::setprecision(10);
 		}
 		bool found = false, metadata = false;
@@ -341,6 +372,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					const auto init = Clock::now();
 					Setup(*fdtd, c, steps, batch, profile, coefficients,fdMode,fdFrequencies,fdOverSampling,fdDumpMode,tdMode);
 					Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
+					Require(fdtd->GPU()->SetPmlMode(pml), "Could not configure PML candidate");
 					Require(fdtd->GPU()->SetBarrierCoalescingEnabled(!referenceBarriers), "Could not configure barrier reference");
 					Require(fdtd->GPU()->SetDispersivePreFusionEnabled(!referenceDispersive), "Could not configure dispersive reference");
 					initSeconds = Seconds(init);
@@ -353,6 +385,7 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 						const auto init = Clock::now();
 						Setup(*fdtd, c, steps, batch, profile, coefficients,fdMode,fdFrequencies,fdOverSampling,fdDumpMode,tdMode);
 						Require(fdtd->GPU()->SetReadbackOptimizationsEnabled(!referenceReadback), "Could not configure readback reference");
+						Require(fdtd->GPU()->SetPmlMode(pml), "Could not configure PML candidate");
 						Require(fdtd->GPU()->SetBarrierCoalescingEnabled(!referenceBarriers), "Could not configure barrier reference");
 						Require(fdtd->GPU()->SetDispersivePreFusionEnabled(!referenceDispersive), "Could not configure dispersive reference");
 						initSeconds = Seconds(init);
@@ -396,12 +429,20 @@ int RunVulkanPerformanceBenchmarks(int argc, char* argv[])
 					             << ',' << p.fdSamples << ',' << p.fdDownloadBytes << ',' << p.fdPhaseBytes
 					             << ',' << p.fdAccumulatorBytes << ',' << p.fdMappingBytes << ',' << p.gpuSeconds[EngineVulkan::ProfileFD]
 					             << ',' << p.categoryDispatches[EngineVulkan::ProfileFD] << ',' << p.fdPhaseSeconds << ',' << p.fdDownloadSeconds
-					             << ',' << tdMode << ',' << p.tdSamples << ',' << p.tdDownloadBytes << ',' << p.gpuSeconds[EngineVulkan::ProfileTD] << '\n';
+					             << ',' << tdMode << ',' << p.tdSamples << ',' << p.tdDownloadBytes << ',' << p.gpuSeconds[EngineVulkan::ProfileTD];
+					if (csv) {
+						for (auto category : {EngineVulkan::ProfileUpmlPreVoltage, EngineVulkan::ProfileUpmlPostVoltage,
+						                      EngineVulkan::ProfileUpmlPreCurrent, EngineVulkan::ProfileUpmlPostCurrent,
+						                      EngineVulkan::ProfileExcitation, EngineVulkan::ProfileOtherExtension})
+							csv << ',' << p.categoryDispatches[category] << ',' << p.gpuSeconds[category] << ',' << p.gpuSamples[category];
+						csv << ',' << pml << ',' << gpu->GetPmlMode() << ',' << gpu->GetPmlReason() << '\n';
+					}
 				}
 				std::sort(timings.begin(), timings.end());
 				const double median = (timings[(repeats - 1) / 2] + timings[repeats / 2]) / 2;
 				std::cout << "BENCHMARK case=" << c.name << " batch=" << batch << " profile=" << profile
 				          << " coefficients=" << coefficients << " reference_readback=" << referenceReadback
+				          << " pml_requested=" << pml << " pml_selected=" << fdtd->GPU()->GetPmlMode()
 				          << " reference_barriers=" << referenceBarriers
 				          << " reference_dispersive_pre=" << referenceDispersive
 				          << " fd=" << fdMode << " td=" << tdMode << " fd_frequencies=" << fdFrequencies << " fd_over_sampling=" << fdOverSampling << " fd_dump_mode=" << fdDumpMode

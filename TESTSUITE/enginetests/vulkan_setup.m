@@ -23,11 +23,17 @@ for selection = 1:size(selections, 1)
     mode = selections{selection, 1}; threads = selections{selection, 2};
     label = [mode '_' num2str(threads)]; folder = fullfile(Sim_Path, label);
     mkdir(folder); WriteOpenEMS(fullfile(folder, 'model.xml'), FDTD, CSX);
+    profile_option = '';
+    if selection==2, profile_option = ' --vulkan-profile'; end
     RunOpenEMS(folder, 'model.xml', ['--engine=vulkan --vulkan-setup=' mode ...
-        ' --vulkan-batch-size=32 --exact-endcriteria --numThreads=' num2str(threads)], ...
+        ' --vulkan-batch-size=32 --exact-endcriteria --numThreads=' num2str(threads) profile_option], ...
         struct('Silent', 1, 'LogFile', 'solver.log'));
     values = dlmread(fullfile(folder, 'voltage'), '', 2, 0);
     logtext = fileread(fullfile(folder, 'solver.log'));
+    if selection==2
+        pass(end+1) = ts_check('Detailed PML profiling', ~isempty(strfind(logtext, 'gpu_upml_pre_voltage_ms=')));
+        pass(end+1) = ts_check('Shader profiling information', ~isempty(strfind(logtext, 'shader_debug_info=1')));
+    end
     if strcmp(mode, 'cpu')
         counts = regexp(logtext, 'CPU operator construction using (\d+) thread', 'tokens');
         selected = ~isempty(counts);

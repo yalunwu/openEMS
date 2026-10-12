@@ -928,6 +928,9 @@ class Test_GPUEngine(unittest.TestCase):
                 profile = re.search(r'VULKAN_PROFILE .*?submissions=(\d+)', result.stdout)
                 self.assertIsNotNone(profile, result.stdout + result.stderr)
                 submissions[batch] = int(profile.group(1))
+                self.assertIn('gpu_upml_pre_voltage_ms=', result.stdout)
+                self.assertIn('gpu_other_extension_ms=', result.stdout)
+                self.assertIn('shader_debug_info=1', result.stdout)
             outputs[(engine, batch)] = {
                 name: np.atleast_2d(np.loadtxt(os.path.join(sdir, name), comments='%'))
                 for name in ('voltage', 'current', 'electric', 'magnetic')}

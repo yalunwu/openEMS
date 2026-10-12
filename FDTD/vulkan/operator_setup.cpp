@@ -169,6 +169,7 @@ public:
 	}
 	void Prepare() {
 		Require(typeid(op)==typeid(Operator),"only the basic Cartesian operator is supported");
+		std::vector<VulkanPml::Region> pmlRegions;
 		for (size_t n=0;n<op.GetNumberOfExtentions();++n) {
 			Operator_Extension* extension=op.GetExtension(n);
 			Require(typeid(*extension)==typeid(Operator_Ext_UPML)||typeid(*extension)==typeid(Operator_Ext_Excitation)||
@@ -180,8 +181,18 @@ public:
 			if (auto* upml=dynamic_cast<Operator_Ext_UPML*>(extension)) {
 				const uint64_t count=3ull*upml->m_numLines[0]*upml->m_numLines[1]*upml->m_numLines[2];
 				Require(count<=UINT32_MAX-upmlCount,"UPML construction index range exceeded"); upmlCount+=uint32_t(count);
+				for (uint32_t component = 0; component < 3u; ++component) {
+					VulkanPml::Region region = {};
+					region.component = component;
+					for (unsigned int d = 0; d < 3u; ++d) {
+						region.origin[d] = upml->m_StartPos[d];
+						region.extent[d] = upml->m_numLines[d];
+					}
+					pmlRegions.push_back(region);
+				}
 			}
 		}
+		VulkanPml::Validate(pmlRegions, op.numLines);
 		uint64_t size=1;
 		for (int n=0;n<3;++n) { Require(op.numLines[n]>=2,"each axis needs two mesh lines"); size*=op.numLines[n]; }
 		Require(size<=(UINT32_MAX-255ull)/3,"construction index range exceeded"); cells=uint32_t(size);
