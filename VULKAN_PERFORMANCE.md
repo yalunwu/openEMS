@@ -1,5 +1,25 @@
 # Vulkan batching, readbacks and profiling
 
+Fused PML/Yee stepping is available through the normal interfaces:
+
+```text
+openEMS model.xml --engine=vulkan --vulkan-pml=fused --vulkan-fd=gpu
+```
+
+```python
+FDTD.Run(sim_path, engine='vulkan', vulkan_pml='fused', vulkan_fd='gpu')
+```
+
+```matlab
+RunOpenEMS(sim_path, 'model.xml', '--engine=vulkan --vulkan-pml=fused --vulkan-fd=gpu');
+```
+
+`--vulkan-pml=indexed` remains the default. Fusion requires validated Cartesian
+PML regions and a supported extension combination. Cylindrical/multigrid models,
+unproven extension combinations, models without PML, or unavailable optional
+resources retain indexed stepping. `VULKAN_PML requested=... selected=... reason=...`
+reports the actual selection. Device/selection failures remain errors.
+
 Experimental memory candidates are available in the native harness through
 `test_backend --vulkan-benchmark --pml=indexed|direct|regions|fused|fused-boxes`
 and `--vulkan-memory-model model.xml --pml=...`. The indexed default is retained.

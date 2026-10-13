@@ -125,6 +125,25 @@ def _run_probe_history_case(engine, batch, sim_dir):
              vulkan_batch_size=batch, numThreads=1, cleanup=False)
 
 
+def _run_pml_selection_case(sim_dir):
+    csx = ContinuousStructure()
+    grid = csx.GetGrid()
+    grid.SetDeltaUnit(1e-3)
+    for axis in 'xyz':
+        grid.SetLines(axis, np.linspace(-8, 8, 17))
+    source = csx.AddExcitation('source', exc_type=0, exc_val=[0, 0, 1])
+    source.AddBox([0, 0, -1], [0, 0, 1])
+    probe = csx.AddProbe('field', p_type=2, over_sampling=100)
+    probe.AddBox([2, 0, 0], [2, 0, 0])
+    fdtd = openEMS(NrTS=97, EndCriteria=0)
+    fdtd.SetCSX(csx)
+    fdtd.SetGaussExcite(20e9, 10e9)
+    fdtd.SetBoundaryCond(['PML_3'] * 6)
+    for index, mode in enumerate(('indexed', 'fused', 'indexed')):
+        fdtd.Run(os.path.join(sim_dir, str(index)), engine='vulkan',
+                 vulkan_setup='gpu', vulkan_pml=mode, numThreads=1, cleanup=False)
+
+
 class Test_GPUEngine(unittest.TestCase):
     def setUp(self):
         temp_root = os.environ.get('OPENEMS_TEST_TMPDIR', os.path.join(repo_root, 'build'))
@@ -203,6 +222,26 @@ class Test_GPUEngine(unittest.TestCase):
         with self.assertRaises((ValueError, RuntimeError)):
             fdtd.Run(self._sim_path('invalid_setup'), engine='vulkan',
                      vulkan_setup='invalid', setup_only=True)
+
+    def test_vulkan_pml_selection_and_reuse(self):
+        """Public PML selection survives Run reuse and preserves fields within 0.1%."""
+        result = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), '--pml-selection-case', self._temp_dir],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count('VULKAN_PML requested=indexed selected=indexed'), 2)
+        self.assertEqual(result.stdout.count('VULKAN_PML requested=fused selected=fused'), 1)
+        reference = np.atleast_2d(np.loadtxt(os.path.join(self._temp_dir, '0', 'field'), comments='%'))
+        peak = np.max(np.abs(reference[:, 1:]))
+        self.assertGreater(peak, 0)
+        for index in ('1', '2'):
+            actual = np.atleast_2d(np.loadtxt(os.path.join(self._temp_dir, index, 'field'), comments='%'))
+            self.assertTrue(np.isfinite(actual).all())
+            np.testing.assert_array_equal(actual[:, 0], reference[:, 0])
+            self.assertLessEqual(np.max(np.abs(actual[:, 1:] - reference[:, 1:])), peak * 0.001)
+        with self.assertRaises((ValueError, RuntimeError)):
+            openEMS().Run(self._sim_path('invalid_pml'), engine='vulkan',
+                          vulkan_pml='invalid', setup_only=True)
 
     def test_different_grid_sizes(self):
         """Verify Vulkan engine on a range of grid sizes (sub-warp, asymmetric, thin slab)."""
@@ -1118,7 +1157,9 @@ class Test_GPUEngine(unittest.TestCase):
                 np.testing.assert_allclose(a[...], b[...], rtol=0.001, atol=1e-4)
 
 if __name__ == '__main__':
-    if len(sys.argv) in (4, 5) and sys.argv[1] == '--disabled-output-case':
+    if len(sys.argv) == 3 and sys.argv[1] == '--pml-selection-case':
+        _run_pml_selection_case(sys.argv[2])
+    elif len(sys.argv) in (4, 5) and sys.argv[1] == '--disabled-output-case':
         _run_disabled_output_case(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) == 5 else 'vulkan')
     elif len(sys.argv) == 5 and sys.argv[1] == '--probe-history-case':
         _run_probe_history_case(sys.argv[2], int(sys.argv[3]), sys.argv[4])

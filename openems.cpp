@@ -299,6 +299,15 @@ void openEMS::collectCommandLineArguments()
 			"Vulkan coefficient storage: dense (default), palette, or analyze both layouts"
 		)
 		(
+			"vulkan-pml",
+			po::value<std::string>()->default_value("indexed")->notifier([&](const std::string& val) {
+				if (val != "indexed" && val != "fused")
+					throw std::invalid_argument("vulkan-pml must be indexed or fused");
+				m_vulkanPml = val;
+			}),
+			"Vulkan PML stepping: indexed (default) or fused PML/Yee with indexed fallback"
+		)
+		(
 			"vulkan-setup",
 			po::value<std::string>()->default_value("auto")->notifier([&](const std::string& val) {
 				if (val != "auto" && val != "cpu" && val != "gpu")
@@ -1473,6 +1482,8 @@ int openEMS::SetupFDTD()
 			}
 			if (vulkanBackend->Initialize())
 			{
+				if (!vulkanBackend->SetPmlMode(m_vulkanPml))
+					throw std::runtime_error("Vulkan PML selection failed");
 				m_EngineBackend = std::move(vulkanBackend);
 				cout << "[openEMS] Activated " << m_EngineBackend->GetBackendName() << " acceleration backend." << endl;
 			}

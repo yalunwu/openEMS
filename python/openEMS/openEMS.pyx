@@ -680,6 +680,10 @@ cdef class openEMS:
           from 1 to 64 (default 32); processing intervals still limit advancement
         * vulkan_profile (bool) - report CPU timings, sampled GPU timings and
           submission/transfer counts; disabled by default
+        * vulkan_pml ('indexed' or 'fused') - PML stepping; 'indexed' is the
+          default. 'fused' combines PML and Yee updates on supported Cartesian
+          models. Unsupported extensions or unavailable optional resources use
+          indexed stepping. The log reports the requested/selected mode and reason
         * vulkan_setup ('auto', 'cpu' or 'gpu') - operator construction;
           'cpu' uses numThreads CPU workers (1 selects the serial reference).
           'auto' (default) attempts
@@ -705,6 +709,10 @@ cdef class openEMS:
 
             FDTD.Run(sim_path, engine='vulkan', vulkan_fd='auto', vulkan_td='auto',
                      vulkan_coefficients='dense', vulkan_batch_size=32)
+
+        Example with fused Cartesian PML/Yee stepping::
+
+            FDTD.Run(sim_path, engine='vulkan', vulkan_pml='fused', vulkan_fd='gpu')
 
         """
         # a relative sim_path would be resolved against itself after the chdir below

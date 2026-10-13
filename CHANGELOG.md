@@ -19,6 +19,10 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Fused Cartesian PML/Yee stepping through `--vulkan-pml=fused`, Python
+  `vulkan_pml='fused'` and the MATLAB/Octave options string. Indexed remains
+  the default and the fallback for unsupported models or optional resources;
+  logs report the requested/selected mode and reason.
 - Native Vulkan memory experiments for direct PML addressing and same-phase
   PML/Yee fusion, with ownership validation, explicit fallback metadata and
   optional compiled pipeline statistics. The indexed release default is retained.

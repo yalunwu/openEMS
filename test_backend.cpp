@@ -4199,6 +4199,40 @@ bool Test_PmlRegionMapping()
 	return true;
 }
 
+bool Test_Vulkan_PublicPmlSelection()
+{
+#ifndef ENABLE_VULKAN
+	return true;
+#else
+	struct Selection { const char* setup; const char* mode; bool pml; };
+	const Selection cases[] = {{"cpu", "", true}, {"gpu", "indexed", true},
+	                           {"cpu", "fused", true}, {"gpu", "fused", true}, {"gpu", "fused", false}};
+	for (const auto& selection : cases) {
+		TestFDTDAccess fdtd;
+		std::vector<std::string> args = {"--engine=vulkan", "--numThreads=1",
+		                                std::string("--vulkan-setup=") + selection.setup};
+		if (selection.mode[0]) args.push_back(std::string("--vulkan-pml=") + selection.mode);
+		fdtd.SetLibraryArguments(args);
+		fdtd.SetCSX(CreateCustomGrid(23, 19, 17));
+		fdtd.SetGaussExcite(20e9, 10e9);
+		fdtd.SetNumberOfTimeSteps(160);
+		fdtd.SetEnableDumps(false);
+		for (unsigned int face = 0; face < 6; ++face) {
+			if (selection.pml) fdtd.Set_BC_PML(face, 3);
+			else fdtd.Set_BC_Type(face, 0);
+		}
+		TEST_ASSERT(fdtd.SetupFDTD() == 0, "Public PML setup failed");
+		auto* gpu = dynamic_cast<EngineVulkan*>(fdtd.GetBackend());
+		TEST_ASSERT(gpu, "Public PML selection silently used CPU stepping");
+		const std::string expected = selection.pml && std::string(selection.mode) == "fused" ? "fused" : "indexed";
+		TEST_ASSERT(gpu->GetPmlMode() == expected, "Public PML option did not select the expected mode");
+		if (!selection.pml) TEST_ASSERT(gpu->GetPmlReason() == "no PML", "PML fallback lost its reason");
+		TEST_ASSERT(gpu->IterateTS(33) && gpu->Synchronize(), "Public PML selection could not step");
+	}
+	return true;
+#endif
+}
+
 bool Test_Vulkan_PmlMemory()
 {
 #ifndef ENABLE_VULKAN
@@ -4425,6 +4459,7 @@ int main(int argc, char* argv[])
 	if (argc > 1 && std::string(argv[1]) == "--pml-memory-tests") {
 		RUN_TEST(Test_PmlRegionMapping);
 		RUN_TEST(Test_Vulkan_PmlMemory);
+	RUN_TEST(Test_Vulkan_PublicPmlSelection);
 		return tests_failed ? 1 : 0;
 	}
 	if (argc > 1 && std::string(argv[1]) == "--vulkan-memory-inspect") {
