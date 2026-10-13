@@ -223,6 +223,44 @@ class Test_GPUEngine(unittest.TestCase):
             fdtd.Run(self._sim_path('invalid_setup'), engine='vulkan',
                      vulkan_setup='invalid', setup_only=True)
 
+    def test_linpoly_operator_setup(self):
+        """Strict GPU LinPoly setup preserves probe samples within 0.1%."""
+        points = [[-4, 4, 4, -1, -1, -4], [-4, -4, -1, -1, 4, 4]]
+        for normal, length in ((0, 6), (1, -6), (2, 0)):
+            outputs = {}
+            for mode in ('cpu', 'gpu', 'auto'):
+                csx = ContinuousStructure()
+                grid = csx.GetGrid()
+                grid.SetDeltaUnit(1e-3)
+                for axis in ('x', 'y', 'z'):
+                    grid.SetLines(axis, np.arange(-8, 9, dtype=float))
+                material = csx.AddMaterial('dielectric', epsilon=3, kappa=0.01)
+                material.AddLinPoly(points, norm_dir=normal,
+                                    elevation=3 if length < 0 else -3, length=length)
+                metal = csx.AddMetal('metal')
+                metal.AddLinPoly([[-3, 3, -3], [-3, -3, 3]], norm_dir=0,
+                                 elevation=2, length=0, priority=3)
+                source = csx.AddExcitation('source', exc_type=0, exc_val=[0, 0, 1])
+                source.AddLinPoly([[-1, 1, 1, -1], [-1, -1, 1, 1]],
+                                  norm_dir=2, elevation=-1, length=2)
+                probe = csx.AddProbe('field', p_type=2)
+                probe.AddBox([3, 0, 1], [3, 0, 1])
+                fdtd = openEMS(NrTS=96, EndCriteria=0, OverSampling=2)
+                fdtd.SetCSX(csx)
+                fdtd.SetGaussExcite(20e9, 10e9)
+                fdtd.SetBoundaryCond(['PML_3'] * 6)
+                sdir = self._sim_path('linpoly_{}_{}'.format(normal, mode))
+                fdtd.Run(sdir, engine='vulkan', vulkan_setup=mode,
+                         numThreads=1, cleanup=False)
+                outputs[mode] = np.atleast_2d(np.loadtxt(os.path.join(sdir, 'field'), comments='%'))
+            reference = outputs['cpu']
+            peak = np.max(np.abs(reference[:, 1:]))
+            self.assertGreater(peak, 0)
+            for mode in ('gpu', 'auto'):
+                self.assertTrue(np.isfinite(outputs[mode]).all())
+                np.testing.assert_array_equal(outputs[mode][:, 0], reference[:, 0])
+                self.assertLessEqual(np.max(np.abs(outputs[mode][:, 1:] - reference[:, 1:])), peak * 0.001)
+
     def test_vulkan_pml_selection_and_reuse(self):
         """Public PML selection survives Run reuse and preserves fields within 0.1%."""
         result = subprocess.run(

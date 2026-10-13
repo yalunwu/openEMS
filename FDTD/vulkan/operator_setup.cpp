@@ -46,6 +46,7 @@
 #include "CSPrimBox.h"
 #include "CSPrimSphere.h"
 #include "CSPrimCylinder.h"
+#include "CSPrimLinPoly.h"
 #include "CSPropMaterial.h"
 #include "CSPropExcitation.h"
 #include "CSPropLumpedElement.h"
@@ -234,6 +235,7 @@ public:
 		Require(primitives.size()<UINT32_MAX/48-1,"primitive index range exceeded");
 		primCount=uint32_t(primitives.size()+1);
 		std::vector<double> geometry(size_t(primCount)*48,0.0);
+		std::vector<double> polygonVertices;
 		for (int n=0;n<3;++n) {
 			geometry[32+n*4]=op.GetBackgroundEpsR(); geometry[33+n*4]=op.GetBackgroundKappa();
 			geometry[34+n*4]=op.GetBackgroundMueR(); geometry[35+n*4]=op.GetBackgroundSigma();
@@ -264,8 +266,22 @@ public:
 				start=cylinder->GetAxisStartCoord()->GetCartesianCoords(); stop=cylinder->GetAxisStopCoord()->GetCartesianCoords();
 				data[22]=cylinder->GetRadius(); cylinder->GetBoundBox(data+23);
 				Require(start[0]!=stop[0]||start[1]!=stop[1]||start[2]!=stop[2],"zero-length cylinder");
+			} else if (prim->GetType()==CSPrimitives::LINPOLY) {
+				CSPrimLinPoly* polygon=static_cast<CSPrimLinPoly*>(prim); data[0]=4;
+				Require(polygon->GetNormDir()>=0 && polygon->GetNormDir()<3,"invalid polygon normal direction");
+				const size_t count=polygon->GetQtyCoords();
+				const uint64_t offset=uint64_t(geometry.size())+polygonVertices.size();
+				Require(offset<=UINT32_MAX && count<=(UINT32_MAX-offset)/2,"polygon vertex index range exceeded");
+				Require(offset+2*count<=properties.limits.maxStorageBufferRange/sizeof(double),"geometry buffer range exceeded");
+				// Vertex pairs follow the fixed-size descriptors in the geometry buffer.
+				data[16]=polygon->GetNormDir(); data[17]=double(offset); data[18]=double(count);
+				polygon->GetBoundBox(data+23);
+				for (size_t vertex=0;vertex<count;++vertex) {
+					polygonVertices.push_back(polygon->GetCoord(int(2*vertex)));
+					polygonVertices.push_back(polygon->GetCoord(int(2*vertex+1)));
+				}
 			} else throw std::runtime_error("GPU operator setup: unsupported primitive "+prim->GetTypeName());
-			std::copy(start,start+3,data+16); std::copy(stop,stop+3,data+19);
+			if (start) { std::copy(start,start+3,data+16); std::copy(stop,stop+3,data+19); }
 			data[1]=prim->GetProperty()->GetType()==CSProperties::METAL?1:0;
 			CSPropMaterial* material=dynamic_cast<CSPropMaterial*>(prim->GetProperty());
 			if (material) for (int n=0;n<3;++n) {
@@ -292,6 +308,11 @@ public:
 				data[32]=sheet->GetConductivity(); data[33]=sheet->GetThickness();
 			}
 		}
+		Require(uint64_t(geometry.size())+polygonVertices.size()<=properties.limits.maxStorageBufferRange/sizeof(double),
+			"geometry buffer range exceeded");
+		Require(estimate+(uint64_t(geometry.size())+polygonVertices.size())*sizeof(double)<=std::min(available,engine.m_setupMemoryLimit),
+			"insufficient device memory budget for operator construction");
+		geometry.insert(geometry.end(),polygonVertices.begin(),polygonVertices.end());
 		for (double value: geometry) Require(std::isfinite(value),"non-finite primitive/material descriptor");
 		// Export the reference's exact priority order after its XY bounding-box cull.
 		const size_t rows=size_t(op.numLines[0])*op.numLines[1];

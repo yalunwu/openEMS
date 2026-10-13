@@ -73,6 +73,29 @@ bool inside(uint prim,dvec3 coord) {
         return sqrt(distance)<geo[b+22];
     }
     for(int n=0;n<3;++n) if(p[n]<geo[b+23+uint(n*2)]||p[n]>geo[b+24+uint(n*2)]) return false;
+    if(geo[b]==4.0) {
+        uint offset=uint(geo[b+17]), count=uint(geo[b+18]);
+        if(count==0) return false;
+        int normal=int(geo[b+16]);
+        double x=p[(normal+1)%3], y=p[(normal+2)%3];
+        double x1=geo[offset+2*(count-1)], y1=geo[offset+2*(count-1)+1];
+        bool startover=y1>=y;
+        int winding=0;
+        // Match CSPrimPolygon, including its exact Cartesian-edge checks.
+        for(uint i=0;i<count;++i) {
+            double x2=geo[offset+2*i], y2=geo[offset+2*i+1];
+            if(x2==x1&&x1==x&&((y<y1&&y>y2)||(y>y1&&y<y2))) return true;
+            if(y2==y1&&y1==y&&((x<x1&&x>x2)||(x>x1&&x<x2))) return true;
+            bool endover=y2>=y;
+            if(startover!=endover) {
+                precise double left=(y2-y)*(x2-x1), right=(y2-y1)*(x2-x);
+                if(left<=right) { if(endover) ++winding; }
+                else { if(!endover) --winding; }
+            }
+            startover=endover; x1=x2; y1=y2;
+        }
+        return winding!=0;
+    }
     precise dvec3 dir=z-a;
     precise double ll=0.0, projection=0.0;
     for(int n=0;n<3;++n) { ll+=dir[n]*dir[n]; projection+=(p[n]-a[n])*dir[n]; }

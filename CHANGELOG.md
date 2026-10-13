@@ -19,6 +19,8 @@ number moved up and patch releases now have somewhere to go.
 
 ### Added
 
+- Vulkan GPU operator construction supports `LinPoly` extruded polygons,
+  including concave outlines, signed extrusion lengths and affine transforms.
 - Fused Cartesian PML/Yee stepping through `--vulkan-pml=fused`, Python
   `vulkan_pml='fused'` and the MATLAB/Octave options string. Indexed remains
   the default and the fallback for unsupported models or optional resources;

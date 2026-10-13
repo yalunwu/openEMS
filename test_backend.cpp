@@ -58,6 +58,7 @@
 #include "CSPrimBox.h"
 #include "CSPrimSphere.h"
 #include "CSPrimCylinder.h"
+#include "CSPrimLinPoly.h"
 #include "CSPrimUserDefined.h"
 #include "CSPropMetal.h"
 #include "CSPropLorentzMaterial.h"
@@ -3829,7 +3830,7 @@ bool Test_Vulkan_OperatorSetup()
 #ifndef ENABLE_VULKAN
 	return true;
 #else
-	for (unsigned int fixture=0;fixture<22;++fixture) {
+	for (unsigned int fixture=0;fixture<32;++fixture) {
 		TestFDTDAccess fdtd;
 		fdtd.SetLibraryArguments({"--engine=basic", "--numThreads=1"});
 		auto* csx=CreateCustomGrid(17,13,19);
@@ -3837,7 +3838,7 @@ bool Test_Vulkan_OperatorSetup()
 			for (unsigned int n=0;n<3;++n) {
 				csx->GetGrid()->ClearLines(n);
 				for (unsigned int p=0;p<(n==0?17u:n==1?13u:19u);++p)
-					csx->GetGrid()->AddDiscLine(n,-20+1.3*p+0.03*p*p);
+					csx->GetGrid()->AddDiscLine(n,fixture>=22 && fixture<29?-8.0+p:-20+1.3*p+0.03*p*p);
 			}
 			auto* material=new CSPropMaterial(csx->GetParameterSet());
 			material->SetIsotropy(false);
@@ -3852,6 +3853,25 @@ bool Test_Vulkan_OperatorSetup()
 				auto* cylinder=new CSPrimCylinder(csx->GetParameterSet(),material);
 				for (int k=0;k<6;++k) cylinder->SetCoord(k,k%2?2:-8);
 				cylinder->SetRadius(4);
+			} else if (fixture>=22) {
+				auto* polygon=new CSPrimLinPoly(csx->GetParameterSet(),material);
+				polygon->SetNormDir((fixture-22)%3);
+				polygon->SetElevation(fixture>=25 && fixture<28?4:-4);
+				polygon->SetLength(fixture==28?0:fixture>=25 && fixture<28?-8:8);
+				const double points[][2]={{-4,-4},{4,-4},{4,-1},{-1,-1},{-1,4},{-4,4}};
+				if (fixture!=31) for (unsigned int i=0;i<(fixture==30?12u:6u);++i) {
+					const unsigned int vertex=fixture%2?5-i%6:i%6;
+					polygon->AddCoord(points[vertex][0]); polygon->AddCoord(points[vertex][1]);
+				}
+				if (fixture==29) {
+					const double scale[3]={1.2,0.8,1.1}, shift[3]={1,-2,0};
+					polygon->GetTransform()->Scale(scale); polygon->GetTransform()->RotateZ(0.2);
+					polygon->GetTransform()->Translate(shift);
+				}
+				// A second vertex list exercises offsets and unused-primitive tracking.
+				auto* unused=new CSPrimLinPoly(csx->GetParameterSet(),material);
+				unused->SetNormDir(2); unused->SetElevation(100); unused->SetLength(1);
+				for (const auto& point:points) { unused->AddCoord(point[0]); unused->AddCoord(point[1]); }
 			} else {
 				auto* box=new CSPrimBox(csx->GetParameterSet(),material);
 				for (int k=0;k<6;++k) box->SetCoord(k,k%2?5:-10);
@@ -3864,8 +3884,15 @@ bool Test_Vulkan_OperatorSetup()
 			excitation->SetExcitType(fixture>=12?0:fixture-5);
 			excitation->SetDelay(1.1e-11);
 			for (int n=0;n<3;++n) excitation->SetExcitation(n==1?0:1+n,n);
-			auto* box=new CSPrimBox(csx->GetParameterSet(),excitation);
-			for (int k=0;k<6;++k) box->SetCoord(k,k%2?0:-10);
+			if (fixture>=22) {
+				auto* polygon=new CSPrimLinPoly(csx->GetParameterSet(),excitation);
+				polygon->SetNormDir(2); polygon->SetElevation(-2); polygon->SetLength(4);
+				const double coords[]={-2,-2,2,-2,2,2,-2,2,-2,2,-2,-2};
+				for (double coord:coords) polygon->AddCoord(coord);
+			} else {
+				auto* box=new CSPrimBox(csx->GetParameterSet(),excitation);
+				for (int k=0;k<6;++k) box->SetCoord(k,k%2?0:-10);
+			}
 			csx->AddProperty(excitation);
 		}
 		if (fixture>=9 && fixture<=12) {
@@ -3878,9 +3905,16 @@ bool Test_Vulkan_OperatorSetup()
 		}
 		if (fixture>=13) {
 			auto* metal=new CSPropMetal(csx->GetParameterSet());
-			auto* box=new CSPrimBox(csx->GetParameterSet(),metal);
-			box->SetPriority(3);
-			for (int k=0;k<6;++k) box->SetCoord(k,k/2==0?csx->GetGrid()->GetLine(0,8):(k%2?0:-10));
+			if (fixture>=22) {
+				auto* polygon=new CSPrimLinPoly(csx->GetParameterSet(),metal);
+				polygon->SetPriority(3); polygon->SetNormDir(0); polygon->SetElevation(1); polygon->SetLength(0);
+				const double coords[]={-3,-3,3,-3,-3,3};
+				for (double coord:coords) polygon->AddCoord(coord);
+			} else {
+				auto* box=new CSPrimBox(csx->GetParameterSet(),metal);
+				box->SetPriority(3);
+				for (int k=0;k<6;++k) box->SetCoord(k,k/2==0?csx->GetGrid()->GetLine(0,8):(k%2?0:-10));
+			}
 			csx->AddProperty(metal);
 		}
 		fdtd.SetCSX(csx); fdtd.SetNumberOfTimeSteps(80); fdtd.SetGaussExcite(20e9,10e9);
@@ -3898,7 +3932,7 @@ bool Test_Vulkan_OperatorSetup()
 		if (fixture==2) { op->SetCellConstantMaterial(); op->SetTimestep(0); op->CalcECOperator(); }
 		if (fixture==3) { op->SetTimeStepMethod(1); op->SetTimestep(0); op->CalcECOperator(); }
 		std::vector<double> materialReference;
-		if (fixture==21) {
+		if (fixture==21 || fixture>=22) {
 			for (int type=0;type<4;++type) op->SetMaterialStoreFlags(type,true);
 			op->SetTimestep(0); op->CalcECOperator();
 			for (int type=0;type<4;++type) for (int n=0;n<3;++n)
@@ -3920,6 +3954,11 @@ bool Test_Vulkan_OperatorSetup()
 			return result;
 		};
 		const auto referenceIds=sourceIds(source);
+		const auto primitives=csx->GetAllPrimitives();
+		std::vector<bool> referenceUsed;
+		if (fixture>=22) for (auto* primitive:primitives) {
+			referenceUsed.push_back(primitive->GetPrimitiveUsed()); primitive->SetPrimitiveUsed(false);
+		}
 		const std::vector<unsigned int> referencePEC(op->m_Nr_PEC,op->m_Nr_PEC+3);
 		std::vector<VulkanCoefficients::Node> reference;
 		for (unsigned int x=0;x<17;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z)
@@ -3934,6 +3973,8 @@ bool Test_Vulkan_OperatorSetup()
 		op->SetTimestep(fixture==18?1e-12:0);
 		EngineVulkan gpu(op); std::string reason;
 		TEST_ASSERT(gpu.BuildOperator(*op,0,reason),reason);
+		if (fixture>=22) for (size_t i=0;i<primitives.size();++i)
+			TEST_ASSERT(primitives[i]->GetPrimitiveUsed()==referenceUsed[i],"GPU polygon used-primitive flags changed");
 		source=op->GetExcitationExtension();
 		TEST_ASSERT(sourceIds(source)==referenceIds,"GPU source indices/directions/delays changed");
 		TEST_ASSERT(std::vector<unsigned int>(op->m_Nr_PEC,op->m_Nr_PEC+3)==referencePEC,"GPU PEC edge counts changed");
@@ -3941,7 +3982,7 @@ bool Test_Vulkan_OperatorSetup()
 			"GPU source compaction changed point counts");
 		std::cout << std::setprecision(17) << "setup fixture=" << fixture << " CPU dt=" << dt << " GPU dt=" << op->GetTimestep() << std::endl;
 		TEST_ASSERT(std::abs(op->GetTimestep()-dt)<=dt*1e-12,"GPU construction changed stable timestep");
-		if (fixture==21) {
+		if (fixture==21 || fixture>=22) {
 			size_t materialIndex=0;
 			for (int type=0;type<4;++type) for (int n=0;n<3;++n)
 				for (unsigned int x=0;x<17;++x) for (unsigned int y=0;y<13;++y) for (unsigned int z=0;z<19;++z) {
@@ -4459,7 +4500,6 @@ int main(int argc, char* argv[])
 	if (argc > 1 && std::string(argv[1]) == "--pml-memory-tests") {
 		RUN_TEST(Test_PmlRegionMapping);
 		RUN_TEST(Test_Vulkan_PmlMemory);
-	RUN_TEST(Test_Vulkan_PublicPmlSelection);
 		return tests_failed ? 1 : 0;
 	}
 	if (argc > 1 && std::string(argv[1]) == "--vulkan-memory-inspect") {
@@ -4530,6 +4570,7 @@ int main(int argc, char* argv[])
 	RUN_TEST(Test_CoefficientPalette_Bits);
 	RUN_TEST(Test_PmlRegionMapping);
 	RUN_TEST(Test_Vulkan_PmlMemory);
+	RUN_TEST(Test_Vulkan_PublicPmlSelection);
 	RUN_TEST(Test_Vulkan_CoefficientEquivalence);
 	RUN_TEST(Test_Vulkan_CoefficientMultigrid);
 	RUN_TEST(Test_Vulkan_SubWarpGrid);

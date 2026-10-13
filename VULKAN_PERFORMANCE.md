@@ -107,7 +107,8 @@ RunOpenEMS(sim_path, 'model.xml', '--engine=vulkan --vulkan-setup=auto')
 GPU construction covers material averaging, EC coefficients, timestep reduction,
 PEC/PMC, UPML, sources, RC ports, general RLC, Mur and local absorbers, TFSF,
 Lorentz/Drude, multipole Debye and conducting sheets. It supports boxes, spheres,
-finite cylinders and nonsingular affine transforms, with constant evaluated
+finite cylinders, `LinPoly` extruded polygons (including concave outlines and
+negative or zero lengths) and nonsingular affine transforms, with constant evaluated
 material/source weights. Spatial weights, other primitives and cylindrical or
 multigrid operators use CPU construction under `auto`. GPU construction requires
 FP64 and at least 22 storage-buffer bindings. Allocation limits and device memory
