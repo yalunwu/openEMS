@@ -16,6 +16,7 @@
 */
 
 #include "operator_ext_tfsf.h"
+#include "FDTD/gpu_operator_setup.h"
 #include "engine_ext_tfsf.h"
 #include <cmath>
 
@@ -222,6 +223,9 @@ bool Operator_Ext_TFSF::BuildExtension()
 			m_H_Amp[n] = m_PropDir[nP]*m_E_Amp[nPP] - m_PropDir[nPP]*m_E_Amp[nP];
 			m_H_Amp[n] /= Z0*sqrt(m_Op->GetBackgroundMueR()/m_Op->GetBackgroundEpsR());
 		}
+
+		if (m_Op->GetSetupBackend())
+			return m_Op->GetSetupBackend()->BuildTFSF(*this,origin);
 
 		double coord[3];
 		double unit = m_Op->GetGridDelta();

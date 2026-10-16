@@ -167,6 +167,8 @@ protected:
 	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_GPU, EngineType_GPU_Reference};
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;
+	std::string m_GPUSetupMode;
+	bool m_GPUSetupFallback;
 
 	//! Setup an operator matching the requested engine
 	virtual bool SetupOperator();

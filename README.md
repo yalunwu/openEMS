@@ -141,6 +141,50 @@ octave --no-gui run_testsuite.m          # add --list, --all-engines or a test n
 It reports PASS/FAIL per test and exits non-zero on failure. See
 [TESTSUITE/README.md](TESTSUITE/README.md).
 
+GPU regression tests compare the basic, reference and device engines. A device
+acceptance run must require its backend so a CPU fallback cannot pass:
+
+```bash
+python3 python/Tests/GPU_Engine.py --require-backend HIP
+python3 python/Tests/GPU_Setup.py --require-backend HIP
+python3 -m openEMS.compare run_a run_b --rtol 1e-4 --l2-rtol 1e-3
+```
+
+The comparator requires matching HDF5 frequency/mesh attributes and exact HDF5
+or VTR coordinates. NF2FF radiated power/directivity use numerical tolerances.
+Non-finite data fails both comparison gates.
+
+GPU operator construction defaults to CPU. Select `--engine=gpu --gpu-setup=gpu`
+(Python: `engine='gpu', gpu_setup='gpu'`; Octave/MATLAB: the same CLI options
+string) to require HIP construction, or `gpu_setup='auto'` to rebuild on the
+CPU when preparation is unsupported or runs out of construction resources.
+The HIP path supports boxes, spheres, finite cylinders, affine transforms and
+LinPoly on Cartesian meshes. UPML, sources, RC/RLC, Mur/local absorbers, TFSF,
+Lorentz/Drude, multipole Debye and conducting-sheet arrays are also constructed
+on the device. Material, source and dispersion weight functions must be empty
+or numeric literals. Other expressions, file-weighted sources, discrete materials,
+multiple TFSF sources, unsupported extension types and other primitives,
+cylindrical/multigrid meshes and non-HIP backends retain CPU construction;
+strict `gpu` reports unsupported cases. Runtime device faults remain errors.
+XML, waveforms, mesh snapping, scalar TFSF metadata, UPML grading tables and
+steady-state metadata remain on CPU. Final core/extension arrays are mirrored
+to the host and packed/uploaded with the existing palettes and fusion. Setup
+and stepping reuse the selected HIP context. This path is not fully device-resident.
+`OPENEMS_GPU_SETUP_MEMORY_LIMIT`
+caps the construction budget in bytes (including reserved headroom).
+Use `numThreads=1` / `--numThreads=1` for serial CPU construction; `0` selects
+available CPUs. Cartesian CPU setup parallelizes averaging, coefficients and PEC.
+Verbose output (`verbose=1` / `-v`) reports setup phase and output finalization
+times. `OPENEMS_GPU_DIAGNOSTICS=1` reports engine batches and HIP range/full-field
+download counts, bytes and work-stream waits, including setup waits. Snapshot,
+DFT and energy downloads are separate paths and are excluded from the field
+transfer counters. Keep `OPENEMS_HIP_KERNEL_TIMES` disabled for throughput runs;
+it synchronizes after each kernel.
+Unprofiled HIP construction phase times include kernel work and readback.
+Separate profiling runs with `OPENEMS_HIP_KERNEL_TIMES=1` report core and
+extension construction kernels. Extension outputs use preallocated scratch;
+large sparse models may select CPU when the conservative memory budget is exceeded.
+
 **Python unit tests:**
 ```bash
 python3 -m unittest discover -s python/Tests -p "test_*.py" -v

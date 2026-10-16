@@ -23,6 +23,7 @@
 
 class Operator_Ext_LorentzMaterial : public Operator_Ext_Dispersive
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine_Ext_LorentzMaterial;
 	friend class HIP_Ext_LorentzMaterial;
 	friend class Metal_Ext_LorentzMaterial;

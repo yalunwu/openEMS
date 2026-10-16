@@ -30,6 +30,8 @@
 class Operator;
 class Engine;
 class Engine_Extension;
+class GPU_OperatorSetup;
+struct GPU_SetupModel;
 
 //! Device implementation of an engine extension, see GPU_Backend::CreateExtension()
 /*!
@@ -128,7 +130,8 @@ typedef Engine_GatherEntry GPU_GatherEntry;
   memory with the host (unified memory), the host mirror is the device memory
   itself (see GetSharedVoltages()) and synchronizing means waiting for the device.
 
-  Init() is called once and before everything else; the rest may follow in any
+  Optional NewOperatorSetup() may precede Init(), which still receives a fully
+  built operator. Init() is called once; the rest may follow in any
   order, except where a method says otherwise. The device work of all calls is
   queued in the order they are made and all of them run on the engine thread,
   only WaitSnapshot() may be called from another thread.
@@ -152,6 +155,13 @@ public:
 	  operator extensions.
 	  */
 	virtual bool Init(const Operator* op) = 0;
+
+	//! Optional construction on this device/context, owned and freed by the caller before Init().
+	virtual GPU_OperatorSetup* NewOperatorSetup(const GPU_SetupModel&, std::string& reason)
+	{
+		reason = "this backend does not support GPU operator construction";
+		return NULL;
+	}
 
 	//! Main voltage update over the whole domain, equivalent to Engine::UpdateVoltages
 	virtual void UpdateVoltages() = 0;

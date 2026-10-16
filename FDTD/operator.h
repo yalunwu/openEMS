@@ -29,10 +29,12 @@ class Operator_Extension;
 class Operator_Ext_Excitation;
 class Engine;
 class TiXmlElement;
+class GPU_OperatorSetup;
 
 //! Basic FDTD-operator
 class Operator : public Operator_Base
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine;
 	friend class Engine_Interface_FDTD;
 	friend class Operator_Ext_LorentzMaterial;
@@ -59,6 +61,7 @@ public:
 	virtual bool SetGeometryCSX(ContinuousStructure* geo);
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
+	virtual GPU_OperatorSetup* GetSetupBackend() const {return NULL;}
 
 	// the next four functions need to be reimplemented in a derived class
 	inline virtual FDTD_FLOAT GetVV(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
@@ -323,6 +326,9 @@ protected:
 
 	//! Calc operator at certain \a pos
 	virtual void Calc_ECOperatorPos(int n, unsigned int* pos);
+	//! Same coefficient arithmetic with an already computed EC index; does not move MainOp's cursor.
+	void Calc_ECOperatorPos(int n, unsigned int* pos, unsigned int index);
+	virtual void CalcCoefficients();
 
 	//! Calculate and setup lumped elements
 	virtual bool Calc_LumpedElements();

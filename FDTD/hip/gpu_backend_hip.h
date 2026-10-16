@@ -45,6 +45,7 @@ public:
 	virtual std::string GetName() const;
 
 	virtual bool Init(const Operator* op);
+	virtual GPU_OperatorSetup* NewOperatorSetup(const GPU_SetupModel& model, std::string& reason);
 
 	virtual void UpdateVoltages();
 	virtual void UpdateCurrents();

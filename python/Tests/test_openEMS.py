@@ -164,6 +164,10 @@ class Test_BoundaryConditions(unittest.TestCase):
 
 
 class Test_LibraryArguments(unittest.TestCase):
+    def test_invalid_gpu_setup_mode_raises(self):
+        with self.assertRaisesRegex(ValueError, 'gpu-setup must be'):
+            openEMS()._SetLibraryArguments({'gpu_setup': 'invalid'})
+
     def test_false_option_does_not_hide_the_following_ones(self):
         # an option that is switched off must not end the option list: what
         # follows it, here an invalid option, still has to be looked at
@@ -305,6 +309,14 @@ class Test_Run(unittest.TestCase):
             self.skipTest('cannot create symlinks')
         self.fdtd.Run(os.path.join(self.tmp.name, 'link'), setup_only=True, verbose=0)
         self.assertInDir(os.path.join(self.tmp.name, 'real'))
+
+    def test_failed_setup_can_be_corrected_and_retried(self):
+        self.fdtd.SetCSX(ContinuousStructure())  # no mesh
+        failed = os.path.join(self.tmp.name, 'failed')
+        self.assertNotEqual(self.fdtd.Run(failed, setup_only=True, engine='gpu-reference'), 0)
+        self.fdtd.SetCSX(_make_csx_with_grid())
+        retry = os.path.join(self.tmp.name, 'retry')
+        self.assertEqual(self.fdtd.Run(retry, setup_only=True, engine='gpu-reference'), 0)
 
 
 if __name__ == '__main__':

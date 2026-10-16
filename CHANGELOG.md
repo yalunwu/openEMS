@@ -15,6 +15,17 @@ there are unreleased changes. It becomes the next release entry.
 
 ### Added
 
+- Optional HIP operator construction: `--gpu-setup=cpu|auto|gpu` (Python
+  `gpu_setup`) supports Cartesian boxes, spheres, finite cylinders, affine
+  transforms and LinPoly. It builds materials, timestep, coefficients and PEC/PMC
+  on the device, plus UPML, sources, RC/RLC, Mur/local absorbers, TFSF,
+  Lorentz/Drude, multipole Debye and conducting-sheet construction. Final arrays
+  are mirrored for existing palette packing/upload and fusion; setup and stepping
+  reuse the backend. CPU construction remains
+  the default. Preparation failures in `auto` rebuild a fresh CPU operator;
+  strict `gpu` reports unsupported geometry/resources. The environment variable
+  `OPENEMS_GPU_SETUP_MEMORY_LIMIT` caps the construction budget in bytes.
+
 - **A GPU engine**, `--engine=gpu` (`engine='gpu'` from Python), with a Metal
   backend on macOS and a HIP backend for AMD (ROCm) and NVIDIA (CUDA) GPUs. It
   is selected like the other engines, runs Cartesian and cylindrical meshes
@@ -24,18 +35,15 @@ there are unreleased changes. It becomes the next release entry.
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
-
-### Fixed
-
-- Python: an option passed as `False` to `Run()`, e.g. `debug_PEC=False`, made
-  openEMS ignore all options after it without a message, so that for example
-  a following `engine=...` or `numThreads=...` had no effect.
-- A simulation that was aborted (`SetAbort()`, an `ABORT` file, Ctrl-C) no
-  longer ends with the warning that the max. number of timesteps was reached;
-  it reports the abort.
+- `openEMS.compare.compare_sim_metrics()` and `--l2-rtol` add a per-file
+  relative-L2 comparison alongside peak error. Verbose solver output reports
+  operator/backend setup phases and output finalization; opt-in
+  `OPENEMS_GPU_DIAGNOSTICS=1` reports GPU batch and HIP transfer/wait counts.
 
 ### Changed
 
+- Cartesian GPU operator construction parallelizes the core coefficient pass
+  using the requested CPU thread count.
 - Field dumps are written on background threads from a snapshot of the
   fields, instead of stalling the timestepping, and a time-domain dump keeps
   its HDF5 file open for the whole run.
@@ -53,6 +61,27 @@ there are unreleased changes. It becomes the next release entry.
   datasets are listed once instead of looked up one by one, which took
   quadratic time. A far-field (NF2FF) calculation from a recording of 3200
   timesteps went from 79 s to 2.4 s per frequency.
+
+### Fixed
+
+- GPU operator setup honors `numThreads`, including serial construction with
+  `1`, and propagates worker errors after joining all workers.
+- Simulation comparison rejects non-finite values, extra outputs and changed
+  HDF5 sampling metadata or meshes, including group-level frequency and mesh
+  attributes. VTR comparisons check coordinates and reject non-finite fields;
+  missing VTK support reports an incomparable dump instead of silently skipping
+  it. NF2FF radiated power and directivity attributes are compared numerically.
+- Failed operator construction stops setup; setup exceptions release partial
+  simulation state and restore interrupt handling. Python translates setup
+  exceptions, and the CLI reports them with a nonzero exit code. Failed GPU
+  engine initialization releases the engine and backend before propagating errors.
+  Dispersive and RLC cleanup also handles partially allocated extension tables.
+- Python: an option passed as `False` to `Run()`, e.g. `debug_PEC=False`, made
+  openEMS ignore all options after it without a message, so that for example
+  a following `engine=...` or `numThreads=...` had no effect.
+- A simulation that was aborted (`SetAbort()`, an `ABORT` file, Ctrl-C) no
+  longer ends with the warning that the max. number of timesteps was reached;
+  it reports the abort.
 
 ### Build
 

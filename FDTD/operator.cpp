@@ -19,11 +19,13 @@
 #include <algorithm>
 #include <stdexcept>
 #include "operator.h"
+#include "gpu_operator_setup.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_excitation.h"
 #include "Common/processfields.h"
 #include "tools/vtk_file_writer.h"
+#include "tools/setup_timer.h"
 #include "fparser.hh"
 #include "extensions/operator_ext_excitation.h"
 
@@ -957,6 +959,11 @@ void Operator::SetExcitationSignal(Excitation* exc)
 void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 {
 	unsigned int i = MainOp->SetPos(pos[0],pos[1],pos[2]);
+	Calc_ECOperatorPos(n, pos, i);
+}
+
+void Operator::Calc_ECOperatorPos(int n, unsigned int* pos, unsigned int i)
+{
 	double C = EC_C[n][i];
 	double G = EC_G[n][i];
 	if (C>0)
@@ -986,11 +993,14 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 
 int Operator::CalcECOperator( DebugFlags debugFlags )
 {
+	SetupTimer timer("Operator setup");
 	Init_EC();
 	InitDataStorage();
+	timer.Report("allocation");
 
 	if (Calc_EC()==0)
 		return -1;
+	timer.Report("material averaging");
 
 	m_InvaildTimestep = false;
 	opt_dT = 0;
@@ -1009,6 +1019,7 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	}
 	else
 		CalcTimestep();
+	timer.Report("timestep");
 
 	dT*=m_TimeStepFactor;
 
@@ -1023,23 +1034,11 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	m_Exc->Reset(dT);
 
 	InitOperator();
+	timer.Report("excitation and coefficient allocation");
 
-	unsigned int pos[3];
+	CalcCoefficients();
 
-	for (int n=0; n<3; ++n)
-	{
-		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
-		{
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
-			{
-				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
-				{
-					Calc_ECOperatorPos(n,pos);
-				}
-			}
-		}
-	}
-
+	timer.Report("coefficients");
 	//Apply PEC to all boundary's
 	bool PEC[6]={1,1,1,1,1,1};
 	//make an exception for BC == -1
@@ -1056,10 +1055,12 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	for (int n=0; n<6; ++n)
 		PMC[n] = m_BC[n]==1;
 	ApplyMagneticBC(PMC);
+	timer.Report("PEC, lumped RC and boundaries");
 
 	//all information available for extension... create now...
+	GPU_OperatorSetup* setup=GetSetupBackend();
 	for (size_t n=0; n<m_Op_exts.size(); ++n)
-		if (m_Op_exts.at(n)->BuildExtension()==false)
+		if ((setup ? setup->BuildExtension(*m_Op_exts.at(n)) : m_Op_exts.at(n)->BuildExtension())==false)
 			m_Op_exts.at(n)->SetActive(false); //extension has nothing to do or failed to build, drop it below
 
 	//remove inactive extensions
@@ -1073,6 +1074,12 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		}
 		else
 			++it;
+	}
+	timer.Report("extensions");
+	if (setup)
+	{
+		setup->SynchronizeOperator();
+		timer.Report("final host synchronization");
 	}
 
 	if (debugFlags & debugMaterial)
@@ -1095,7 +1102,18 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		EC_R[n]=NULL;
 	}
 
+	timer.Report("debug output and cleanup");
 	return 0;
+}
+
+void Operator::CalcCoefficients()
+{
+	unsigned int pos[3];
+	for (int n=0; n<3; ++n)
+		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+					Calc_ECOperatorPos(n,pos);
 }
 
 void Operator::ApplyElectricBC(bool* dirs)
@@ -1644,22 +1662,27 @@ bool Operator::Calc_LumpedElements()
 				unsigned int pos[3];
 				double unitGC=0;
 				int ipos=0;
-				for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
+				if (GetSetupBackend())
+					unitGC=GetSetupBackend()->LumpedGeometry(ny,uiStart,uiStop);
+				else
 				{
-					double unitGC_Plane=0;
-					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
+					for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
 					{
-						for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
+						double unitGC_Plane=0;
+						for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
 						{
-							// capacity/conductivity in parallel: add values
-							unitGC_Plane += GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
+							for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
+							{
+								// capacity/conductivity in parallel: add values
+								unitGC_Plane += GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
+							}
 						}
-					}
 
-					//capacity/conductivity in series: add reciprocal values
-					unitGC += 1/unitGC_Plane;
+						//capacity/conductivity in series: add reciprocal values
+						unitGC += 1/unitGC_Plane;
+					}
+					unitGC = 1/unitGC;
 				}
-				unitGC = 1/unitGC;
 
 				bool caps = PLE->GetCaps();
 				double kappa = 0;
@@ -1678,64 +1701,69 @@ bool Operator::Calc_LumpedElements()
 					}
 				}
 
-				for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
+				if (GetSetupBackend())
+					GetSetupBackend()->ApplyLumpedRC(ny,uiStart,uiStop,C,R,epsilon,kappa,caps);
+				else
 				{
-					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
+					for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
 					{
-						for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
+						for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
 						{
-							ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-							if (C>0)
-								EC_C[ny][ipos] = epsilon * GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
-							if (R>0)
-								EC_G[ny][ipos] = kappa * GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
-
-							if (R==0) //make lumped element a PEC if resistance is zero
+							for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
 							{
-								SetVV(ny,pos[0],pos[1],pos[2], 0 );
-								SetVI(ny,pos[0],pos[1],pos[2], 0 );
+								ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
+								if (C>0)
+									EC_C[ny][ipos] = epsilon * GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
+								if (R>0)
+									EC_G[ny][ipos] = kappa * GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
+
+								if (R==0) //make lumped element a PEC if resistance is zero
+								{
+									SetVV(ny,pos[0],pos[1],pos[2], 0 );
+									SetVI(ny,pos[0],pos[1],pos[2], 0 );
+								}
+								else //recalculate operator inside the lumped element
+									Calc_ECOperatorPos(ny,pos);
 							}
-							else //recalculate operator inside the lumped element
-								Calc_ECOperatorPos(ny,pos);
 						}
 					}
-				}
 
-				// setup metal caps
-				if (caps)
-				{
-					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
+					// setup metal caps
+					if (caps)
 					{
-						for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
+						for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
 						{
-							pos[ny]=uiStart[ny];
-							if (pos[nyP]<uiStop[nyP])
+							for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
 							{
-								SetVV(nyP,pos[0],pos[1],pos[2], 0 );
-								SetVI(nyP,pos[0],pos[1],pos[2], 0 );
-								++m_Nr_PEC[nyP];
-							}
+								pos[ny]=uiStart[ny];
+								if (pos[nyP]<uiStop[nyP])
+								{
+									SetVV(nyP,pos[0],pos[1],pos[2], 0 );
+									SetVI(nyP,pos[0],pos[1],pos[2], 0 );
+									++m_Nr_PEC[nyP];
+								}
 
-							if (pos[nyPP]<uiStop[nyPP])
-							{
-								SetVV(nyPP,pos[0],pos[1],pos[2], 0 );
-								SetVI(nyPP,pos[0],pos[1],pos[2], 0 );
-								++m_Nr_PEC[nyPP];
-							}
+								if (pos[nyPP]<uiStop[nyPP])
+								{
+									SetVV(nyPP,pos[0],pos[1],pos[2], 0 );
+									SetVI(nyPP,pos[0],pos[1],pos[2], 0 );
+									++m_Nr_PEC[nyPP];
+								}
 
-							pos[ny]=uiStop[ny];
-							if (pos[nyP]<uiStop[nyP])
-							{
-								SetVV(nyP,pos[0],pos[1],pos[2], 0 );
-								SetVI(nyP,pos[0],pos[1],pos[2], 0 );
-								++m_Nr_PEC[nyP];
-							}
+								pos[ny]=uiStop[ny];
+								if (pos[nyP]<uiStop[nyP])
+								{
+									SetVV(nyP,pos[0],pos[1],pos[2], 0 );
+									SetVI(nyP,pos[0],pos[1],pos[2], 0 );
+									++m_Nr_PEC[nyP];
+								}
 
-							if (pos[nyPP]<uiStop[nyPP])
-							{
-								SetVV(nyPP,pos[0],pos[1],pos[2], 0 );
-								SetVI(nyPP,pos[0],pos[1],pos[2], 0 );
-								++m_Nr_PEC[nyPP];
+								if (pos[nyPP]<uiStop[nyPP])
+								{
+									SetVV(nyPP,pos[0],pos[1],pos[2], 0 );
+									SetVI(nyPP,pos[0],pos[1],pos[2], 0 );
+									++m_Nr_PEC[nyPP];
+								}
 							}
 						}
 					}

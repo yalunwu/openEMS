@@ -28,6 +28,7 @@
 
 #include "hip_internal.h"
 #include "FDTD/operator.h"
+#include "tools/setup_timer.h"
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/engine_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
@@ -544,6 +545,8 @@ HIP_Context::~HIP_Context()
 
 GPU_Backend_HIP::Impl::Impl()
 {
+	diagnostics = getenv("OPENEMS_GPU_DIAGNOSTICS") && atoi(getenv("OPENEMS_GPU_DIAGNOSTICS"))!=0;
+	stream_waits = range_downloads = range_bytes = field_downloads = field_bytes = 0;
 	dim.nx = dim.ny = dim.nz = 0;
 	numCells = 0;
 	volt = curr = vv = vi = ii = iv = NULL;
@@ -570,6 +573,10 @@ GPU_Backend_HIP::Impl::Impl()
 
 GPU_Backend_HIP::Impl::~Impl()
 {
+	if (diagnostics)
+		std::cout << "GPU diagnostics (HIP): stream_waits=" << stream_waits
+		          << " range_downloads=" << range_downloads << " range_bytes=" << range_bytes
+		          << " field_downloads=" << field_downloads << " field_bytes=" << field_bytes << std::endl;
 	if (ctx)
 	{
 		hipStreamSynchronize(ctx->stream);
@@ -694,6 +701,7 @@ void GPU_Backend_HIP::Impl::FreeSnapshots()
 
 void GPU_Backend_HIP::Impl::Flush()
 {
+	if (diagnostics) ++stream_waits;
 	HIP_Check(hipStreamSynchronize(Stream()), "stream synchronization");
 }
 
@@ -742,7 +750,7 @@ GPU_Backend_HIP* GPU_Backend_HIP::New()
 		hipGetLastError();
 		return NULL;
 	}
-	Impl* impl = new Impl();
+	std::unique_ptr<Impl> impl(new Impl());
 	impl->ctx = std::make_shared<HIP_Context>();
 	HIP_Check(hipGetDevice(&impl->ctx->device), "hipGetDevice");
 	hipDeviceProp_t prop;
@@ -769,10 +777,11 @@ GPU_Backend_HIP* GPU_Backend_HIP::New()
 		std::cerr << "GPU_Backend_HIP: no kernels for " << impl->ctx->name << arch
 		          << " in this build: " << hipGetErrorString(err) << std::endl;
 		hipGetLastError();
-		delete impl;
 		return NULL;
 	}
-	return new GPU_Backend_HIP(impl);
+	GPU_Backend_HIP* backend = new GPU_Backend_HIP(impl.get());
+	impl.release();
+	return backend;
 }
 
 GPU_Backend* GPU_Backend_HIP::NewSubGridBackend()
@@ -802,6 +811,7 @@ std::string GPU_Backend_HIP::GetName() const
 
 bool GPU_Backend_HIP::Init(const Operator* op)
 {
+	SetupTimer timer("HIP setup");
 	unsigned int numLines[3];
 	for (int n=0; n<3; ++n)
 		numLines[n] = op->GetNumberOfLines(n, true);
@@ -824,6 +834,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	const size_t count = 3*d->numCells;
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
+	timer.Report("field allocation");
 
 	// upload the final operator coefficients, including all changes by operator extensions
 	std::vector<float> vv(count), vi(count), ii(count), iv(count);
@@ -840,6 +851,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 					iv[idx] = op->GetIV(n, pos[0], pos[1], pos[2]);
 				}
 
+	timer.Report("coefficient extraction");
 	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
 	// every distinct set of the 12 coefficients of a node once and a set index per node
 	const size_t sn = d->numCells;
@@ -852,19 +864,23 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 				    values[3*c+n] = (*src[c])[n*sn+i];
 	    }, sets))
 	{
+		timer.Report("palette packing");
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
 		std::cout << "GPU_Backend_HIP: " << sets.count << " distinct coefficient sets, compressed update coefficients ("
 		          << (sets.mode==1 ? 16 : 32) << " bit index)" << std::endl;
+		timer.Report("coefficient upload");
 		return true;
 	}
 
+	timer.Report("palette packing");
 	d->coeff_mode = 0;
 	d->vv = d->Alloc<float>(count, vv.data());
 	d->vi = d->Alloc<float>(count, vi.data());
 	d->ii = d->Alloc<float>(count, ii.data());
 	d->iv = d->Alloc<float>(count, iv.data());
+	timer.Report("coefficient upload");
 	return true;
 }
 
@@ -941,6 +957,7 @@ static void CheckSize(size_t host_count, size_t device_count)
 
 void GPU_Backend_HIP::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 {
+	if (d->diagnostics) { ++d->field_downloads; d->field_bytes += volt.size()*sizeof(float); }
 	CheckSize(volt.size(), 3*d->numCells);
 	d->PinHostMemory(volt.data(), volt.size()*sizeof(FDTD_FLOAT));
 	HIP_Check(hipMemcpyAsync(volt.data(), d->volt, volt.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
@@ -949,6 +966,7 @@ void GPU_Backend_HIP::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 
 void GPU_Backend_HIP::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
 {
+	if (d->diagnostics) { ++d->field_downloads; d->field_bytes += curr.size()*sizeof(float); }
 	CheckSize(curr.size(), 3*d->numCells);
 	d->PinHostMemory(curr.data(), curr.size()*sizeof(FDTD_FLOAT));
 	HIP_Check(hipMemcpyAsync(curr.data(), d->curr, curr.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
@@ -975,6 +993,7 @@ bool GPU_Backend_HIP::DownloadRange(bool currents, size_t offset, size_t count, 
 {
 	if (offset+count > 3*d->numCells)
 		return false;
+	if (d->diagnostics) { ++d->range_downloads; d->range_bytes += count*sizeof(float); }
 	const float* src = (currents ? d->curr : d->volt) + offset;
 	HIP_Check(hipMemcpyAsync(dst, src, count*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "range download");
 	d->Flush();

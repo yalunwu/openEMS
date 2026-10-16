@@ -2,6 +2,7 @@
 if(ENABLE_HIP)
   set(HIP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/gpu_backend_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/operator_setup_hip.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_ext_excitation.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_ext_upml.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_ext_mur_abc.hip
@@ -58,6 +59,7 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_cylindrical_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_field_gather.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_gpu.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/operator_gpu_setup.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_gpu.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_gpu_cylindermultigrid.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gpu_backend.cpp

@@ -61,7 +61,8 @@ class Engine_GPU : public Engine
 {
 public:
 	//! Create the engine for \a op on the GPU backend \a backend (see GPU_Backend::New), or for a sub-grid on a backend sharing the work stream of \a parent
-	static Engine_GPU* New(const Operator* op, const std::string& backend, GPU_Backend* parent=NULL);
+	//! Takes ownership of prepared (if supplied), including when initialization fails.
+	static Engine_GPU* New(const Operator* op, const std::string& backend, GPU_Backend* parent=NULL, GPU_Backend* prepared=NULL);
 	virtual ~Engine_GPU();
 
 	//! Create the backend, the device extensions and decide device or host fallback
@@ -142,6 +143,8 @@ protected:
 	std::vector<GPU_GatherEntry> m_SnapshotGather[2];   //!< dump entries of the snapshots: E, H (see AddSnapshotGather())
 	bool m_SnapshotGatherSet;                           //!< m_SnapshotGather was passed to the backend
 	bool m_FieldDFTUsed;                                //!< AddFieldDFT() succeeded once
+	bool m_Diagnostics;
+	size_t m_Batches, m_BatchTimesteps;
 
 	//! device implementations of the engine extensions, same order as m_Eng_exts (fast path only)
 	std::vector<GPU_Extension*> m_GPU_exts;

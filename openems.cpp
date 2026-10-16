@@ -21,6 +21,7 @@
 #include <fstream>
 #include "tools/signal.h"
 #include "tools/useful.h"
+#include "tools/setup_timer.h"
 #include "FDTD/operator_cylinder.h"
 #include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/engine_multithread.h"
@@ -85,6 +86,8 @@ openEMS::openEMS()
 
 	m_engine = EngineType_Multithreaded; //default engine type
 	m_engine_numThreads = 0;
+	m_GPUSetupMode = "cpu";
+	m_GPUSetupFallback = false;
 
 	m_Abort = false;
 	m_Exc = 0;
@@ -289,8 +292,17 @@ void openEMS::collectCommandLineArguments()
 							 << m_engine_numThreads << endl;
 				}
 			),
-			"Force use n threads for multithreaded engine "
-			"(needs: --engine=multithreaded)"
+			"CPU threads for the multithreaded engine and GPU operator setup "
+			"(0: automatic, 1: serial)"
+		)
+		(
+			"gpu-setup",
+			po::value<std::string>()->default_value("cpu")->notifier([&](const std::string& mode) {
+				if (mode!="cpu" && mode!="auto" && mode!="gpu")
+					throw std::invalid_argument("gpu-setup must be cpu, auto or gpu");
+				m_GPUSetupMode=mode;
+			}),
+			"GPU operator construction: cpu (default), auto (CPU fallback), gpu (required HIP construction)"
 		)
 		(
 			"no-simulation",
@@ -793,6 +805,10 @@ void openEMS::SetupCylinderMultiGrid(std::string val)
 
 bool openEMS::SetupOperator()
 {
+	if (m_GPUSetupMode=="gpu" && (CylinderCoords || (m_engine!=EngineType_GPU && m_engine!=EngineType_GPU_Reference)))
+		throw GPU_SetupUnavailable("GPU construction requires a Cartesian GPU engine");
+	if (m_GPUSetupMode=="auto" && CylinderCoords)
+		cout << "GPU construction: CPU selected (cylindrical/multigrid setup)" << endl;
 	if (CylinderCoords)
 	{
 		bool gpu = (m_engine == EngineType_GPU) || (m_engine == EngineType_GPU_Reference);
@@ -819,7 +835,8 @@ bool openEMS::SetupOperator()
 	}
 	else if ((m_engine == EngineType_GPU) || (m_engine == EngineType_GPU_Reference))
 	{
-		FDTD_Op = Operator_GPU::New(m_engine == EngineType_GPU_Reference ? "reference" : "auto");
+		FDTD_Op = Operator_GPU::New(m_engine == EngineType_GPU_Reference ? "reference" : "auto", m_engine_numThreads,
+		                          m_GPUSetupFallback ? "cpu" : m_GPUSetupMode);
 	}
 	else
 	{
@@ -868,6 +885,7 @@ void openEMS::Set_Mur_PhaseVel(int idx, double val)
 
 bool openEMS::ParseFDTDSetup(std::string file)
 {
+	SetupTimer timer("FDTD input");
 	Reset();
 
 	if (g_settings.GetVerboseLevel()>0)
@@ -905,7 +923,9 @@ bool openEMS::ParseFDTDSetup(std::string file)
 	this->SetCSX(csx);
 
 
-	return this->Parse_XML_FDTDSetup(FDTD_Opts);
+	const bool success = this->Parse_XML_FDTDSetup(FDTD_Opts);
+	timer.Report("XML and geometry parsing");
+	return success;
 }
 
 bool openEMS::Parse_XML_FDTDSetup(TiXmlElement* FDTD_Opts)
@@ -1195,8 +1215,9 @@ ContinuousStructure* openEMS::GetCSX() const
 	return m_CSX;
 }
 
-int openEMS::SetupFDTD()
+int openEMS::SetupFDTD() try
 {
+	SetupTimer timer("FDTD setup");
 	// of a previous setup that was not run
 	FreeSimulation();
 
@@ -1332,7 +1353,25 @@ int openEMS::SetupFDTD()
 	if (m_debugPEC)
 		debugFlags |= Operator::debugPEC;
 
-	FDTD_Op->CalcECOperator( debugFlags );
+	int operatorResult;
+	try { operatorResult=FDTD_Op->CalcECOperator(debugFlags); }
+	catch (const GPU_SetupUnavailable& error)
+	{
+		if (m_GPUSetupMode!="auto" || m_GPUSetupFallback) throw;
+		cout << "GPU construction: " << error.what() << "; rebuilding a fresh CPU operator" << endl;
+		// Optional allocations finish before EC arrays, primitive flags or waveforms change.
+		m_GPUSetupFallback=true;
+		const int result=SetupFDTD();
+		m_GPUSetupFallback=false;
+		return result;
+	}
+	if (operatorResult != 0)
+	{
+		cerr << "openEMS::SetupFDTD: Error constructing the FDTD operator!" << endl;
+		Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+		FreeSimulation();
+		return 2;
+	}
 	/*******************************************************************************/
 
 	//reset flags for material storage, if no dump-box resets it to true, it will be cleaned up...
@@ -1389,8 +1428,10 @@ int openEMS::SetupFDTD()
 		return 1;
 	}
 
+	timer.Report("operator and waveform construction");
 	//create FDTD engine
 	FDTD_Eng = FDTD_Op->CreateEngine();
+	timer.Report("backend and engine initialization");
 
 	if (Op_Ext_SSD)
 	{
@@ -1418,7 +1459,15 @@ int openEMS::SetupFDTD()
 	}
 
 	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+	timer.Report("processing initialization and cleanup");
 	return 0;
+}
+catch (...)
+{
+	m_GPUSetupFallback=false;
+	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+	FreeSimulation();
+	throw;
 }
 
 string FormatTime(int sec)
@@ -1613,7 +1662,9 @@ void openEMS::RunFDTD()
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
 
 	//*************** postproc ************//
+	SetupTimer finalTimer("FDTD output");
 	PA->PostProcess();
+	finalTimer.Report("finalization");
 
 	// the results are written: free the memory of the operator and the engine,
 	// e.g. for a post-processing in the same process (NF2FF, SAR)

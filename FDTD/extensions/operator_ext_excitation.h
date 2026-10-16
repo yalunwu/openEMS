@@ -25,6 +25,7 @@ class Excitation;
 
 class Operator_Ext_Excitation : public Operator_Extension
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine_Ext_Excitation;
 	friend class Engine_Ext_Mur_ABC;
 	friend class Operator;

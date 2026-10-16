@@ -88,6 +88,8 @@ struct GPU_Backend_HIP::Impl
 
 	HIP_GridDim dim;
 	size_t numCells;    //!< nx*ny*nz, the field buffers hold 3*numCells values
+	bool diagnostics;
+	size_t stream_waits, range_downloads, range_bytes, field_downloads, field_bytes;
 
 	float *volt, *curr;
 	float2* energy;                      //!< per-line energy sums, see GPU_Backend_HIP::CalcFastEnergy()

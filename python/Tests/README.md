@@ -20,6 +20,23 @@ python3 run_testsuite.py --unittests        # those plus the unittest modules
 python3 run_testsuite.py --only-unittests   # just the fast ones
 ```
 
+Run `GPU_Engine.py --require-backend HIP` (or `Metal`) for device acceptance;
+without this flag device tests may be skipped when no GPU is available.
+`--case cpu_setup` selects the worker isolation/thread-count regression.
+The shared comparator checks exact sampling and finite data, with `1e-4`
+peak-relative and `1e-3` per-file relative-L2 limits for device output.
+`test_compare.py` also covers group-level HDF5 metadata, NF2FF scalar results
+and VTR normalization/coordinates. Its VTR tests isolate comparison arithmetic
+from the optional VTK reader; they do not constitute a reader integration test.
+`GPU_Setup.py --require-backend HIP` separately requires device construction and
+compares CPU/HIP setup with the same HIP stepping backend, including nonuniform
+and transformed geometry, LinPoly, timestep settings and extension construction.
+Per-extension activation assertions cover UPML, sources, RC/RLC, Mur/local
+absorbers, TFSF, Lorentz/Drude, Debye and conducting sheets. Additional fixtures
+exercise nonuniform material-filled UPML, RLC caps/overlap, delayed hard E/H
+sources and the Debye minimum relaxation time. Resource/weight fallback,
+malformed budgets, strict errors and solver reuse are checked too.
+
 The runner reports PASS/FAIL/ERROR per test, prints a summary and exits non-zero
 if anything failed, so it can be used from CI. A failing test does not abort the
 run.

@@ -16,6 +16,8 @@
 */
 
 #include <stdexcept>
+#include <cstdlib>
+#include <memory>
 
 #include "engine_gpu.h"
 #include "gpu_backend.h"
@@ -28,11 +30,13 @@ using std::endl;
 
 //! \brief construct an Engine_GPU instance
 //! it's the responsibility of the caller to free the returned pointer
-Engine_GPU* Engine_GPU::New(const Operator* op, const std::string& backend, GPU_Backend* parent)
+Engine_GPU* Engine_GPU::New(const Operator* op, const std::string& backend, GPU_Backend* parent, GPU_Backend* prepared)
 {
-	Engine_GPU* e = new Engine_GPU(op, backend, parent);
+	std::unique_ptr<GPU_Backend> owner(prepared);
+	std::unique_ptr<Engine_GPU> e(new Engine_GPU(op, backend, parent));
+	e->m_Backend = owner.release();
 	e->Init();
-	return e;
+	return e.release();
 }
 
 Engine_GPU::Engine_GPU(const Operator* op, const std::string& backend, GPU_Backend* parent) : Engine(op)
@@ -46,6 +50,8 @@ Engine_GPU::Engine_GPU(const Operator* op, const std::string& backend, GPU_Backe
 	m_SnapshotsUsed = false;
 	m_SnapshotGatherSet = false;
 	m_FieldDFTUsed = false;
+	m_Diagnostics = getenv("OPENEMS_GPU_DIAGNOSTICS") && atoi(getenv("OPENEMS_GPU_DIAGNOSTICS"))!=0;
+	m_Batches = m_BatchTimesteps = 0;
 	m_StaleVolt.stale = m_StaleCurr.stale = false;
 	m_StaleVolt.full_this_batch = m_StaleCurr.full_this_batch = false;
 	m_StaleVolt.full_last_batch = m_StaleCurr.full_last_batch = false;
@@ -62,7 +68,8 @@ void Engine_GPU::Init()
 	Engine::Init();
 
 	// a sub-grid shares the device work stream of its parent grid
-	m_Backend = m_ParentBackend ? m_ParentBackend->NewSubGridBackend() : GPU_Backend::New(m_BackendName);
+	if (!m_Backend)
+		m_Backend = m_ParentBackend ? m_ParentBackend->NewSubGridBackend() : GPU_Backend::New(m_BackendName);
 	cout << "Create FDTD engine (GPU, backend: " << m_Backend->GetName() << ")" << endl;
 	if (!m_Backend->Init(Op))
 		throw std::runtime_error("Engine_GPU::Init: GPU backend initialization failed");
@@ -122,6 +129,9 @@ void Engine_GPU::ClearGPUExtensions()
 
 void Engine_GPU::Reset()
 {
+	if (m_Diagnostics && m_Batches)
+		cout << "GPU diagnostics (engine): batches=" << m_Batches << " timesteps=" << m_BatchTimesteps << endl;
+	m_Batches = m_BatchTimesteps = 0;
 	// the device extensions refer to the backend and to the engine extensions
 	ClearGPUExtensions();
 	delete m_Backend;
@@ -295,6 +305,7 @@ void Engine_GPU::CurrentsToDevice()
 
 bool Engine_GPU::IterateTS(unsigned int iterTS)
 {
+	if (m_Diagnostics) { ++m_Batches; m_BatchTimesteps += iterTS; }
 	for (unsigned int iter=0; iter<iterTS; ++iter)
 	{
 		VoltageHalfStep();

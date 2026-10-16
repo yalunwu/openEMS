@@ -24,7 +24,11 @@ function RunOpenEMS(Sim_Path, Sim_File, opts, Settings)
 %          --engine=sse             engine using sse vector extensions
 %          --engine=sse-compressed  engine using compressed operator + sse vector extensions
 %          --engine=multithreaded   engine using compressed operator + sse vector extensions + multithreading
-%      --numThreads=<n>     Force use n threads for multithreaded engine
+%          --engine=gpu             GPU engine using HIP or Metal
+%          --engine=gpu-reference   GPU engine using the CPU reference backend
+%      --numThreads=<n>     CPU threads, including GPU operator setup (0: automatic, 1: serial)
+%      --gpu-setup=<mode>   cpu (default), auto (CPU fallback), gpu (require HIP core/extension construction)
+%                          Scalar metadata and waveforms are prepared on the CPU.
 %      --no-simulation      only run preprocessing; do not simulate
 %      --dump-statistics    dump simulation statistics to 'openEMS_run_stats.txt' and 'openEMS_stats.txt'
 %

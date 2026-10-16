@@ -663,7 +663,11 @@ cdef class openEMS:
         see `./openEMS --help`). Examples are:
 
         * verbose (int) -- set the openEMS verbosity level 0..3
-        * numThreads (int) -- set the number of threads (default 0 --> max)
+        * numThreads (int) -- set CPU threads, including GPU operator setup
+          (0: automatic, 1: serial; capped by available CPUs and mesh lines)
+        * gpu_setup (str) -- CPU construction ('cpu', default), automatic HIP
+          construction with CPU fallback ('auto'), or required HIP core and
+          extension construction ('gpu'). Scalar metadata and waveforms stay on CPU.
         * disable_dumps (bool) -- disable all field dumps for faster simulation
         * debug_material (bool) - dump material distribution to a vtk file for
           debugging.

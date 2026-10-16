@@ -59,7 +59,7 @@ cdef extern from "openEMS/openems.h":
 
         void SetAbort(bool val)
 
-        int SetupFDTD() nogil
+        int SetupFDTD() except + nogil
         void RunFDTD()  nogil
 
         bool Write2XML(string file)
