@@ -86,6 +86,9 @@ there are unreleased changes. It becomes the next release entry.
   quadratic time. A far-field (NF2FF) calculation from a recording of 3200
   timesteps went from 79 s to 2.4 s per frequency.
 
+- An unknown `--engine` value (`engine=` from Python) is an error; it used to
+  run the default engine without a word, e.g. for `--engine=GPU` or `cuda`.
+
 ### Fixed
 
 - A run switched flush-to-zero on in the calling process and left it on: in
@@ -159,6 +162,8 @@ there are unreleased changes. It becomes the next release entry.
   unless `CMAKE_HIP_ARCHITECTURES` / `CMAKE_CUDA_ARCHITECTURES` name others.
   Whatever a backend is missing switches it off with a warning; openEMS
   builds without it.
+- C++17 is now required (was C++11), e.g. GCC 8 or newer, also for the
+  Python bindings and the GPU sources (HIP/CUDA, were C++14).
 
 ### Upgrade notes
 

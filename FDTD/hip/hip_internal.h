@@ -241,7 +241,7 @@ struct GPU_Backend_HIP::Impl
 		if (ptr==NULL)
 			return;
 		m_Allocations.erase(std::remove(m_Allocations.begin(), m_Allocations.end(), ptr), m_Allocations.end());
-		hipFree(ptr);
+		(void)hipFree(ptr);
 	}
 
 	//! Take ownership only after registration succeeds; failure leaves the result intact.
