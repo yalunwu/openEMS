@@ -44,6 +44,7 @@ public:
 	virtual void DoPostCurrentUpdates(int threadID);
 
 protected:
+	void EnsureHostState();
 	template <typename EngType>
 	void DoPreVoltageUpdatesImpl(EngType* eng, int threadID);
 

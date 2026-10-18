@@ -27,13 +27,19 @@ Engine_Ext_LumpedRLC::Engine_Ext_LumpedRLC(Operator_Ext_LumpedRLC* op_ext_RLC) :
 	// Local pointer of the operator.
 	m_Op_Ext_RLC = op_ext_RLC;
 
-	v_Vdn		= new FDTD_FLOAT*[3];
-	v_Jn		= new FDTD_FLOAT*[3];
-	v_Il		= NULL;
+	v_Vdn=nullptr;v_Jn=nullptr;v_Il=nullptr;
+	if (!op_ext_RLC->HasDeviceConstruction()) PrepareHost();
+}
+
+void Engine_Ext_LumpedRLC::PrepareHost()
+{
+	m_Op_Ext_RLC->EnsureHostConstruction();
+	if (v_Vdn) return;
 
 	// No additional allocations are required if there are no actual lumped elements.
 	if (!(m_Op_Ext_RLC->RLC_count))
 		return;
+	v_Vdn=new FDTD_FLOAT*[3]();v_Jn=new FDTD_FLOAT*[3]();
 
 	// Initialize ADE containers for currents and voltages
 	v_Il		= new FDTD_FLOAT[m_Op_Ext_RLC->RLC_count];
@@ -58,16 +64,8 @@ Engine_Ext_LumpedRLC::Engine_Ext_LumpedRLC(Operator_Ext_LumpedRLC* op_ext_RLC) :
 Engine_Ext_LumpedRLC::~Engine_Ext_LumpedRLC()
 {
 	// Only delete if values were allocated in the first place
-	if (m_Op_Ext_RLC->RLC_count)
-	{
-		delete[] v_Il;
-
-		for (unsigned int k = 0 ; k < 3 ; k++)
-		{
-			delete[] v_Vdn[k];
-			delete[] v_Jn[k];
-		}
-	}
+	delete[] v_Il;
+	for (unsigned int k=0;k<3;++k) {if (v_Vdn) delete[] v_Vdn[k];if (v_Jn) delete[] v_Jn[k];}
 
 	delete[] v_Vdn;
 	delete[] v_Jn;
@@ -84,6 +82,7 @@ Engine_Ext_LumpedRLC::~Engine_Ext_LumpedRLC()
 
 void Engine_Ext_LumpedRLC::DoPreVoltageUpdates()
 {
+	PrepareHost();
 	if (!m_Op_Ext_RLC->RLC_count)
 		return;
 
@@ -104,6 +103,7 @@ void Engine_Ext_LumpedRLC::DoPreVoltageUpdates()
 template <typename EngType>
 void Engine_Ext_LumpedRLC::Apply2VoltagesImpl(EngType* eng)
 {
+	PrepareHost();
 	if (!m_Op_Ext_RLC->RLC_count)
 		return;
 

@@ -27,7 +27,11 @@
 #include <stdexcept>
 
 #include "hip_internal.h"
+#include "setup_scan_hip.h"
+#include "FDTD/gpu_setup_memory.h"
+#include "FDTD/gpu_setup_adapters.h"
 #include "FDTD/operator.h"
+#include "tools/setup_timer.h"
 #include "FDTD/extensions/engine_ext_upml.h"
 #include "FDTD/extensions/engine_ext_excitation.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
@@ -360,11 +364,37 @@ __global__ void gather_region(const float* __restrict__ f, HIP_GatherRegion R, H
 	if (e<R.total)
 		out[e] = f[region_field_index(R, N, e)];
 }
+// the dumped values of a snapshot: entries [0, nv) from the voltages, [nv, n) from the currents
+// (see GPU_GatherEntry). Evaluated here so that only the dumped values go over PCIe, not the
+// whole fields. Double precision without FMA contraction (--fmad=false), as on the host.
+#include "hip_gather.hiph"
 
 // frequency domain dumps: sums[k*total + e] += raw value(e) * w[k] for the weights of one timestep,
 // a float times a complex float, then a complex sum; the host interpolates the sums
 #define DFT_WEIGHTS 32   // weights per launch, passed by value in the kernel parameters
 struct HIP_DFTWeights { float2 w[DFT_WEIGHTS]; };
+
+__global__ void gather_prepared(const float* volt,const float* curr,const GPU_GatherEntry* entries,
+                               unsigned int nv,unsigned int count,float* output)
+{
+	const unsigned int i=blockIdx.x*blockDim.x+threadIdx.x;
+	if (i<count) output[i]=gather_value(i<nv ? volt : curr,entries[i]);
+}
+
+__global__ void prepared_field_dft(const float* fields,const GPU_GatherEntry* entries,unsigned int count,
+                                  HIP_DFTWeights weights,unsigned int frequencies,float2* sums)
+{
+	const unsigned int i=blockIdx.x*blockDim.x+threadIdx.x;
+	if (i>=count) return;
+	const float value=gather_value(fields,entries[i]);
+	for (unsigned int k=0;k<frequencies;++k)
+	{
+		float2 sum=sums[size_t(k)*count+i];
+		sum.x+=value*weights.w[k].x;sum.y+=value*weights.w[k].y;
+		sums[size_t(k)*count+i]=sum;
+	}
+}
+
 
 __global__ void field_dft(const float* __restrict__ f, HIP_GatherRegion R, HIP_GridDim N,
                           HIP_DFTWeights W, unsigned int nw, float2* __restrict__ sums)
@@ -507,6 +537,7 @@ HIP_Context::HIP_Context()
 
 HIP_Context::~HIP_Context()
 {
+	HIP_UnregisterDiagnostics(this);
 	if (stream)
 	{
 		hipStreamSynchronize(stream);
@@ -521,6 +552,9 @@ HIP_Context::~HIP_Context()
 
 GPU_Backend_HIP::Impl::Impl()
 {
+	waveform_source=NULL; waveform_length=0; waveform[0]=waveform[1]=NULL;
+	diagnostics = getenv("OPENEMS_GPU_DIAGNOSTICS") && atoi(getenv("OPENEMS_GPU_DIAGNOSTICS"))!=0;
+	stream_waits = range_downloads = range_bytes = field_downloads = field_bytes = 0;
 	dim.nx = dim.ny = dim.nz = 0;
 	numCells = 0;
 	volt = curr = vv = vi = ii = iv = NULL;
@@ -546,6 +580,10 @@ GPU_Backend_HIP::Impl::Impl()
 
 GPU_Backend_HIP::Impl::~Impl()
 {
+	if (diagnostics)
+		std::cout << "GPU diagnostics (HIP): stream_waits=" << stream_waits
+		          << " range_downloads=" << range_downloads << " range_bytes=" << range_bytes
+		          << " field_downloads=" << field_downloads << " field_bytes=" << field_bytes << std::endl;
 	if (ctx)
 	{
 		hipStreamSynchronize(ctx->stream);
@@ -558,6 +596,101 @@ GPU_Backend_HIP::Impl::~Impl()
 		hipFree(m_Allocations.at(n));
 	for (std::set<void*>::iterator it=m_Pinned.begin(); it!=m_Pinned.end(); ++it)
 		hipHostUnregister(*it);
+}
+
+namespace
+{
+__global__ void MarkDeviceFixup(const unsigned int* indices,unsigned int count,unsigned int stride,HIP_GridDim dims,
+                                HIP_GridDim start,HIP_GridDim stop,HIP_FusedRegions regions,bool folded,
+                                uint64_t* flags,unsigned int* collision)
+{
+	const unsigned int q=blockIdx.x*blockDim.x+threadIdx.x;
+	if (q>=count) return;
+	const unsigned int node=indices[size_t(q)*stride]%(dims.nx*dims.ny*dims.nz);
+	const unsigned int p[3]={node/(dims.ny*dims.nz),(node/dims.nz)%dims.ny,node%dims.nz};
+	const unsigned int first[3]={start.nx,start.ny,start.nz},last[3]={stop.nx,stop.ny,stop.nz},lines[3]={dims.nx,dims.ny,dims.nz};
+	for (int m=-1;m<3;++m)
+	{
+		unsigned int c[3]={p[0],p[1],p[2]};
+		if (m>=0) {if (!c[m]) continue;--c[m];}
+		bool valid=true;
+		for (int n=0;n<3;++n) valid&=(folded || (c[n]>=first[n] && c[n]<last[n])) && c[n]+1<lines[n];
+		if (!valid) continue;
+		if (folded && fused_region_of(regions,c[0],c[1],c[2])>=0) atomicOr(collision,1u);
+		atomicExch(reinterpret_cast<unsigned long long*>(flags+(size_t(c[0])*dims.ny+c[1])*dims.nz+c[2]),1ull);
+	}
+}
+
+__global__ void FilterDeviceFixup(uint64_t* flags,unsigned int cells,HIP_GridDim dims,HIP_GridDim start,HIP_GridDim stop)
+{
+	const unsigned int node=blockIdx.x*blockDim.x+threadIdx.x;
+	if (node>=cells) return;
+	const unsigned int x=node/(dims.ny*dims.nz),y=(node/dims.nz)%dims.ny,z=node%dims.nz;
+	if (x<start.nx || x>=stop.nx || y<start.ny || y>=stop.ny || z<start.nz || z>=stop.nz) flags[node]=0;
+}
+
+__global__ void FillDeviceFixup(const uint64_t* offsets,unsigned int cells,size_t* output)
+{
+	const unsigned int node=blockIdx.x*blockDim.x+threadIdx.x;
+	if (node<cells && offsets[node]<offsets[node+1]) output[offsets[node]]=node;
+}
+
+struct FixupWorkspace
+{
+	hipStream_t stream;
+	std::vector<void*> buffers;
+	explicit FixupWorkspace(hipStream_t s) : stream(s) {}
+	~FixupWorkspace() {hipStreamSynchronize(stream);for (void* p:buffers) hipFree(p);}
+	template<class T> T* Allocate(size_t count)
+	{
+		if (!count) return nullptr;
+		T* buffer=nullptr;
+		const size_t bytes=GPU_SetupMultiply(count,sizeof(T));
+		const hipError_t status=HIP_AllocateDevice(stream,&buffer,bytes);
+		if (status==hipErrorOutOfMemory) {hipGetLastError();throw GPU_SetupUnavailable("insufficient device memory for fusion metadata");}
+		HIP_Check(status,"fusion metadata allocation");
+		try {buffers.push_back(buffer);} catch (...) {hipFree(buffer);throw;}
+		HIP_Check(hipMemsetAsync(buffer,0,bytes,stream),"fusion metadata clear");return buffer;
+	}
+};
+
+void BuildDeviceFixup(GPU_Backend_HIP::Impl& d)
+{
+	FixupWorkspace workspace(d.Stream());
+	auto lists=d.device_volt_modified;
+	if (!d.volt_modified.empty())
+	{
+		std::vector<unsigned int> values;
+		values.reserve(d.volt_modified.size());
+		for (size_t index:d.volt_modified)
+		{
+			if (index>UINT_MAX) throw std::overflow_error("device construction fusion index exceeds its limit");
+			values.push_back(static_cast<unsigned int>(index));
+		}
+		auto* input=workspace.Allocate<unsigned int>(d.volt_modified.size());
+		HIP_Check(hipMemcpyAsync(input,values.data(),values.size()*sizeof(unsigned int),hipMemcpyHostToDevice,d.Stream()),"legacy fusion inputs");
+		lists.push_back({input,static_cast<unsigned int>(d.volt_modified.size()),1});
+	}
+	auto* flags=workspace.Allocate<uint64_t>(d.numCells+1);
+	auto* collision=workspace.Allocate<unsigned int>(1);
+	for (const auto& list:lists) if (list.count)
+		MarkDeviceFixup<<<(list.count+255u)/256,256,0,d.Stream()>>>(list.index,list.count,list.stride,d.dim,d.main_start,d.main_stop,d.fregions,d.fregions.count!=0,flags,collision);
+	HIP_Check(hipGetLastError(),"fusion dependency marking");
+	unsigned int collided=0;
+	HIP_Check(hipMemcpyAsync(&collided,collision,sizeof(collided),hipMemcpyDeviceToHost,d.Stream()),"fusion boundary metadata");d.Flush();
+	if (collided) d.fregions.count=0;
+	const unsigned int groups=static_cast<unsigned int>((d.numCells+255)/256);
+	if (!d.fregions.count) FilterDeviceFixup<<<groups,256,0,d.Stream()>>>(flags,static_cast<unsigned int>(d.numCells),d.dim,d.main_start,d.main_stop);
+	auto* scan=workspace.Allocate<uint64_t>(HIP_SetupScanWorkspace(d.numCells+1));
+	HIP_SetupExclusiveScan(flags,d.numCells+1,scan,d.Stream());
+	uint64_t count=0;
+	HIP_Check(hipMemcpyAsync(&count,flags+d.numCells,sizeof(count),hipMemcpyDeviceToHost,d.Stream()),"fusion output count");d.Flush();
+	if (count>d.numCells) throw std::runtime_error("invalid fusion dependency count");
+	d.fixup_count=static_cast<unsigned int>(count);d.fixup=d.Alloc<size_t>(count);
+	if (count) FillDeviceFixup<<<groups,256,0,d.Stream()>>>(flags,static_cast<unsigned int>(d.numCells),d.fixup);
+	HIP_Check(hipGetLastError(),"fusion dependency compaction");d.Flush();
+	if (d.diagnostics) std::cout << "GPU fusion metadata constructed: nodes=" << count << " d2h_bytes=" << sizeof(count)+sizeof(collided) << std::endl;
+}
 }
 
 bool GPU_Backend_HIP::Impl::DecideFusedStep()
@@ -573,6 +706,9 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 	// again. With the UPML regions in the kernel, region nodes cannot (the current flux is
 	// updated in place): then the region kernels update the regions.
 	const bool folded = fregions.count>0;
+	if (!device_volt_modified.empty()) BuildDeviceFixup(*this);
+	else
+	{
 	std::set<size_t> nodes;
 	for (size_t k=0; k<volt_modified.size(); ++k)
 	{
@@ -609,6 +745,10 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		else if (fregions.count)
 			list.push_back(*it);
 	}
+	fixup_count = list.size();
+	fixup = Alloc<size_t>(fixup_count, list.data());
+	}
+
 	// The buffers are allocated last, after the field dumps: without them the run is only slower.
 	volt_next = TryAlloc<float>(3*numCells);
 	curr_next = TryAlloc<float>(3*numCells);
@@ -620,9 +760,6 @@ bool GPU_Backend_HIP::Impl::DecideFusedStep()
 		std::cout << "GPU_Backend_HIP: not enough device memory for the fused step, using separate updates" << std::endl;
 		return false;
 	}
-	fixup_count = list.size();
-	fixup = Alloc<size_t>(fixup_count, list.data());
-
 	// both buffers start with the current fields
 	HIP_Check(hipMemcpyAsync(volt_next, volt, 3*numCells*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
 	HIP_Check(hipMemcpyAsync(curr_next, curr, 3*numCells*sizeof(float), hipMemcpyDeviceToDevice, Stream()), "fused step buffers");
@@ -674,6 +811,7 @@ void GPU_Backend_HIP::Impl::FreeSnapshots()
 	snap_lines.clear();
 	snap_regions[0].clear();
 	snap_regions[1].clear();
+	hipFree(snap_entries);snap_entries=nullptr;
 	hipFree(snap_dev);
 	hipHostFree(snap_host);
 	snap_dev = snap_host = NULL;
@@ -683,6 +821,7 @@ void GPU_Backend_HIP::Impl::FreeSnapshots()
 
 void GPU_Backend_HIP::Impl::Flush()
 {
+	if (diagnostics) ++stream_waits;
 	HIP_Check(hipStreamSynchronize(Stream()), "stream synchronization");
 }
 
@@ -731,7 +870,7 @@ GPU_Backend_HIP* GPU_Backend_HIP::New()
 		hipGetLastError();
 		return NULL;
 	}
-	Impl* impl = new Impl();
+	std::unique_ptr<Impl> impl(new Impl());
 	impl->ctx = std::make_shared<HIP_Context>();
 	HIP_Check(hipGetDevice(&impl->ctx->device), "hipGetDevice");
 	hipDeviceProp_t prop;
@@ -740,6 +879,7 @@ GPU_Backend_HIP* GPU_Backend_HIP::New()
 	impl->ctx->warp_size = prop.warpSize > 0 ? prop.warpSize : 32;
 	HIP_Check(hipStreamCreateWithFlags(&impl->ctx->stream, hipStreamNonBlocking), "hipStreamCreate");
 	HIP_Check(hipStreamCreateWithFlags(&impl->ctx->copy_stream, hipStreamNonBlocking), "hipStreamCreate");
+	impl->ctx->setup_diagnostics.enabled=impl->diagnostics;HIP_RegisterDiagnostics(impl->ctx.get());
 
 	// A GPU whose architecture this build has no code for is found and described like any
 	// other, and launching on it takes the process down with it rather than returning an
@@ -758,10 +898,11 @@ GPU_Backend_HIP* GPU_Backend_HIP::New()
 		std::cerr << "GPU_Backend_HIP: no kernels for " << impl->ctx->name << arch
 		          << " in this build: " << hipGetErrorString(err) << std::endl;
 		hipGetLastError();
-		delete impl;
 		return NULL;
 	}
-	return new GPU_Backend_HIP(impl);
+	GPU_Backend_HIP* backend = new GPU_Backend_HIP(impl.get());
+	impl.release();
+	return backend;
 }
 
 GPU_Backend* GPU_Backend_HIP::NewSubGridBackend()
@@ -789,8 +930,23 @@ std::string GPU_Backend_HIP::GetName() const
 	return "HIP (" + d->ctx->name + ")";
 }
 
+bool GPU_Backend_HIP::SetSetupResult(std::shared_ptr<GPU_SetupResult> result)
+{
+	const auto hip=std::dynamic_pointer_cast<HIP_SetupResult>(result);
+	if (!hip || hip->context!=d->ctx || d->setup_result) return false;
+	d->setup_result=hip;
+	return true;
+}
+
+bool GPU_Backend_HIP::BuildExcitationSignal(Excitation& excitation, unsigned int maxTS)
+{
+	if (!d->setup_result) throw std::logic_error("waveform construction requires an owned operator result");
+	return HIP_BuildSetupWaveform(*d->setup_result,excitation,maxTS,d->diagnostics);
+}
+
 bool GPU_Backend_HIP::Init(const Operator* op)
 {
+	SetupTimer timer("HIP setup");
 	unsigned int numLines[3];
 	for (int n=0; n<3; ++n)
 		numLines[n] = op->GetNumberOfLines(n, true);
@@ -832,6 +988,42 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	const size_t count = 3*d->numCells;
 	d->volt = d->Alloc<float>(count);
 	d->curr = d->Alloc<float>(count);
+	timer.Report("field allocation");
+	if (d->setup_result)
+	{
+		HIP_SetupResult& result=*d->setup_result;
+		for (int n=0;n<3;++n)
+			if (result.dims[n]!=numLines[n]) throw std::runtime_error("HIP construction result mesh mismatch");
+		d->coeff_mode=result.mode;
+		if (result.mode)
+		{
+			d->coeff=result.palette; d->index=result.index;
+			std::cout << "GPU_Backend_HIP: " << result.sets << " distinct coefficient sets, device-packed update coefficients ("
+			          << (result.mode==1?16:32) << " bit index)" << std::endl;
+		}
+		else
+		{
+			d->vv=result.coefficients[0]; d->vi=result.coefficients[1];
+			d->ii=result.coefficients[2]; d->iv=result.coefficients[3];
+		}
+		d->waveform_source=result.waveform_source; d->waveform_length=result.waveform_length;
+		for (int kind=0;kind<2;++kind)
+		{
+			d->waveform_owner[kind]=result.waveform_owner[kind];
+			d->waveform[kind]=d->waveform_owner[kind].get();
+		}
+		if (!d->waveform_source && d->ctx->waveform_source==op->GetExcitationSignal())
+		{
+			for (unsigned int k=0;k<2;++k) d->waveform_owner[k]=d->ctx->waveform[k].lock();
+			if (!d->waveform_owner[0] || !d->waveform_owner[1]) throw std::runtime_error("shared multigrid waveform expired");
+			d->waveform_source=d->ctx->waveform_source;d->waveform_length=d->ctx->waveform_length;
+			for (unsigned int k=0;k<2;++k) d->waveform[k]=d->waveform_owner[k].get();
+		}
+		std::cout << "HIP device construction result adopted" << std::endl;
+		result.engine_adopted=true;
+		timer.Report("device construction result adoption");
+		return true;
+	}
 
 	// upload the final operator coefficients, including all changes by operator extensions.
 	// Most nodes share one of a few coefficient sets (same material and mesh spacing): store
@@ -839,6 +1031,7 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	GPU_CoeffSets sets;
 	if (GPU_FindSets(d->numCells, 12, [&](size_t i, float* values) {GPU_NodeCoefficients(op, numLines, i, values);}, sets))
 	{
+		timer.Report("palette packing");
 		d->coeff_mode = sets.mode;
 		d->index = d->AllocIndex(sets);
 		d->coeff = d->Alloc<float>(sets.table.size(), sets.table.data());
@@ -856,13 +1049,16 @@ bool GPU_Backend_HIP::Init(const Operator* op)
 	d->vi = upload(1);
 	d->ii = upload(2);
 	d->iv = upload(3);
+	timer.Report("coefficient upload");
 	return true;
 }
 
 void GPU_Backend_HIP::UpdateVoltages()
 {
 	const bool c = d->coeff_mode>0;
-	if (d->DecideFusedStep())
+	const bool fused=d->DecideFusedStep();
+	HIP_ReportSetupDiagnostics(d->ctx.get());
+	if (fused)
 	{
 		// the main nodes, or the whole grid with the UPML regions in the kernel (see update_fused)
 		HIP_GridDim B = d->main_start;
@@ -932,6 +1128,7 @@ static void CheckSize(size_t host_count, size_t device_count)
 
 void GPU_Backend_HIP::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 {
+	if (d->diagnostics) { ++d->field_downloads; d->field_bytes += volt.size()*sizeof(float); }
 	CheckSize(volt.size(), 3*d->numCells);
 	d->PinHostMemory(volt.data(), volt.size()*sizeof(FDTD_FLOAT));
 	HIP_Check(hipMemcpyAsync(volt.data(), d->volt, volt.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
@@ -940,6 +1137,7 @@ void GPU_Backend_HIP::DownloadVoltages(ArrayLib::ArrayNIJK<FDTD_FLOAT>& volt)
 
 void GPU_Backend_HIP::DownloadCurrents(ArrayLib::ArrayNIJK<FDTD_FLOAT>& curr)
 {
+	if (d->diagnostics) { ++d->field_downloads; d->field_bytes += curr.size()*sizeof(float); }
 	CheckSize(curr.size(), 3*d->numCells);
 	d->PinHostMemory(curr.data(), curr.size()*sizeof(FDTD_FLOAT));
 	HIP_Check(hipMemcpyAsync(curr.data(), d->curr, curr.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "download");
@@ -966,6 +1164,7 @@ bool GPU_Backend_HIP::DownloadRange(bool currents, size_t offset, size_t count, 
 {
 	if (offset+count > 3*d->numCells)
 		return false;
+	if (d->diagnostics) { ++d->range_downloads; d->range_bytes += count*sizeof(float); }
 	const float* src = (currents ? d->curr : d->volt) + offset;
 	HIP_Check(hipMemcpyAsync(dst, src, count*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "range download");
 	d->Flush();
@@ -1016,8 +1215,8 @@ bool GPU_Backend_HIP::SetSnapshotGather(const std::vector<Engine_GatherRegion>& 
 	if ((n==0) || (n>UINT_MAX))
 		return false;
 	// not fatal: without snapshots the dumps read the fields from the host mirror
-	bool ok = (hipMalloc(&d->snap_dev, n*sizeof(float))==hipSuccess)
-	          && (hipHostMalloc(&d->snap_host, n*sizeof(float))==hipSuccess);
+	bool ok = (HIP_AllocateDevice(d->Stream(),&d->snap_dev, n*sizeof(float))==hipSuccess)
+	          && (HIP_AllocateHost(d->Stream(),&d->snap_host, n*sizeof(float))==hipSuccess);
 	const std::vector<Engine_GatherRegion>* regions[2] = {&volt_regions, &curr_regions};
 	for (int f=0; f<2 && ok; ++f)
 		for (size_t r=0; r<regions[f]->size() && ok; ++r)
@@ -1051,6 +1250,7 @@ bool GPU_Backend_HIP::SnapshotFields(const FDTD_FLOAT* &volt, const FDTD_FLOAT* 
 	if (d->snap_taken)
 		HIP_Check(hipStreamWaitEvent(d->Stream(), d->snap_done, 0), "hipStreamWaitEvent");
 	size_t offset = 0;
+	if (d->snap_entries) HIP_Launch(d,"gather_prepared",gather_prepared,d->snap_n,1,1,static_cast<const float*>(d->volt),static_cast<const float*>(d->curr),static_cast<const GPU_GatherEntry*>(d->snap_entries),d->snap_nv,d->snap_n,d->snap_dev);
 	for (int f=0; f<2; ++f)
 		for (size_t r=0; r<d->snap_regions[f].size(); ++r)
 		{
@@ -1075,7 +1275,7 @@ int GPU_Backend_HIP::AddFieldDFT(bool h_field, const Engine_GatherRegion& region
 	const size_t n = region.Size();
 	if ((n==0) || (count==0))
 		return -1;
-	Impl::FieldDFT dft;
+	Impl::FieldDFT dft={};
 	dft.count = count;
 	dft.currents = h_field;
 	void* lines = d->UploadRegion(region, dft.region);
@@ -1104,6 +1304,11 @@ void GPU_Backend_HIP::AccumulateFieldDFT(int id, const std::vector<std::complex<
 		const unsigned int nw = std::min(count-k0, (unsigned int)DFT_WEIGHTS);
 		for (unsigned int k=0; k<nw; ++k)
 			W.w[k] = make_float2(weights[k0+k].real(), weights[k0+k].imag());
+		if (dft.prepared)
+		{
+			HIP_Launch(d,"prepared_field_dft",prepared_field_dft,dft.n,1,1,static_cast<const float*>(dft.currents ? d->curr : d->volt),static_cast<const GPU_GatherEntry*>(dft.entries),dft.n,W,nw,dft.sums+size_t(k0)*dft.n);
+			continue;
+		}
 		HIP_Launch(d, "field_dft", field_dft, dft.region.total, 1, 1, (const float*)(dft.currents ? d->curr : d->volt),
 		            dft.region, d->dim, W, nw, dft.sums + k0*dft.region.total);
 	}
@@ -1114,8 +1319,9 @@ bool GPU_Backend_HIP::ReadFieldDFT(int id, unsigned int k, std::vector<std::comp
 	if ((id<0) || ((size_t)id>=d->field_dfts.size()) || (k>=d->field_dfts[id].count))
 		return false;
 	const Impl::FieldDFT& dft = d->field_dfts[id];
-	sums.resize(dft.region.total);
-	HIP_Check(hipMemcpyAsync(sums.data(), dft.sums + k*dft.region.total, sums.size()*sizeof(float2), hipMemcpyDeviceToHost, d->Stream()), "download");
+	const size_t count=dft.prepared ? dft.n : dft.region.total;
+	sums.resize(count);
+	HIP_Check(hipMemcpyAsync(sums.data(), dft.sums + size_t(k)*count, sums.size()*sizeof(float2), hipMemcpyDeviceToHost, d->Stream()), "download");
 	d->Flush();
 	return true;
 }
@@ -1170,6 +1376,7 @@ static const HIP_ExtensionFactory HIP_EXTENSIONS[] = {
 
 GPU_Extension* GPU_Backend_HIP::CreateExtension(Engine_Extension* eng_ext, Engine* eng)
 {
+	if (d->setup_result) GPU_CheckEngineAdapter(*eng_ext);
 	// the fused step (see update_fused) knows the UPML, the excitation, lumped RLC elements and the steady-state detection
 	if (!dynamic_cast<Engine_Ext_UPML*>(eng_ext) && !dynamic_cast<Engine_Ext_Excitation*>(eng_ext) && !dynamic_cast<Engine_Ext_LumpedRLC*>(eng_ext)
 	    && !dynamic_cast<Engine_Ext_SteadyState*>(eng_ext))
@@ -1182,6 +1389,7 @@ GPU_Extension* GPU_Backend_HIP::CreateExtension(Engine_Extension* eng_ext, Engin
 		if (gpu_ext)
 			return gpu_ext;
 	}
+	if (d->setup_result) throw std::runtime_error("HIP construction: registered extension has no matching device engine implementation");
 	d->fused_blockers++;   // host fallback
 	return NULL;
 }

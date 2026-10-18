@@ -38,6 +38,7 @@ Engine_Ext_Cylinder::Engine_Ext_Cylinder(Operator_Ext_Cylinder* op_ext) : Engine
 template <typename EngType>
 void Engine_Ext_Cylinder::DoPostVoltageUpdatesImpl(EngType* eng)
 {
+	cyl_Op->EnsureHostConstruction();
 	if (CC_closedAlpha==false) return;
 
 	if (CC_R0_included)

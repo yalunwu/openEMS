@@ -40,7 +40,7 @@ class Operator_CylinderMultiGrid;
 class Engine_GPU_CylinderMultiGrid : public Engine_GPU
 {
 public:
-	static Engine_GPU_CylinderMultiGrid* New(const Operator_CylinderMultiGrid* op, const std::string& backend, GPU_Backend* parent=NULL);
+	static Engine_GPU_CylinderMultiGrid* New(const Operator_CylinderMultiGrid* op,const std::string& backend,GPU_Backend* parent=NULL,GPU_Backend* prepared=NULL);
 	virtual ~Engine_GPU_CylinderMultiGrid();
 
 	virtual void Init();

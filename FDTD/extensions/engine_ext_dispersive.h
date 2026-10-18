@@ -35,6 +35,7 @@ public:
 	virtual void Apply2Current();
 
 protected:
+	void PrepareHost();
 	template <typename EngType>
 	void Apply2VoltagesImpl(EngType* eng);
 

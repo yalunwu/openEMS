@@ -21,6 +21,9 @@
 #include "extensions/operator_ext_cylinder.h"
 #include "tools/useful.h"
 #include "CSUseful.h"
+#include "gpu_backend.h"
+#include "gpu_setup_multigrid_plan.h"
+#include "gpu_setup_controller.h"
 #include <stdexcept>
 
 using std::cout;
@@ -65,7 +68,7 @@ Operator_CylinderMultiGrid* Operator_CylinderMultiGrid::New(
 Engine* Operator_CylinderMultiGrid::CreateEngine()
 {
 	if (!m_GPU_Backend.empty())
-		m_Engine = Engine_GPU_CylinderMultiGrid::New(this, m_GPU_Backend, m_GPU_Parent);
+		m_Engine = Engine_GPU_CylinderMultiGrid::New(this,m_GPU_Backend,m_GPU_Parent,m_GPUConstruction ? m_GPUConstruction->ReleaseBackend() : nullptr);
 	else
 		m_Engine = Engine_CylinderMultiGrid::New(this, m_orig_numThreads);
 	return m_Engine;
@@ -88,7 +91,16 @@ bool Operator_CylinderMultiGrid::SetupCSXGrid(CSRectGrid* grid)
 		throw std::runtime_error("Operator_CylinderMultiGrid::SetupCSXGrid: Error, number of lines in alpha direction must be odd... found: " + std::to_string(numLines[1]));
 
 	m_Split_Pos = 0;
-	for (unsigned int n=0; n<numLines[0]; ++n)
+	if (m_GPU_SetupMode!="cpu" && !m_GPU_Backend.empty())
+	{
+		CheckSetupCancellation();
+		if (!m_GPU_Parent) {m_GPUSetupContext.reset(GPU_Backend::New(m_GPU_Backend));m_GPU_Parent=m_GPUSetupContext.get();}
+		if (!GPU_SetupMultiGridSplit(m_GPU_Parent,discLines[0],numLines[0],m_Split_Rad,m_Split_Pos))
+			throw GPU_SetupUnavailable("backend does not support GPU multigrid planning");
+		CheckSetupCancellation();
+		if (m_Split_Pos) m_Split_Rad=discLines[0][m_Split_Pos];
+	}
+	else for (unsigned int n=0; n<numLines[0]; ++n)
 	{
 		if (m_Split_Rad < discLines[0][n])
 		{
@@ -113,6 +125,18 @@ bool Operator_CylinderMultiGrid::SetGeometryCSX(ContinuousStructure* geo)
 		return false;
 
 	CSRectGrid* grid = geo->GetGrid();
+	struct RestoreLines
+	{
+		CSRectGrid* grid;std::vector<double> lines[2];
+		explicit RestoreLines(CSRectGrid* g) : grid(g)
+		{
+			for (int n=0;n<2;++n) for (unsigned int p=0;p<grid->GetQtyLines(n);++p) lines[n].push_back(grid->GetLine(n,p));
+		}
+		~RestoreLines()
+		{
+			for (int n=0;n<2;++n) {grid->ClearLines(n);for (double line:lines[n]) grid->AddDiscLine(n,line);}
+		}
+	} restore(grid);
 
 	grid->ClearLines(0);
 	grid->ClearLines(1);
@@ -121,16 +145,11 @@ bool Operator_CylinderMultiGrid::SetGeometryCSX(ContinuousStructure* geo)
 	for (unsigned int n=0; n<numLines[1]; n+=2)
 		grid->AddDiscLine(1,discLines[1][n]);
 
+	if (m_GPU_SetupMode!="cpu" && !m_GPU_Backend.empty())
+		m_InnerOp->SetGPUBackend(m_GPU_Backend,m_GPU_Parent,m_GPU_SetupMode);
+	m_InnerOp->SetSetupCancellation(m_SetupCancelled);
 	if (m_InnerOp->SetGeometryCSX(CSX)==false)
 		return false;
-
-	//restore grid to original mesh
-	grid->ClearLines(0);
-	grid->ClearLines(1);
-	for (unsigned int n=0; n<numLines[0]; ++n)
-		grid->AddDiscLine(0,discLines[0][n]);
-	for (unsigned int n=0; n<numLines[1]; ++n)
-		grid->AddDiscLine(1,discLines[1][n]);
 
 	return true;
 }
@@ -255,29 +274,43 @@ bool Operator_CylinderMultiGrid::GetCellCenterMaterialAvgCoord(const int pos[3],
 
 int Operator_CylinderMultiGrid::CalcECOperator( DebugFlags debugFlags )
 {
+	CheckSetupCancellation();
+	m_InnerOp->SetSetupCancellation(m_SetupCancelled);
 	int retCode=0;
+	if (m_GPU_SetupMode!="cpu" && !m_GPU_Backend.empty())
+	{
+		if (!m_GPU_Parent)
+		{
+			m_GPUSetupContext.reset(GPU_Backend::New(m_GPU_Backend));m_GPU_Parent=m_GPUSetupContext.get();
+		}
+		m_InnerOp->SetGPUBackend(m_GPU_Backend,m_GPU_Parent,m_GPU_SetupMode);
+	}
 	if (dT)
 		m_InnerOp->SetTimestep(dT);
 
 	//calc inner child first
-	m_InnerOp->CalcECOperator();
+	retCode=m_InnerOp->CalcECOperator();if (retCode) return retCode;
 
 	dT = m_InnerOp->GetTimestep();
 
 	retCode = Operator_Cylinder::CalcECOperator( debugFlags );
-	if (GetTimestepValid()==false)
+	if (!GetTimestepValid() || !m_InnerOp->GetTimestepValid())
 	{
+		double limit=opt_dT;
+		if (!m_InnerOp->GetTimestepValid()) limit=limit>0 ? (std::min)(limit,m_InnerOp->opt_dT) : m_InnerOp->opt_dT;
+		if (HasDeviceConstruction()) throw GPU_SetupTimestepChange(limit);
 		cerr << "Operator_CylinderMultiGrid::CalcECOperator(): Warning, timestep invalid... resetting..." << endl;
-		dT = opt_dT;
+		dT = limit;
 		m_InnerOp->SetTimestep(dT);
-		m_InnerOp->CalcECOperator();
+		retCode=m_InnerOp->CalcECOperator();if (retCode) return retCode;
+		dT=m_InnerOp->GetTimestep();
 		retCode = Operator_Cylinder::CalcECOperator( debugFlags );
 	}
 
-	SetupInterpolation();
+	if (!HasDeviceConstruction()) SetupInterpolation();
 
 	//the data storage will only be filled up to m_Split_Pos-1, fill the remaining area here...
-	FillMissingDataStorage();
+	if (!HasDeviceConstruction()) FillMissingDataStorage();
 	return retCode;
 }
 
@@ -487,6 +520,18 @@ void Operator_CylinderMultiGrid::SetExcitationSignal(Excitation* exc)
 {
 	m_InnerOp->SetExcitationSignal(exc);
 	Operator_Cylinder::SetExcitationSignal(exc);
+}
+
+void Operator_CylinderMultiGrid::SetTimestepFactor(double factor)
+{
+	Operator_Cylinder::SetTimestepFactor(factor);m_InnerOp->SetTimestepFactor(factor);
+}
+
+void Operator_CylinderMultiGrid::ApplyTimestepSettings()
+{
+	// The child has already applied the factor and periodic adjustment. Every
+	// level must advance with that same timestep, including during rebuilds.
+	dT=m_InnerOp->GetTimestep();
 }
 
 void Operator_CylinderMultiGrid::Delete()

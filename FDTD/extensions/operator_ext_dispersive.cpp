@@ -50,8 +50,9 @@ Operator_Ext_Dispersive::~Operator_Ext_Dispersive()
 	m_curr_ADE_On=NULL;
 	m_volt_ADE_On=NULL;
 
-	for (int n=0;n<m_Order;++n)
+	for (int n=0;m_LM_pos && n<m_Order;++n)
 	{
+		if (!m_LM_pos[n]) continue;
 		delete[] m_LM_pos[n][0];
 		delete[] m_LM_pos[n][1];
 		delete[] m_LM_pos[n][2];

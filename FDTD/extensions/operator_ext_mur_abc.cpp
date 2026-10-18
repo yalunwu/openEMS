@@ -100,8 +100,6 @@ void Operator_Ext_Mur_ABC::SetDirection(int ny, bool top_ny)
 	m_numLines[0] = m_Op->GetNumberOfLines(m_nyP,true);
 	m_numLines[1] = m_Op->GetNumberOfLines(m_nyPP,true);
 
-	m_Mur_Coeff_nyP.Init("Mur_Coeff_nyP", m_numLines);
-	m_Mur_Coeff_nyPP.Init("Mur_Coeff_nyPP", m_numLines);
 }
 
 bool Operator_Ext_Mur_ABC::BuildExtension()
@@ -111,6 +109,8 @@ bool Operator_Ext_Mur_ABC::BuildExtension()
 		cerr << "Operator_Ext_Mur_ABC::BuildExtension: Warning, Extension not initialized! Use SetDirection!! Abort build!!" << endl;
 		return false;
 	}
+	m_Mur_Coeff_nyP.Init("Mur_Coeff_nyP", m_numLines);
+	m_Mur_Coeff_nyPP.Init("Mur_Coeff_nyPP", m_numLines);
 	double dT = m_Op->GetTimestep();
 	unsigned int pos[] = {0,0,0};
 	pos[m_ny] = m_LineNr;

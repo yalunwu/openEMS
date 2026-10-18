@@ -60,7 +60,7 @@ void Operator_Ext_Absorbing_BC::Initialize()
 	m_phaseVelocity = 0.0;
 }
 
-bool Operator_Ext_Absorbing_BC::SetInitParams(CSPrimitives* prim, CSPropAbsorbingBC* abc_prop)
+bool Operator_Ext_Absorbing_BC::SetInitParams(CSPrimitives* prim, CSPropAbsorbingBC* abc_prop,bool defer)
 {
 	CSPrimBox* cSheet = dynamic_cast<CSPrimBox*>(prim);
 	// If this just so happen to not be a sheet, ignore this
@@ -72,6 +72,7 @@ bool Operator_Ext_Absorbing_BC::SetInitParams(CSPrimitives* prim, CSPropAbsorbin
 	}
 
 	// Check that this is actually a sheet
+	if (defer) {m_PendingPrimitive=prim;m_PendingProperty=abc_prop;return true;}
 	// Get box start and stop positions
 
 
@@ -129,6 +130,8 @@ bool Operator_Ext_Absorbing_BC::SetInitParams(CSPrimitives* prim, CSPropAbsorbin
 	// Copy all of the relevant data, so BuildExtension ca0n work
 	m_ABCtype = (ABCtype)(abc_prop->GetAbsorbingBoundaryType());
 	m_normalSignPositive = abc_prop->GetNormalSignPositive();
+	// Retain immutable inputs so a cancelled device build can prepare again.
+	if (m_Op->GetSetupBackend()) {m_PendingPrimitive=prim;m_PendingProperty=abc_prop;}
 
 	prim->SetPrimitiveUsed(true);
 

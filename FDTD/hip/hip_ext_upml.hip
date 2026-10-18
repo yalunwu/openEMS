@@ -20,6 +20,8 @@
 #include <iostream>
 
 #include "hip_internal.h"
+#include "FDTD/gpu_setup_processing.h"
+bool HIP_SetupUPMLFusion(GPU_Backend_HIP::Impl*,const std::vector<GPU_UPMLRegion>&,const unsigned int*,unsigned int*,unsigned int*);
 #include "FDTD/engine.h"
 #include "FDTD/extensions/operator_ext_upml.h"
 #include "FDTD/extensions/engine_ext_upml.h"
@@ -77,6 +79,7 @@ __global__ void upml_fused_curr(float* curr_out, const float* curr_in, const flo
 
 class HIP_Ext_UPML : public GPU_Extension
 {
+    friend void HIP_PrepareUPMLFusion(GPU_Backend_HIP::Impl*);
 public:
 	HIP_Ext_UPML(GPU_Backend_HIP::Impl* impl, Operator_Ext_UPML* op_ext, Engine* eng);
 	virtual ~HIP_Ext_UPML();
@@ -193,6 +196,20 @@ HIP_Ext_UPML::HIP_Ext_UPML(GPU_Backend_HIP::Impl* impl, Operator_Ext_UPML* op_ex
 	const size_t cells = (size_t)m_Region.lx*m_Region.ly*m_Region.lz;
 	m_VoltFlux = d->Alloc<float>(3*cells);
 	m_CurrFlux = d->Alloc<float>(3*cells);
+	if (d->setup_result)
+	{
+		const auto prepared=d->setup_result->upml.find(op_ext);
+		if (prepared!=d->setup_result->upml.end())
+		{
+			const auto& result=*prepared->second;
+			m_VV=result.values;m_VVFO=result.values+3*cells;m_VVFN=result.values+6*cells;
+			m_II=result.values+9*cells;m_IIFO=result.values+12*cells;m_IIFN=result.values+15*cells;
+			m_CoeffMode=result.mode;m_SetIndex=result.index;m_Sets=result.palette;
+			d->upml.push_back(this);
+			std::cout << "HIP UPML construction result adopted: " << cells << " cells, mode " << m_CoeffMode << std::endl;
+			return;
+		}
+	}
 	m_VV   = Upload(op_ext->vv);
 	m_VVFO = Upload(op_ext->vvfo);
 	m_VVFN = Upload(op_ext->vvfn);
@@ -265,7 +282,7 @@ bool HIP_Ext_UPML::CanFuse()
 	}
 	const unsigned int numLines[3] = {d->dim.nx, d->dim.ny, d->dim.nz};
 	unsigned int start[3], stop[3];
-	if (!GPU_UPMLFusionBox(m_Eng, regions, numLines, start, stop))
+	if (!(d->setup_result ? GPU_SetupFusionOrder(m_Eng,regions.size()) && HIP_SetupUPMLFusion(d,regions,numLines,start,stop) : GPU_UPMLFusionBox(m_Eng, regions, numLines, start, stop)))
 		return false;
 	d->main_start.nx = start[0]; d->main_start.ny = start[1]; d->main_start.nz = start[2];
 	d->main_stop.nx = stop[0]; d->main_stop.ny = stop[1]; d->main_stop.nz = stop[2];
@@ -369,6 +386,11 @@ bool HIP_Ext_UPML::CanFuse()
 		}
 	}
 	return true;
+}
+
+void HIP_PrepareUPMLFusion(GPU_Backend_HIP::Impl* d)
+{
+	if (!d->upml.empty()) static_cast<HIP_Ext_UPML*>(d->upml.front())->Fused();
 }
 
 GPU_Extension* HIP_CreateExt_UPML(GPU_Backend_HIP::Impl* d, Engine_Extension* eng_ext, Engine* eng)

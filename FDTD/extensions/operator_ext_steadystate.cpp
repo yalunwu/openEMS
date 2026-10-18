@@ -54,6 +54,7 @@ bool Operator_Ext_SteadyState::BuildExtension()
 
 void Operator_Ext_SteadyState::Reset()
 {
+	Operator_Extension::Reset();
 	for (int n=0;n<3;++n)
 	{
 		m_E_probe_pos[n].clear();

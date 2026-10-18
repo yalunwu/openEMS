@@ -663,7 +663,17 @@ cdef class openEMS:
         see `./openEMS --help`). Examples are:
 
         * verbose (int) -- set the openEMS verbosity level 0..3
-        * numThreads (int) -- set the number of threads (default 0 --> max)
+        * numThreads (int) -- set CPU threads, including GPU operator setup
+          (0: automatic, 1: serial; capped by available CPUs and mesh lines)
+        * gpu_setup (str) -- CPU construction ('cpu', default), automatic HIP
+          construction with CPU fallback ('auto'), or required HIP core and
+          extension construction ('gpu'), including cylindrical/multigrid meshes.
+          Constant inputs, default PML and built-in waveforms use stock
+          CSXCAD/fparser. Probe snapping, dump mesh selection, constant-function
+          mode matching and SAR sampling use HIP. Spatial/file inputs, polyhedra,
+          UserDefined geometry, custom waveforms and custom PML require CPU
+          construction. Host consumers materialize requested data. See the
+          README and GPU_SETUP_STATUS.md for coverage and validation limits.
         * disable_dumps (bool) -- disable all field dumps for faster simulation
         * debug_material (bool) - dump material distribution to a vtk file for
           debugging.
@@ -703,6 +713,11 @@ cdef class openEMS:
             self.thisptr.RunFDTD()
 
     def SetAbort(self, val):
+        """Request cancellation during setup or stepping; clear before reuse.
+
+        GPU setup checks cancellation between device phases and releases partial
+        results before raising an error.
+        """
         self.thisptr.SetAbort(val)
 
     def Write2XML(self, file):

@@ -25,6 +25,7 @@
 //! Abstract base class for all dispersive material models, based on an ADE (additional differential equation)
 class Operator_Ext_Dispersive : public Operator_Extension
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine_Ext_Dispersive;
 	friend class HIP_Ext_LorentzMaterial;
 	friend class Metal_Ext_LorentzMaterial;

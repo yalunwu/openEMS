@@ -23,8 +23,8 @@
 #include "operator.h"
 
 Field_Gather_FDTD::Field_Gather_FDTD(const Engine_Interface_FDTD* eng_if, const Operator* op,
-                                     const ArrayLib::ArrayNIJK<FDTD_FLOAT>* volt, const ArrayLib::ArrayNIJK<FDTD_FLOAT>* curr,
-                                     bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3])
+									 const ArrayLib::ArrayNIJK<FDTD_FLOAT>* volt, const ArrayLib::ArrayNIJK<FDTD_FLOAT>* curr,
+									 bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3])
 	: m_EngIf(eng_if), m_Op(op), m_Volt(volt), m_Curr(curr), m_H(h_field), m_RegionSnapshot(false), m_Offset(0)
 {
 	for (int n=0; n<3; ++n)
@@ -117,4 +117,36 @@ void Field_Gather_FDTD::EvaluateSums(const std::complex<float>* raw_sums, ArrayL
 				for (int n=0; n<3; ++n)
 					field(n, i, j, k) = out[n];
 			}
+}
+
+
+void Prepared_Field_Gather_FDTD::Evaluate(size_t first,size_t last,ArrayLib::ArrayNIJK<float>& field,const float* src) const
+{
+	if (!(src && m_Snapshot)) EnsureHost();
+	const float* values=src && m_Snapshot ? src+m_Offset : (src ? src : (m_H ? m_Curr->data() : m_Volt->data()));
+	for (size_t l=first;l<last;++l) for (unsigned int k=0;k<m_nk;++k) for (int n=0;n<3;++n)
+	{
+		const size_t index=(l*m_nk+k)*3+n;
+		double value=0;
+		if (src && m_Snapshot) value=values[index];
+		else
+		{
+			const auto& e=entries[index];
+			auto raw=[&](unsigned int q){return e.delta[q] ? double(values[e.idx[q]])/e.delta[q] : 0.0;};
+			switch (e.form)
+			{
+			case Engine_GatherEntry::RAW:value=raw(0);break;
+			case Engine_GatherEntry::LERP:value=raw(0)*(1.0-e.rel)+raw(1)*e.rel;break;
+			case Engine_GatherEntry::AVG4:value=raw(0);value+=raw(1);value+=raw(2);value+=raw(3);value/=4;break;
+			default:break;
+			}
+		}
+		field(n,l/m_nj,l%m_nj,k)=float(value);
+	}
+}
+
+void Prepared_Field_Gather_FDTD::EvaluateSums(const std::complex<float>* sums,ArrayLib::ArrayNIJK<std::complex<float>>& field) const
+{
+	const size_t nodes=prepared->Count()/3;
+	for (size_t i=0;i<nodes;++i) for (int n=0;n<3;++n) field.data()[n*nodes+i]=sums[i*3+n];
 }

@@ -29,13 +29,16 @@
 #endif
 #include <boost/algorithm/string.hpp>
 #include <iostream>
+#include <stdexcept>
 
 unsigned int CalcNyquistNum(double fmax, double dT)
 {
+	if (!std::isfinite(fmax) || fmax<0 || !std::isfinite(dT) || dT<0)
+		throw std::invalid_argument("Nyquist frequency and timestep must be finite and nonnegative");
 	if (fmax==0) return UINT_MAX;
 	if (dT==0) return 1;
-	double T0 = 1/fmax;
-	return floor(T0/2/dT);
+	const double interval=floor(0.5/fmax/dT);
+	return interval>=UINT_MAX ? UINT_MAX : static_cast<unsigned int>(interval);
 }
 
 double CalcNyquistFrequency(unsigned int nyquist, double dT)

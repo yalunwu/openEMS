@@ -45,8 +45,11 @@ public:
 	  also called by the GPU engines, which record the probes on the device.
 	  */
 	void CheckPeriod(unsigned int rel_pos, const std::function<double(size_t, unsigned int)>& record);
+	//! Combine a device/host period reduction with the shared energy stopping criterion.
+	void SetPeriodDifference(double difference, bool valid);
 
 protected:
+	void PrepareHost();
 	Operator_Ext_SteadyState* m_Op_SS;
 	double m_last_max_diff;
 	std::vector<double*> m_E_records;

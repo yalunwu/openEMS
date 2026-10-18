@@ -54,55 +54,19 @@ Operator_Ext_LorentzMaterial::Operator_Ext_LorentzMaterial(Operator* op, Operato
 
 Operator_Ext_LorentzMaterial::~Operator_Ext_LorentzMaterial()
 {
-	if ((m_curr_Lor_ADE_On==NULL) || (m_volt_Lor_ADE_On==NULL)) // all data already cleaned up or never used
-		return;
-	for (int i=0;i<m_Order;++i)
+	FDTD_FLOAT**** arrays[6]={&v_int_ADE,&v_ext_ADE,&i_int_ADE,&i_ext_ADE,&v_Lor_ADE,&i_Lor_ADE};
+	for (auto array:arrays)
 	{
-		for (int n=0; n<3; ++n)
-		{
-			if (m_volt_ADE_On[i])
-			{
-				delete[] v_int_ADE[i][n];
-				delete[] v_ext_ADE[i][n];
-			}
-			if (m_curr_ADE_On[i])
-			{
-				delete[] i_int_ADE[i][n];
-				delete[] i_ext_ADE[i][n];
-			}
-			if (m_volt_Lor_ADE_On[i])
-				delete[] v_Lor_ADE[i][n];
-			if (m_curr_Lor_ADE_On[i])
-				delete[] i_Lor_ADE[i][n];
-		}
-		if (m_volt_ADE_On[i])
-		{
-			delete[] v_int_ADE[i];
-			delete[] v_ext_ADE[i];
-		}
-		if (m_curr_ADE_On[i])
-		{
-			delete[] i_int_ADE[i];
-			delete[] i_ext_ADE[i];
-		}
-		if (m_volt_Lor_ADE_On[i])
-			delete[] v_Lor_ADE[i];
-		if (m_curr_Lor_ADE_On[i])
-			delete[] i_Lor_ADE[i];
+		if (*array)
+			for (int i=0;i<m_Order;++i)
+				if ((*array)[i])
+				{
+					for (int n=0;n<3;++n) delete[] (*array)[i][n];
+					delete[] (*array)[i];
+				}
+		delete[] *array;
+		*array=NULL;
 	}
-	delete[] v_int_ADE;
-	delete[] v_ext_ADE;
-	delete[] i_int_ADE;
-	delete[] i_ext_ADE;
-	v_int_ADE = NULL;
-	v_ext_ADE = NULL;
-	i_int_ADE = NULL;
-	i_ext_ADE = NULL;
-
-	delete[] v_Lor_ADE;
-	delete[] i_Lor_ADE;
-	v_Lor_ADE = NULL;
-	i_Lor_ADE = NULL;
 
 	delete[] m_curr_Lor_ADE_On;
 	delete[] m_volt_Lor_ADE_On;
@@ -152,20 +116,20 @@ bool Operator_Ext_LorentzMaterial::BuildExtension()
 		if (LorMat->GetDispersionOrder()>m_Order)
 			m_Order=LorMat->GetDispersionOrder();
 	}
-	m_LM_pos = new unsigned int**[m_Order];
+	m_LM_pos = new unsigned int**[m_Order]();
 
-	m_volt_ADE_On = new bool[m_Order];
-	m_curr_ADE_On = new bool[m_Order];
-	m_volt_Lor_ADE_On = new bool[m_Order];
-	m_curr_Lor_ADE_On = new bool[m_Order];
+	m_volt_ADE_On = new bool[m_Order]();
+	m_curr_ADE_On = new bool[m_Order]();
+	m_volt_Lor_ADE_On = new bool[m_Order]();
+	m_curr_Lor_ADE_On = new bool[m_Order]();
 
-	v_int_ADE = new FDTD_FLOAT**[m_Order];
-	v_ext_ADE = new FDTD_FLOAT**[m_Order];
-	i_int_ADE = new FDTD_FLOAT**[m_Order];
-	i_ext_ADE = new FDTD_FLOAT**[m_Order];
+	v_int_ADE = new FDTD_FLOAT**[m_Order]();
+	v_ext_ADE = new FDTD_FLOAT**[m_Order]();
+	i_int_ADE = new FDTD_FLOAT**[m_Order]();
+	i_ext_ADE = new FDTD_FLOAT**[m_Order]();
 
-	v_Lor_ADE = new FDTD_FLOAT**[m_Order];
-	i_Lor_ADE = new FDTD_FLOAT**[m_Order];
+	v_Lor_ADE = new FDTD_FLOAT**[m_Order]();
+	i_Lor_ADE = new FDTD_FLOAT**[m_Order]();
 
 	for (int order=0;order<m_Order;++order)
 	{
@@ -327,12 +291,12 @@ bool Operator_Ext_LorentzMaterial::BuildExtension()
 		//copy all vectors into the array's
 		m_LM_Count.push_back(v_pos[0].size());
 
-		m_LM_pos[order] = new unsigned int*[3];
+		m_LM_pos[order] = new unsigned int*[3]();
 
 		if (m_volt_ADE_On[order])
 		{
-			v_int_ADE[order] = new FDTD_FLOAT*[3];
-			v_ext_ADE[order] = new FDTD_FLOAT*[3];
+			v_int_ADE[order] = new FDTD_FLOAT*[3]();
+			v_ext_ADE[order] = new FDTD_FLOAT*[3]();
 		}
 		else
 		{
@@ -342,8 +306,8 @@ bool Operator_Ext_LorentzMaterial::BuildExtension()
 
 		if (m_curr_ADE_On[order])
 		{
-			i_int_ADE[order] = new FDTD_FLOAT*[3];
-			i_ext_ADE[order] = new FDTD_FLOAT*[3];
+			i_int_ADE[order] = new FDTD_FLOAT*[3]();
+			i_ext_ADE[order] = new FDTD_FLOAT*[3]();
 		}
 		else
 		{
@@ -352,12 +316,12 @@ bool Operator_Ext_LorentzMaterial::BuildExtension()
 		}
 
 		if (m_volt_Lor_ADE_On[order])
-			v_Lor_ADE[order] = new FDTD_FLOAT*[3];
+			v_Lor_ADE[order] = new FDTD_FLOAT*[3]();
 		else
 			v_Lor_ADE[order] = NULL;
 
 		if (m_curr_Lor_ADE_On[order])
-			i_Lor_ADE[order] = new FDTD_FLOAT*[3];
+			i_Lor_ADE[order] = new FDTD_FLOAT*[3]();
 		else
 			i_Lor_ADE[order] = NULL;
 

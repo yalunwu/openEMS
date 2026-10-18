@@ -33,6 +33,7 @@ class FunctionParser;
   */
 class Operator_Ext_UPML : public Operator_Extension
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine_Ext_UPML;
 	friend class HIP_Ext_UPML;
 	friend class Metal_Ext_UPML;
@@ -64,6 +65,7 @@ public:
 		An empty function string will be ignored.
 	*/
 	virtual bool SetGradingFunction(std::string func);
+	const std::string& GetGradingFunction() const {return m_GradFunc;}
 
 	virtual bool BuildExtension();
 

@@ -17,8 +17,10 @@
 */
 
 #include "processmodematch.h"
+#include "FDTD/gpu_setup_processing.h"
 #include "CSFunctionParser.h"
 #include "Common/operator_base.h"
+#include <stdexcept>
 
 using namespace std;
 
@@ -85,7 +87,7 @@ void ProcessModeMatch::InitProcess()
 	bool dualMesh = m_ModeFieldType==1;
 	int Dump_Dim=0;
 	m_ny = -1;
-	for (int n=0; n<3; ++n)
+	if (!GPU_SetupProcessingIndices(Op,true,dualMesh,nullptr,nullptr,start,stop,m_ny,Dump_Dim)) for (int n=0; n<3; ++n)
 	{
 		if (start[n]>stop[n])
 		{
@@ -123,6 +125,18 @@ void ProcessModeMatch::InitProcess()
 	int nPP = (m_ny+2)%3;
 	m_numLines[0] = stop[nP] - start[nP] + 1;
 	m_numLines[1] = stop[nPP] - start[nPP] + 1;
+	m_PreparedMode.reset();m_ModeDist.Reset();
+	Engine_ModeTableInput device_input={};device_input.normal=m_ny;device_input.magnetic=dualMesh;
+	for (int n=0;n<3;++n)
+	{
+		device_input.start[n]=start[n];device_input.stop[n]=stop[n];device_input.origin[n]=m_WeightOrigin[n];device_input.functions[n]=m_WeightFunction[n];
+	}
+	device_input.file=m_WeightFile;m_PreparedMode=m_Eng_Interface->BuildModeMatch(device_input);
+	if (m_PreparedMode)
+	{
+		if (m_PreparedMode->Count()!=2ull*m_numLines[0]*m_numLines[1]) throw std::logic_error("prepared mode table dimensions differ");
+		ProcessIntegral::InitProcess();return;
+	}
 
 	// Check that this isn't a custom mode, before running this test
 	if (m_WeightFile.empty())
@@ -236,6 +250,7 @@ void ProcessModeMatch::InitProcess()
 
 void ProcessModeMatch::Reset()
 {
+	m_PreparedMode.reset();
 	ProcessIntegral::Reset();
 	m_ModeDist.Reset();
 }
@@ -257,6 +272,10 @@ void ProcessModeMatch::SetFieldType(int type)
 
 double* ProcessModeMatch::CalcMultipleIntegrals()
 {
+	if (m_PreparedMode && !m_ModeDist.valid())
+	{
+		m_ModeDist.Init("ModeDist",{2,m_numLines[0],m_numLines[1]});m_PreparedMode->Read(m_ModeDist.data(),m_ModeDist.size());
+	}
 	double value = 0;
 	double field = 0;
 	double purity = 0;

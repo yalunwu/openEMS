@@ -45,6 +45,9 @@ public:
 	virtual std::string GetName() const;
 
 	virtual bool Init(const Operator* op);
+	virtual GPU_OperatorSetup* NewOperatorSetup(const GPU_SetupModel& model, std::string& reason);
+	virtual bool SetSetupResult(std::shared_ptr<GPU_SetupResult> result);
+	virtual bool BuildExcitationSignal(Excitation& excitation, unsigned int maxTS);
 
 	virtual void UpdateVoltages();
 	virtual void UpdateCurrents();
@@ -61,6 +64,14 @@ public:
 	virtual bool CanSnapshotGather() const {return true;}
 	virtual bool SetSnapshotGather(const std::vector<Engine_GatherRegion>& volt_regions, const std::vector<Engine_GatherRegion>& curr_regions);
 	virtual int AddFieldDFT(bool h_field, const Engine_GatherRegion& region, unsigned int count);
+	bool HasDeviceConstruction() const override;
+	std::shared_ptr<Engine_SetupTable> BuildModeMatch(const Operator* op,const Engine_ModeTableInput& input) override;
+	std::shared_ptr<Engine_CellMaterialTable> BuildCellMaterials(const unsigned int lines[3],unsigned int* const positions[3],const std::shared_ptr<Engine_SamplingMesh>& mesh={}) override;
+	std::shared_ptr<GPU_FieldGather> BuildFieldGather(const Operator* op,unsigned int interpolation,bool h_field,
+	                    const unsigned int lines[3],unsigned int* const positions[3],const std::shared_ptr<Engine_SamplingMesh>& mesh={}) override;
+	bool SetPreparedSnapshotGather(const std::vector<std::shared_ptr<GPU_FieldGather>>& volt,
+	                              const std::vector<std::shared_ptr<GPU_FieldGather>>& curr) override;
+	int AddPreparedFieldDFT(const std::shared_ptr<GPU_FieldGather>& gather,bool currents,unsigned int count) override;
 	virtual void AccumulateFieldDFT(int id, const std::vector<std::complex<float>>& weights);
 	virtual bool ReadFieldDFT(int id, unsigned int k, std::vector<std::complex<float>>& sums);
 	virtual bool CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy);

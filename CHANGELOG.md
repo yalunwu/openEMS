@@ -15,6 +15,31 @@ there are unreleased changes. It becomes the next release entry.
 
 ### Added
 
+- Multiple TFSF plane-wave sources use independent operator/engine tables and
+  superpose in registration order on CPU, reference, HIP and Metal engines.
+  Per-source delays and enabled states apply to each source.
+
+- Optional HIP operator construction: `--gpu-setup=cpu|auto|gpu` (Python
+  `gpu_setup`) supports Cartesian, cylindrical and nested multigrid meshes with
+  stock CSXCAD/fparser and constant material/source/dispersion inputs. Geometry
+  includes Box, Sphere, Cylinder, LinPoly, Polygon, MultiBox, RotPoly,
+  SphericalShell, CylindricalShell, Wire, Point and metal/excitation Curve paths.
+  Materials, timestep, coefficients, built-in waveforms, default UPML and
+  extension tables are constructed on HIP and adopted directly by the engine.
+  Sampling maps, E/H DFT histories, constant-function mode matching and SAR
+  material/E-field samples use HIP. Host callers materialize requested data.
+  Coordinate-independent expressions are folded with the stock host parser;
+  custom C++ types require explicit adapters and matching engine extensions.
+  Spatial weights, UserDefined geometry, polyhedra, discrete materials,
+  file-weighted sources, spatial/file-based mode matching, custom waveforms and
+  custom PML grading require CPU construction. CPU construction remains the
+  default. Unsupported inputs and preparation/resource failures in `auto`
+  rebuild a fresh CPU operator while retaining HIP stepping; strict `gpu`
+  reports an error. The environment variable
+  `OPENEMS_GPU_SETUP_MEMORY_LIMIT` caps the construction budget in bytes.
+  Diagnostics report transfers and allocation peaks. Setup cancellation rolls
+  back partial results and permits reuse after clearing the abort flag.
+
 - **A GPU engine**, `--engine=gpu` (`engine='gpu'` from Python), with a Metal
   backend on macOS and a HIP backend for AMD (ROCm) and NVIDIA (CUDA) GPUs. It
   is selected like the other engines, runs Cartesian and cylindrical meshes
@@ -22,9 +47,44 @@ there are unreleased changes. It becomes the next release entry.
   the same probes and dumps. Without a usable GPU the setup fails with an
   error instead of running something slower. `--engine=gpu-reference` runs it
   on a CPU reference backend, to check the device backends against.
+
 - `python -m openEMS.compare <sim_path_a> <sim_path_b>` compares the probes
   and field dumps of two runs, e.g. of two engines, and
   `openEMS.compare.compare_sim_results()` does the same from Python.
+
+- `openEMS.compare.compare_sim_metrics()` and `--l2-rtol` add a per-file
+  relative-L2 comparison alongside peak error. Verbose solver output reports
+  operator/backend setup phases and output finalization; opt-in
+  `OPENEMS_GPU_DIAGNOSTICS=1` reports GPU batch and HIP transfer/wait counts.
+
+### Changed
+
+- The Python bindings need Python 3.6 or newer (was 3.4), the oldest version
+  CI still tests; CentOS 7 and Ubuntu 14.04 are no longer tested.
+
+- Time-domain HDF5 field dumps are written in the background instead of
+  stalling the timestepping, with the file kept open for the whole run; with
+  the GPU engine from snapshots of the fields.
+
+- Field dumps are evaluated on several threads, with every engine; large
+  dumps, like the surfaces of an NF2FF box, slow the simulation down less.
+
+- The end criteria is checked every Nyquist period during the first minute of
+  a simulation, and only after that with the progress report every few
+  seconds. A short simulation used to run on until the first report, on a fast
+  machine several times longer than necessary, with correspondingly larger
+  dumps; it now stops where the end criteria is met, at the same timestep on
+  every machine. `--exact-endcriteria` keeps this for the whole run.
+
+- The memory of the operator and the engine is freed at the end of the
+  simulation, not when the `openEMS` object is destroyed. A post-processing in
+  the same script (NF2FF, SAR) has it available, and running one `openEMS`
+  object several times no longer keeps the memory of every run.
+
+- Reading a time-domain field dump with many timesteps is much faster: its
+  datasets are listed once instead of looked up one by one, which took
+  quadratic time. A far-field (NF2FF) calculation from a recording of 3200
+  timesteps went from 79 s to 2.4 s per frequency.
 
 ### Fixed
 
@@ -32,18 +92,23 @@ there are unreleased changes. It becomes the next release entry.
   Python, numpy computations after `Run()` lost their denormal (subnormal)
   values, and the results of a following run with the basic engine depended
   on it. Every engine now flushes denormals to zero during the run only.
+
 - Python: an option passed as `False` to `Run()`, e.g. `debug_PEC=False`, made
   openEMS ignore all options after it without a message, so that for example
   a following `engine=...` or `numThreads=...` had no effect.
+
 - A node-interpolated B-field dump of a closed cylindrical mesh was zero on
   its first alpha line: the B field was not evaluated across the seam of the
   mesh as the H field is.
+
 - A simulation that was aborted (`SetAbort()`, an `ABORT` file, Ctrl-C) no
   longer ends with the warning that the max. number of timesteps was reached;
   it reports the abort.
+
 - An error during the setup or the run of a simulation, e.g. running out of
   memory, no longer terminates the process: openEMS ends with an error message,
   Python raises a `RuntimeError`, and Ctrl-C works again afterwards.
+
 - A simulation with more than about 1.4 billion mesh nodes no longer
   overflows the size of its field and coefficient arrays, which corrupted
   memory without a message. The operator statistics show the right memory
@@ -51,32 +116,37 @@ there are unreleased changes. It becomes the next release entry.
   domain and SAR dumps, the SAR calculation, VTK field dumps and the node
   counts of materials, excitations and lumped elements no longer wrap around
   at 2 to 4 billion nodes.
+
 - A SAR dump kept a second, unused copy of its frequency domain fields:
   24 bytes per dumped cell and frequency less memory now.
 
-### Changed
+- Direct C++ operator construction initializes boundary widths to zero.
+  Uninitialized widths could suppress conducting-sheet cells.
 
-- The Python bindings need Python 3.6 or newer (was 3.4), the oldest version
-  CI still tests; CentOS 7 and Ubuntu 14.04 are no longer tested.
-- Time-domain HDF5 field dumps are written in the background instead of
-  stalling the timestepping, with the file kept open for the whole run; with
-  the GPU engine from snapshots of the fields.
-- Field dumps are evaluated on several threads, with every engine; large
-  dumps, like the surfaces of an NF2FF box, slow the simulation down less.
-- The end criteria is checked every Nyquist period during the first minute of
-  a simulation, and only after that with the progress report every few
-  seconds. A short simulation used to run on until the first report, on a fast
-  machine several times longer than necessary, with correspondingly larger
-  dumps; it now stops where the end criteria is met, at the same timestep on
-  every machine. `--exact-endcriteria` keeps this for the whole run.
-- The memory of the operator and the engine is freed at the end of the
-  simulation, not when the `openEMS` object is destroyed. A post-processing in
-  the same script (NF2FF, SAR) has it available, and running one `openEMS`
-  object several times no longer keeps the memory of every run.
-- Reading a time-domain field dump with many timesteps is much faster: its
-  datasets are listed once instead of looked up one by one, which took
-  quadratic time. A far-field (NF2FF) calculation from a recording of 3200
-  timesteps went from 79 s to 2.4 s per frequency.
+- Cylindrical multigrid preserves the caller's mesh and shares timestep factors
+  and periodic adjustment across all levels; invalid child timesteps propagate.
+
+- E/H dumps no longer request unused electric/magnetic material storage.
+
+- Concurrent CPU dump workers materialize each device sampling table once.
+
+- Curve excitation visits every primitive in a property and ignores disabled
+  sources. A path direction could previously overwrite the primitive loop index.
+
+- GPU operator setup honors `numThreads`, including serial construction with
+  `1`, and propagates worker errors after joining all workers.
+
+- Simulation comparison rejects non-finite values, extra outputs and changed
+  HDF5 sampling metadata or meshes, including group-level frequency and mesh
+  attributes. VTR comparisons check coordinates and reject non-finite fields;
+  missing VTK support reports an incomparable dump instead of silently skipping
+  it. NF2FF radiated power and directivity attributes are compared numerically.
+
+- Failed operator construction stops setup; setup exceptions release partial
+  simulation state and restore interrupt handling. Python translates setup
+  exceptions, and the CLI reports them with a nonzero exit code. Failed GPU
+  engine initialization releases the engine and backend before propagating errors.
+  Dispersive and RLC cleanup also handles partially allocated extension tables.
 
 ### Build
 

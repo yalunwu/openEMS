@@ -28,14 +28,20 @@ Engine_Ext_UPML::Engine_Ext_UPML(Operator_Ext_UPML* op_ext) : Engine_Extension(o
 	//this ABC extension should be executed first!
 	m_Priority = ENG_EXT_PRIO_UPML;
 
-	volt_flux.Init("volt_flux", m_Op_UPML->m_numLines);
-	curr_flux.Init("curr_flux", m_Op_UPML->m_numLines);
+	if (!m_Op_UPML->HasDeviceConstruction()) EnsureHostState();
 
 	SetNumberOfThreads(1);
 }
 
 Engine_Ext_UPML::~Engine_Ext_UPML()
 {
+}
+
+void Engine_Ext_UPML::EnsureHostState()
+{
+	m_Op_UPML->EnsureHostConstruction();
+	if (!volt_flux.valid()) volt_flux.Init("volt_flux",m_Op_UPML->m_numLines);
+	if (!curr_flux.valid()) curr_flux.Init("curr_flux",m_Op_UPML->m_numLines);
 }
 
 void Engine_Ext_UPML::SetNumberOfThreads(int nrThread)
@@ -94,6 +100,7 @@ void Engine_Ext_UPML::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPreVoltageUpdates(int threadID)
 {
+	if (!volt_flux.valid()) EnsureHostState();
 	ENG_DISPATCH_ARGS(DoPreVoltageUpdatesImpl, threadID);
 }
 
@@ -138,6 +145,7 @@ void Engine_Ext_UPML::DoPostVoltageUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPostVoltageUpdates(int threadID)
 {
+	if (!volt_flux.valid()) EnsureHostState();
 	ENG_DISPATCH_ARGS(DoPostVoltageUpdatesImpl, threadID);
 }
 
@@ -186,6 +194,7 @@ void Engine_Ext_UPML::DoPreCurrentUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPreCurrentUpdates(int threadID)
 {
+	if (!curr_flux.valid()) EnsureHostState();
 	ENG_DISPATCH_ARGS(DoPreCurrentUpdatesImpl, threadID);
 }
 
@@ -230,5 +239,6 @@ void Engine_Ext_UPML::DoPostCurrentUpdatesImpl(EngType* eng, int threadID)
 
 void Engine_Ext_UPML::DoPostCurrentUpdates(int threadID)
 {
+	if (!curr_flux.valid()) EnsureHostState();
 	ENG_DISPATCH_ARGS(DoPostCurrentUpdatesImpl, threadID);
 }

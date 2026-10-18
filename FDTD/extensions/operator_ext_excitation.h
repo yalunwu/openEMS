@@ -25,6 +25,7 @@ class Excitation;
 
 class Operator_Ext_Excitation : public Operator_Extension
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine_Ext_Excitation;
 	friend class Engine_Ext_Mur_ABC;
 	friend class Operator;
@@ -59,11 +60,13 @@ public:
 
 	size_t GetCurrCount() const {return Curr_Count;}
 	size_t GetCurrCount(int ny) const {return Curr_Count_Dir[ny];}
+	int GetBoundaryDelay(unsigned int normal,unsigned int line) const;
 
 protected:
 	Operator_Ext_Excitation(Operator* op, Operator_Ext_Excitation* op_ext);
 
 	Excitation* m_Exc;
+	std::function<int(unsigned int,unsigned int)> m_BoundaryDelay;
 
 	void setupVoltageExcitation(
 		std::vector<unsigned int> const volt_vIndex[3],

@@ -20,6 +20,8 @@
 #include "engine_gpu.h"
 #include "Common/processfields.h"
 #include "operator_cylinder.h"
+#include "gpu_setup_processing.h"
+#include "gpu_setup_controller.h"
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_cylinder.h"
 #include "tools/useful.h"
@@ -42,6 +44,7 @@ Operator_Cylinder::Operator_Cylinder() : Operator_Multithread()
 	m_MeshType = CYLINDRICAL;
 	m_Cyl_Ext = NULL;
 	m_GPU_Parent = NULL;
+	m_GPU_SetupMode="cpu";
 }
 
 Operator_Cylinder::~Operator_Cylinder()
@@ -53,7 +56,7 @@ Engine* Operator_Cylinder::CreateEngine()
 {
 	if (!m_GPU_Backend.empty())
 	{
-		m_Engine = Engine_GPU::New(this, m_GPU_Backend, m_GPU_Parent);
+		m_Engine = Engine_GPU::New(this,m_GPU_Backend,m_GPU_Parent,m_GPUConstruction ? m_GPUConstruction->ReleaseBackend() : nullptr);
 		return m_Engine;
 	}
 	//! create a special cylindrical-engine
@@ -96,13 +99,16 @@ double Operator_Cylinder::GetMaterial(
 
 int Operator_Cylinder::CalcECOperator( DebugFlags debugFlags )
 {
+	if (m_GPUConstruction && m_GPU_SetupMode!="cpu" && (debugFlags&debugMaterial)) for (int k=0;k<4;++k) SetMaterialStoreFlags(k,true);
 	// debugs only work with the native vector dumps
 	bool natDump = g_settings.NativeFieldDumps();
 	g_settings.SetNativeFieldDumps(true);
-	int rc = Operator_Multithread::CalcECOperator(debugFlags);
-	// reset original settings
-	g_settings.SetNativeFieldDumps(natDump);
-	return rc;
+	try
+	{
+		const int rc=m_GPUConstruction ? m_GPUConstruction->Build(m_GPU_Backend,m_GPU_SetupMode,m_GPU_Parent,[this,debugFlags]() {return Operator::CalcECOperator(debugFlags);}) : Operator_Multithread::CalcECOperator(debugFlags);
+		g_settings.SetNativeFieldDumps(natDump);return rc;
+	}
+	catch (...) {g_settings.SetNativeFieldDumps(natDump);throw;}
 }
 
 double Operator_Cylinder::CalcTimestep()
@@ -111,8 +117,39 @@ double Operator_Cylinder::CalcTimestep()
 		// use conservative timestep for a mesh including the r==0 singularity
 		m_TimeStepVar = 1;
 
-	return Operator::CalcTimestep();
+	return GetSetupBackend() ? m_GPUConstruction->CalcTimestep() : Operator::CalcTimestep();
 }
+
+void Operator_Cylinder::SetGPUBackend(const std::string& backend,GPU_Backend* parent,const std::string& setup)
+{
+	if (!setup.empty() && setup!="cpu" && setup!="auto" && setup!="gpu") throw std::invalid_argument("gpu-setup must be cpu, auto or gpu");
+	m_GPU_Backend=backend;m_GPU_Parent=parent;
+	if (!setup.empty()) m_GPU_SetupMode=setup;
+	if (m_GPU_SetupMode!="cpu" && !m_GPUConstruction) m_GPUConstruction.reset(new GPU_SetupController(*this));
+}
+
+GPU_OperatorSetup* Operator_Cylinder::GetSetupBackend() const {return m_GPUConstruction ? m_GPUConstruction->Setup() : nullptr;}
+GPU_SetupController* Operator_Cylinder::GetConstruction() const {return HasDeviceConstruction() ? m_GPUConstruction.get() : nullptr;}
+bool Operator_Cylinder::HasDeviceConstruction() const {return m_GPUConstruction && m_GPUConstruction->HasDeviceResult();}
+void Operator_Cylinder::MaterializeMultiGrid(GPU_MultiGridInterpolation& output) const {if (!m_GPUConstruction) throw std::logic_error("multigrid construction result is missing");m_GPUConstruction->MaterializeMultiGrid(output);}
+bool Operator_Cylinder::BuildExcitationSignal(unsigned int maxTS) {return m_GPUConstruction ? m_GPUConstruction->BuildExcitationSignal(maxTS) : Operator::BuildExcitationSignal(maxTS);}
+void Operator_Cylinder::Init_EC() {if (GetSetupBackend()) m_GPUConstruction->InitEC();else Operator_Multithread::Init_EC();}
+void Operator_Cylinder::InitOperator() {if (GetSetupBackend()) m_GPUConstruction->InitOperator();else Operator_Multithread::InitOperator();}
+bool Operator_Cylinder::Calc_EC() {return GetSetupBackend() ? m_GPUConstruction->CalcEC() : Operator_Multithread::Calc_EC();}
+bool Operator_Cylinder::CalcPEC() {return GetSetupBackend() ? m_GPUConstruction->CalcPEC() : Operator_Multithread::CalcPEC();}
+void Operator_Cylinder::CalcCoefficients() {if (GetSetupBackend()) m_GPUConstruction->CalcCoefficients();else Operator_Multithread::CalcCoefficients();}
+void Operator_Cylinder::ApplyElectricBC(bool* dirs) {if (!GetSetupBackend()) Operator_Multithread::ApplyElectricBC(dirs);}
+FDTD_FLOAT Operator_Cylinder::GetVV(unsigned int n,unsigned int x,unsigned int y,unsigned int z) const {return m_GPUConstruction && m_GPUConstruction->HasDeviceResult() ? m_GPUConstruction->Coefficient(0,n,x,y,z) : Operator_Multithread::GetVV(n,x,y,z);}
+FDTD_FLOAT Operator_Cylinder::GetVI(unsigned int n,unsigned int x,unsigned int y,unsigned int z) const {return m_GPUConstruction && m_GPUConstruction->HasDeviceResult() ? m_GPUConstruction->Coefficient(1,n,x,y,z) : Operator_Multithread::GetVI(n,x,y,z);}
+FDTD_FLOAT Operator_Cylinder::GetII(unsigned int n,unsigned int x,unsigned int y,unsigned int z) const {return m_GPUConstruction && m_GPUConstruction->HasDeviceResult() ? m_GPUConstruction->Coefficient(2,n,x,y,z) : Operator_Multithread::GetII(n,x,y,z);}
+FDTD_FLOAT Operator_Cylinder::GetIV(unsigned int n,unsigned int x,unsigned int y,unsigned int z) const {return m_GPUConstruction && m_GPUConstruction->HasDeviceResult() ? m_GPUConstruction->Coefficient(3,n,x,y,z) : Operator_Multithread::GetIV(n,x,y,z);}
+void Operator_Cylinder::SetVV(unsigned int n,unsigned int x,unsigned int y,unsigned int z,FDTD_FLOAT value) {if (HasDeviceConstruction()) m_GPUConstruction->SetCoefficient(0,n,x,y,z,value);else Operator_Multithread::SetVV(n,x,y,z,value);}
+void Operator_Cylinder::SetVI(unsigned int n,unsigned int x,unsigned int y,unsigned int z,FDTD_FLOAT value) {if (HasDeviceConstruction()) m_GPUConstruction->SetCoefficient(1,n,x,y,z,value);else Operator_Multithread::SetVI(n,x,y,z,value);}
+void Operator_Cylinder::SetII(unsigned int n,unsigned int x,unsigned int y,unsigned int z,FDTD_FLOAT value) {if (HasDeviceConstruction()) m_GPUConstruction->SetCoefficient(2,n,x,y,z,value);else Operator_Multithread::SetII(n,x,y,z,value);}
+void Operator_Cylinder::SetIV(unsigned int n,unsigned int x,unsigned int y,unsigned int z,FDTD_FLOAT value) {if (HasDeviceConstruction()) m_GPUConstruction->SetCoefficient(3,n,x,y,z,value);else Operator_Multithread::SetIV(n,x,y,z,value);}
+void Operator_Cylinder::DumpOperator2File(std::string filename) {if (m_GPUConstruction) m_GPUConstruction->MaterializeCoefficients();Operator::DumpOperator2File(filename);}
+void Operator_Cylinder::DumpPEC2File(std::string filename,unsigned int* range) {if (m_GPUConstruction) m_GPUConstruction->MaterializeCoefficients();Operator::DumpPEC2File(filename,range);}
+void Operator_Cylinder::ShowStat() const {if (m_GPUConstruction && m_GPUConstruction->HasDeviceResult()) Operator::ShowStat();else Operator_Multithread::ShowStat();}
 
 inline unsigned int Operator_Cylinder::GetNumberOfLines(int ny, bool full) const
 {
@@ -299,6 +336,9 @@ unsigned int Operator_Cylinder::SnapToMeshLine(int ny, double coord, bool &insid
 
 int Operator_Cylinder::SnapBox2Mesh(const double* start, const double* stop, unsigned int* uiStart, unsigned int* uiStop, bool dualMesh, bool fullMesh, int SnapMethod, bool* bStartIn, bool* bStopIn) const
 {
+	if (GetSetupBackend() && !bStartIn && !bStopIn) return GetSetupBackend()->SnapBox2Mesh(start,stop,uiStart,uiStop,dualMesh,fullMesh,SnapMethod);
+	int dimension=0;
+	if (GPU_SetupProcessingSnap(this,start,stop,uiStart,uiStop,dualMesh,fullMesh,SnapMethod,false,bStartIn,bStopIn,dimension)) return dimension;
 	double a_min = GetDiscLine(1,0);
 	double a_max = GetDiscLine(1,GetNumberOfLines(1,fullMesh)-1);
 
@@ -544,6 +584,7 @@ bool Operator_Cylinder::SetupCSXGrid(CSRectGrid* grid)
 
 void Operator_Cylinder::ApplyMagneticBC(bool* dirs)
 {
+	if (GetSetupBackend()) return;
 	if (dirs==NULL) return;
 	if (CC_closedAlpha)
 	{

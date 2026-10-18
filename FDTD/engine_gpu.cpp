@@ -17,8 +17,10 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <memory>
 
 #include "engine_gpu.h"
+#include "gpu_setup_processing.h"
 #include "gpu_backend.h"
 #include "extensions/engine_extension.h"
 #include "extensions/operator_extension.h"
@@ -29,19 +31,13 @@ using std::endl;
 
 //! \brief construct an Engine_GPU instance
 //! it's the responsibility of the caller to free the returned pointer
-Engine_GPU* Engine_GPU::New(const Operator* op, const std::string& backend, GPU_Backend* parent)
+Engine_GPU* Engine_GPU::New(const Operator* op, const std::string& backend, GPU_Backend* parent, GPU_Backend* prepared)
 {
-	Engine_GPU* e = new Engine_GPU(op, backend, parent);
-	try
-	{
-		e->Init();
-	}
-	catch (...)
-	{
-		delete e;
-		throw;
-	}
-	return e;
+	std::unique_ptr<GPU_Backend> owner(prepared);
+	std::unique_ptr<Engine_GPU> e(new Engine_GPU(op, backend, parent));
+	e->m_Backend = owner.release();
+	e->Init();
+	return e.release();
 }
 
 Engine_GPU::Engine_GPU(const Operator* op, const std::string& backend, GPU_Backend* parent) : Engine(op)
@@ -57,6 +53,8 @@ Engine_GPU::Engine_GPU(const Operator* op, const std::string& backend, GPU_Backe
 	m_SnapshotGatherSize[0] = m_SnapshotGatherSize[1] = 0;
 	m_FieldDFTUsed = false;
 	m_DumpPath = 0;
+	m_Diagnostics = getenv("OPENEMS_GPU_DIAGNOSTICS") && atoi(getenv("OPENEMS_GPU_DIAGNOSTICS"))!=0;
+	m_Batches = m_BatchTimesteps = 0;
 	m_StaleVolt.stale = m_StaleCurr.stale = false;
 	m_StaleVolt.full_this_batch = m_StaleCurr.full_this_batch = false;
 	m_StaleVolt.full_last_batch = m_StaleCurr.full_last_batch = false;
@@ -69,13 +67,17 @@ Engine_GPU::~Engine_GPU()
 
 void Engine_GPU::Init()
 {
-	// allocates the host mirror and creates the extensions
-	Engine::Init();
+	// Field storage starts on the device. Empty array objects remain stable for
+	// gather consumers; a host fallback or an explicit read allocates storage.
+	numTS=0;
+	volt_ptr=new ArrayLib::ArrayNIJK<FDTD_FLOAT>();
+	curr_ptr=new ArrayLib::ArrayNIJK<FDTD_FLOAT>();
+	InitExtensions();SortExtensionByPriority();
 
 	// a sub-grid shares the device work stream of its parent grid
-	m_Backend = m_ParentBackend ? m_ParentBackend->NewSubGridBackend() : GPU_Backend::New(m_BackendName);
-	if (m_Backend==NULL)
-		throw std::runtime_error("no GPU backend with a usable device is available for --engine=gpu");
+	if (!m_Backend)
+		m_Backend = m_ParentBackend ? m_ParentBackend->NewSubGridBackend() : GPU_Backend::New(m_BackendName);
+	if (!m_Backend) throw std::runtime_error("no GPU backend with a usable device is available for --engine=gpu");
 	cout << "Create FDTD engine (GPU, backend: " << m_Backend->GetName() << ")" << endl;
 	m_DumpPath = 0;
 	if (const char* env = getenv("OPENEMS_GPU_DUMPS"))
@@ -113,6 +115,7 @@ void Engine_GPU::Init()
 	m_FieldsOnHost = !host_exts.empty();
 	if (m_FieldsOnHost)
 	{
+		AllocateHostField(false);AllocateHostField(true);
 		// all or nothing: with one extension on the host, both fields are uploaded
 		// before every main update, which would overwrite what a device extension
 		// did to them
@@ -124,6 +127,8 @@ void Engine_GPU::Init()
 	}
 	else if (g_settings.GetVerboseLevel()>1)
 		cout << "Engine_GPU: all extensions run on the device" << endl;
+	if (!m_FieldsOnHost) GPU_FinishInitialization(m_Backend);
+	if (m_Diagnostics) cout << "GPU initialization: host_field_bytes=" << HostFieldStorageBytes() << endl;
 }
 
 void Engine_GPU::ForceHostFallback()
@@ -131,7 +136,28 @@ void Engine_GPU::ForceHostFallback()
 	if (m_FieldsOnHost)
 		return;
 	ClearGPUExtensions();
+	VoltagesToHost();CurrentsToHost();
 	m_FieldsOnHost = true;
+}
+
+void Engine_GPU::AllocateHostField(bool currents)
+{
+	auto* field=currents ? curr_ptr : volt_ptr;
+	if (field->valid()) return;
+	field->Init(currents ? "curr" : "volt",numLines);
+	if (m_Diagnostics) cout << "GPU requested host field storage: current=" << currents << " host_bytes=" << field->bytes() << endl;
+}
+
+ArrayLib::ArrayNIJK<FDTD_FLOAT>& Engine_GPU::HostVoltages() const
+{
+	if (!volt_ptr->valid() || m_StaleVolt.stale) const_cast<Engine_GPU*>(this)->VoltagesToHost();
+	return *volt_ptr;
+}
+
+ArrayLib::ArrayNIJK<FDTD_FLOAT>& Engine_GPU::HostCurrents() const
+{
+	if (!curr_ptr->valid() || m_StaleCurr.stale) const_cast<Engine_GPU*>(this)->CurrentsToHost();
+	return *curr_ptr;
 }
 
 void Engine_GPU::ClearGPUExtensions()
@@ -143,8 +169,13 @@ void Engine_GPU::ClearGPUExtensions()
 
 void Engine_GPU::Reset()
 {
+	if (m_Diagnostics && m_Batches)
+		cout << "GPU diagnostics (engine): batches=" << m_Batches << " timesteps=" << m_BatchTimesteps << endl;
+	m_Batches = m_BatchTimesteps = 0;
 	// the device extensions refer to the backend and to the engine extensions
 	ClearGPUExtensions();
+	m_PreparedSnapshot[0].clear();m_PreparedSnapshot[1].clear();
+	m_PreparedSnapshotCount[0]=m_PreparedSnapshotCount[1]=0;
 	delete m_Backend;
 	m_Backend = NULL;
 	Engine::Reset();
@@ -152,6 +183,7 @@ void Engine_GPU::Reset()
 
 void Engine_GPU::VoltagesToHost()
 {
+	AllocateHostField(false);
 	if (m_SharedMemory)
 		m_Backend->Synchronize();
 	else
@@ -162,6 +194,7 @@ void Engine_GPU::VoltagesToHost()
 
 void Engine_GPU::CurrentsToHost()
 {
+	AllocateHostField(true);
 	if (m_SharedMemory)
 		m_Backend->Synchronize();
 	else
@@ -174,6 +207,7 @@ FDTD_FLOAT Engine_GPU::GetVolt(unsigned int n, unsigned int x, unsigned int y, u
 {
 	if (m_StaleVolt.stale)
 		return ReadStale(false, n, x, y, z);
+	if (!volt_ptr->valid()) return 0; // newly initialized device field
 	return Engine::GetVolt(n, x, y, z);
 }
 
@@ -181,7 +215,22 @@ FDTD_FLOAT Engine_GPU::GetCurr(unsigned int n, unsigned int x, unsigned int y, u
 {
 	if (m_StaleCurr.stale)
 		return ReadStale(true, n, x, y, z);
+	if (!curr_ptr->valid()) return 0;
 	return Engine::GetCurr(n, x, y, z);
+}
+
+void Engine_GPU::SetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value)
+{
+	if (m_StaleVolt.stale) VoltagesToHost();else AllocateHostField(false);
+	Engine::SetVolt(n,x,y,z,value);
+	if (!m_FieldsOnHost) VoltagesToDevice();
+}
+
+void Engine_GPU::SetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value)
+{
+	if (m_StaleCurr.stale) CurrentsToHost();else AllocateHostField(true);
+	Engine::SetCurr(n,x,y,z,value);
+	if (!m_FieldsOnHost) CurrentsToDevice();
 }
 
 // Reading a z-line takes about the latency of a transfer, the whole field (24 bytes
@@ -246,7 +295,13 @@ bool Engine_GPU::SnapshotFields(const FDTD_FLOAT* &volt, const FDTD_FLOAT* &curr
 	if (CanSnapshotGather() && !m_SnapshotGatherSet)
 	{
 		// once: without enough device memory the backend has no snapshots
-		m_Backend->SetSnapshotGather(m_SnapshotGather[0], m_SnapshotGather[1]);
+		if (m_PreparedSnapshotCount[0] || m_PreparedSnapshotCount[1])
+		{
+			if (!m_SnapshotGather[0].empty() || !m_SnapshotGather[1].empty()) throw std::logic_error("mixed host/device snapshot construction");
+			m_Backend->SetPreparedSnapshotGather(m_PreparedSnapshot[0],m_PreparedSnapshot[1]);
+			m_PreparedSnapshot[0].clear();m_PreparedSnapshot[1].clear();
+		}
+		else m_Backend->SetSnapshotGather(m_SnapshotGather[0], m_SnapshotGather[1]);
 		m_SnapshotGatherSet = true;
 		std::vector<Engine_GatherRegion>().swap(m_SnapshotGather[0]);
 		std::vector<Engine_GatherRegion>().swap(m_SnapshotGather[1]);
@@ -282,6 +337,25 @@ bool Engine_GPU::AddSnapshotGather(bool h_field, const Engine_GatherRegion& regi
 	return true;
 }
 
+bool Engine_GPU::AddPreparedSnapshotGather(bool h_field,const std::shared_ptr<GPU_FieldGather>& gather,size_t& offset)
+{
+	if (!gather || m_SnapshotGatherSet || !CanSnapshotGather()) return false;
+	const unsigned int n=h_field ? 1 : 0;
+	offset=m_PreparedSnapshotCount[n];
+	m_PreparedSnapshot[n].push_back(gather);m_PreparedSnapshotCount[n]+=gather->Count();return true;
+}
+
+int Engine_GPU::AddPreparedFieldDFT(bool h_field,const std::shared_ptr<GPU_FieldGather>& gather,unsigned int count)
+{
+	if (m_FieldsOnHost || m_DumpPath>=1) return -1;
+	const int id=m_Backend->AddPreparedFieldDFT(gather,h_field,count);
+	if (id>=0 && !m_FieldDFTUsed)
+	{
+		cout << "Engine_GPU: frequency domain dumps accumulated on the device" << endl;m_FieldDFTUsed=true;
+	}
+	return id;
+}
+
 int Engine_GPU::AddFieldDFT(bool h_field, const Engine_GatherRegion& region, unsigned int count)
 {
 	// not with the fields on the host (host fallback of extensions): the dumps read them there
@@ -299,9 +373,9 @@ int Engine_GPU::AddFieldDFT(bool h_field, const Engine_GatherRegion& region, uns
 
 void Engine_GPU::UpdateHostMirror()
 {
-	if (m_StaleVolt.stale)
+	if (m_StaleVolt.stale || !volt_ptr->valid())
 		VoltagesToHost();
-	if (m_StaleCurr.stale)
+	if (m_StaleCurr.stale || !curr_ptr->valid())
 		CurrentsToHost();
 }
 
@@ -321,6 +395,7 @@ void Engine_GPU::CurrentsToDevice()
 
 bool Engine_GPU::IterateTS(unsigned int iterTS)
 {
+	if (m_Diagnostics) { ++m_Batches; m_BatchTimesteps += iterTS; }
 	for (unsigned int iter=0; iter<iterTS; ++iter)
 	{
 		VoltageHalfStep();

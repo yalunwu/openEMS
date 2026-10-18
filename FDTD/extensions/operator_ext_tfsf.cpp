@@ -16,6 +16,7 @@
 */
 
 #include "operator_ext_tfsf.h"
+#include "FDTD/gpu_operator_setup.h"
 #include "engine_ext_tfsf.h"
 #include <cmath>
 
@@ -26,7 +27,11 @@ using std::cout;
 using std::cerr;
 using std::endl;
 
-Operator_Ext_TFSF::Operator_Ext_TFSF(Operator* op) : Operator_Extension(op)
+Operator_Ext_TFSF::Operator_Ext_TFSF(Operator* op) : Operator_Ext_TFSF(op,NULL)
+{
+}
+
+Operator_Ext_TFSF::Operator_Ext_TFSF(Operator* op, CSPropExcitation* source) : Operator_Extension(op), m_Source(source)
 {
 	Init();
 }
@@ -51,6 +56,7 @@ void Operator_Ext_TFSF::Init()
 			}
 
 	m_Frequency = 0.0;
+	m_SourceDelay = 0.0;
 	m_PhVel = C0;
 	Operator_Extension::Init();
 }
@@ -114,6 +120,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 	{
 		prop = vec_prop.at(p);
 		elec = prop->ToExcitation();
+		if ((m_Source && m_Source!=elec) || !elec->GetEnabled()) continue;
 		if (elec->GetExcitType()!=10)
 			continue;
 		if (prop->GetQtyPrimitives()!=1)
@@ -135,6 +142,20 @@ bool Operator_Ext_TFSF::BuildExtension()
 		}
 
 		// found a plane-wave excite with exactly one box
+		m_SourceDelay=elec->GetDelay();
+		if (!std::isfinite(m_SourceDelay) || m_SourceDelay<0 || m_SourceDelay/dT>INT32_MAX)
+			throw std::invalid_argument("invalid TFSF source delay");
+		if (auto* setup=m_Op->GetSetupBackend())
+		{
+			if (setup->SnapBox2Mesh(box->GetStartCoord()->GetNativeCoords(),box->GetStopCoord()->GetNativeCoords(),m_Start,m_Stop,false,false,0)!=3)
+			{
+				cerr << "Operator_Ext_TFSF::BuildExtension: Warning, plane wave box dimension is invalid, skipping..." << endl;
+				SetActive(false);return false;
+			}
+			m_Frequency=elec->GetFrequency();
+			for (int n=0;n<3;++n) {m_PropDir[n]=elec->GetPropagationDir(n);m_E_Amp[n]=elec->GetExcitation(n);}
+			return setup->BuildTFSF(*this,nullptr);
+		}
 		for (int n=0;n<3;++n)
 			m_PropDir[n] = elec->GetPropagationDir(n);
 		double dir_norm = sqrt(m_PropDir[0]*m_PropDir[0]+m_PropDir[1]*m_PropDir[1]+m_PropDir[2]*m_PropDir[2]);
@@ -223,6 +244,9 @@ bool Operator_Ext_TFSF::BuildExtension()
 			m_H_Amp[n] /= Z0*sqrt(m_Op->GetBackgroundMueR()/m_Op->GetBackgroundEpsR());
 		}
 
+		if (m_Op->GetSetupBackend())
+			return m_Op->GetSetupBackend()->BuildTFSF(*this,origin);
+
 		double coord[3];
 		double unit = m_Op->GetGridDelta();
 		double delay;
@@ -270,7 +294,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 					{
 						m_Op->GetYeeCoords(nP,pos,coord,false);
 						dist = fabs((coord[0]-origin[0])*m_PropDir[0])+fabs((coord[1]-origin[1])*m_PropDir[1])+fabs((coord[2]-origin[2])*m_PropDir[2]);
-						delay = dist*unit/m_PhVel/dT;
+						delay = dist*unit/m_PhVel/dT + m_SourceDelay/dT;
 						m_maxDelay = std::max((unsigned int)delay,m_maxDelay);
 						m_CurrDelay[n][0][1][ui_pos] = floor(delay);
 						m_CurrDelayDelta[n][0][1][ui_pos] = delay - floor(delay);
@@ -278,7 +302,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 
 						m_Op->GetYeeCoords(nPP,pos,coord,false);
 						dist = fabs((coord[0]-origin[0])*m_PropDir[0])+fabs((coord[1]-origin[1])*m_PropDir[1])+fabs((coord[2]-origin[2])*m_PropDir[2]);
-						delay = dist*unit/m_PhVel/dT;
+						delay = dist*unit/m_PhVel/dT + m_SourceDelay/dT;
 						m_maxDelay = std::max((unsigned int)delay,m_maxDelay);
 						m_CurrDelay[n][0][0][ui_pos] = floor(delay);
 						m_CurrDelayDelta[n][0][0][ui_pos] = delay - floor(delay);
@@ -294,7 +318,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 						pos[n] = m_Stop[n];
 						m_Op->GetYeeCoords(nP,pos,coord,false);
 						dist = fabs((coord[0]-origin[0])*m_PropDir[0])+fabs((coord[1]-origin[1])*m_PropDir[1])+fabs((coord[2]-origin[2])*m_PropDir[2]);
-						delay = dist*unit/m_PhVel/dT;
+						delay = dist*unit/m_PhVel/dT + m_SourceDelay/dT;
 						m_maxDelay = std::max((unsigned int)delay,m_maxDelay);
 						m_CurrDelay[n][1][1][ui_pos] = floor(delay);
 						m_CurrDelayDelta[n][1][1][ui_pos] = delay - floor(delay);
@@ -302,7 +326,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 
 						m_Op->GetYeeCoords(nPP,pos,coord,false);
 						dist = fabs((coord[0]-origin[0])*m_PropDir[0])+fabs((coord[1]-origin[1])*m_PropDir[1])+fabs((coord[2]-origin[2])*m_PropDir[2]);
-						delay = dist*unit/m_PhVel/dT;
+						delay = dist*unit/m_PhVel/dT + m_SourceDelay/dT;
 						m_maxDelay = std::max((unsigned int)delay,m_maxDelay);
 						m_CurrDelay[n][1][0][ui_pos] = floor(delay);
 						m_CurrDelayDelta[n][1][0][ui_pos] = delay - floor(delay);
@@ -338,7 +362,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 					{
 						m_Op->GetYeeCoords(nP,pos,coord,true);
 						dist = fabs((coord[0]-origin[0])*m_PropDir[0])+fabs((coord[1]-origin[1])*m_PropDir[1])+fabs((coord[2]-origin[2])*m_PropDir[2]);
-						delay = dist*unit/m_PhVel/dT + 1.0;
+						delay = dist*unit/m_PhVel/dT + 1.0 + m_SourceDelay/dT;
 						m_maxDelay = std::max((unsigned int)delay,m_maxDelay);
 						m_VoltDelay[n][0][1][ui_pos] = floor(delay);
 						m_VoltDelayDelta[n][0][1][ui_pos] = delay - floor(delay);
@@ -346,7 +370,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 
 						m_Op->GetYeeCoords(nPP,pos,coord,true);
 						dist = fabs((coord[0]-origin[0])*m_PropDir[0])+fabs((coord[1]-origin[1])*m_PropDir[1])+fabs((coord[2]-origin[2])*m_PropDir[2]);
-						delay = dist*unit/m_PhVel/dT + 1.0;
+						delay = dist*unit/m_PhVel/dT + 1.0 + m_SourceDelay/dT;
 						m_maxDelay = std::max((unsigned int)delay,m_maxDelay);
 						m_VoltDelay[n][0][0][ui_pos] = floor(delay);
 						m_VoltDelayDelta[n][0][0][ui_pos] = delay - floor(delay);
@@ -362,7 +386,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 					{
 						m_Op->GetYeeCoords(nP,pos,coord,true);
 						dist = fabs((coord[0]-origin[0])*m_PropDir[0])+fabs((coord[1]-origin[1])*m_PropDir[1])+fabs((coord[2]-origin[2])*m_PropDir[2]);
-						delay = dist*unit/m_PhVel/dT + 1.0;
+						delay = dist*unit/m_PhVel/dT + 1.0 + m_SourceDelay/dT;
 						m_maxDelay = std::max((unsigned int)delay,m_maxDelay);
 						m_VoltDelay[n][1][1][ui_pos] = floor(delay);
 						m_VoltDelayDelta[n][1][1][ui_pos] = delay - floor(delay);
@@ -370,7 +394,7 @@ bool Operator_Ext_TFSF::BuildExtension()
 
 						m_Op->GetYeeCoords(nPP,pos,coord,true);
 						dist = fabs((coord[0]-origin[0])*m_PropDir[0])+fabs((coord[1]-origin[1])*m_PropDir[1])+fabs((coord[2]-origin[2])*m_PropDir[2]);
-						delay = dist*unit/m_PhVel/dT + 1.0;
+						delay = dist*unit/m_PhVel/dT + 1.0 + m_SourceDelay/dT;
 						m_maxDelay = std::max((unsigned int)delay,m_maxDelay);
 						m_VoltDelay[n][1][0][ui_pos] = floor(delay);
 						m_VoltDelayDelta[n][1][0][ui_pos] = delay - floor(delay);

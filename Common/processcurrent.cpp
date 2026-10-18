@@ -18,6 +18,7 @@
 #include "tools/global.h"
 #include "processcurrent.h"
 #include "FDTD/engine_interface_fdtd.h"
+#include "FDTD/gpu_setup_processing.h"
 #include <iomanip>
 
 using std::cerr;
@@ -42,8 +43,14 @@ std::string ProcessCurrent::GetIntegralName(int row) const
 void ProcessCurrent::DefineStartStopCoord(double* dstart, double* dstop)
 {
 	ProcessIntegral::DefineStartStopCoord(dstart, dstop);
+	const bool prepared=GPU_SetupProcessingIndices(Op,false,m_dualMesh,dstart,dstop,start,stop,m_normDir,m_Dimension);
+	if (prepared && (m_normDir<0 || m_normDir>2))
+	{
+		cerr << "ProcessCurrent::DefineStartStopCoord(): Warning Current Integration Box \"" << m_filename << "\" is not a surface nor has a valid normal direction! --> disabled" << endl;
+		SetEnable(false);return;
+	}
 
-	if ((m_normDir<0) || (m_normDir>2))
+	if (!prepared && ((m_normDir<0) || (m_normDir>2)))
 	{
 		if (m_Dimension!=2)
 		{
@@ -58,7 +65,7 @@ void ProcessCurrent::DefineStartStopCoord(double* dstart, double* dstop)
 				m_normDir = n;
 		}
 	}
-	else
+	else if (!prepared)
 	{
 		//expand dimension to 2 if possible
 		m_Dimension = 0;

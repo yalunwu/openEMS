@@ -20,8 +20,17 @@
 
 #include "gpu_backend.h"
 #include "gpu_backend_reference.h"
+#include "gpu_setup_multigrid_plan.h"
+#include "gpu_setup_processing.h"
+#include "gpu_setup_controller.h"
+#include "operator_cylinder.h"
 #ifdef OPENEMS_WITH_HIP
 #include "hip/gpu_backend_hip.h"
+bool HIP_SetupMultiGridSplit(GPU_Backend*,const double*,unsigned int,double,unsigned int&);
+std::shared_ptr<Engine_SamplingMesh> HIP_SetupSamplingMesh(GPU_SetupResult*,GPU_Backend*,const Operator_Base*,const unsigned int*,const unsigned int*,bool,bool,const unsigned int*,const double*);
+bool HIP_SetupProcessingSnap(GPU_SetupResult*,GPU_Backend*,const Operator_Base*,const double*,const double*,unsigned int*,unsigned int*,bool,bool,int,bool,bool*,bool*,int&);
+bool HIP_SetupProcessingIndices(GPU_SetupResult*,GPU_Backend*,const Operator_Base*,bool,bool,const double*,const double*,unsigned int*,unsigned int*,int&,int&);
+void HIP_FinishInitialization(GPU_Backend*);
 #endif
 #include "engine.h"
 #include "operator.h"
@@ -59,8 +68,55 @@ GPU_Backend* GPU_Backend::New(const std::string& name)
 	return NULL;
 }
 
-bool GPU_UPMLFusionBox(Engine* eng, const std::vector<GPU_UPMLRegion>& regions, const unsigned int numLines[3],
-                       unsigned int start[3], unsigned int stop[3])
+bool GPU_SetupMultiGridSplit(GPU_Backend* backend,const double* lines,unsigned int count,double radius,unsigned int& split)
+{
+#ifdef OPENEMS_WITH_HIP
+	return HIP_SetupMultiGridSplit(backend,lines,count,radius,split);
+#else
+	return false;
+#endif
+}
+
+unsigned int GPU_SetupCoordinateFlags(const Operator_Base* op)
+{
+	const auto* cylinder=dynamic_cast<const Operator_Cylinder*>(op);
+	return cylinder ? 1u|(cylinder->GetClosedAlpha() ? 2u : 0u)|(cylinder->GetR0Included() ? 4u : 0u) : 0;
+}
+
+std::shared_ptr<Engine_SamplingMesh> GPU_SetupSamplingMesh(const Operator_Base* op,const unsigned int start[3],const unsigned int stop[3],
+    bool dual,bool optimal,const unsigned int step[3],const double resolution[3])
+{
+#ifdef OPENEMS_WITH_HIP
+	const auto* fdtd=dynamic_cast<const Operator*>(op);
+	if (auto* owner=fdtd ? fdtd->GetConstruction() : nullptr)
+		return HIP_SetupSamplingMesh(owner->Result().get(),owner->Backend(),op,start,stop,dual,optimal,step,resolution);
+#endif
+	return {};
+}
+
+bool GPU_SetupProcessingSnap(const Operator_Base* op,const double start[3],const double stop[3],unsigned int first[3],unsigned int last[3],
+    bool dual,bool full,int method,bool point,bool* first_inside,bool* last_inside,int& dimension)
+{
+#ifdef OPENEMS_WITH_HIP
+	const auto* fdtd=dynamic_cast<const Operator*>(op);
+	if (auto* owner=fdtd ? fdtd->GetConstruction() : nullptr)
+		return HIP_SetupProcessingSnap(owner->Result().get(),owner->Backend(),op,start,stop,first,last,dual,full,method,point,first_inside,last_inside,dimension);
+#endif
+	return false;
+}
+
+bool GPU_SetupProcessingIndices(const Operator_Base* op,bool mode_match,bool dual,const double* start,const double* stop,
+    unsigned int first[3],unsigned int last[3],int& normal,int& dimension)
+{
+#ifdef OPENEMS_WITH_HIP
+	const auto* fdtd=dynamic_cast<const Operator*>(op);
+	if (auto* owner=fdtd ? fdtd->GetConstruction() : nullptr)
+		return HIP_SetupProcessingIndices(owner->Result().get(),owner->Backend(),op,mode_match,dual,start,stop,first,last,normal,dimension);
+#endif
+	return false;
+}
+
+bool GPU_SetupFusionOrder(Engine* eng,size_t regions)
 {
 	// the extension order: UPML (and steady-state) first, so that nothing else
 	// touches the fields between the UPML hooks and the main update
@@ -72,7 +128,7 @@ bool GPU_UPMLFusionBox(Engine* eng, const std::vector<GPU_UPMLRegion>& regions, 
 			++num_upml;
 			last_upml = n;
 		}
-	if ((num_upml==0) || (num_upml!=regions.size()))
+	if ((num_upml==0) || (num_upml!=regions))
 		return false;
 	for (size_t n=0; n<last_upml; ++n)
 	{
@@ -80,6 +136,20 @@ bool GPU_UPMLFusionBox(Engine* eng, const std::vector<GPU_UPMLRegion>& regions, 
 		if (!dynamic_cast<Engine_Ext_UPML*>(ext) && !dynamic_cast<Engine_Ext_SteadyState*>(ext))
 			return false;
 	}
+	return true;
+}
+
+void GPU_FinishInitialization(GPU_Backend* backend)
+{
+#ifdef OPENEMS_WITH_HIP
+	HIP_FinishInitialization(backend);
+#endif
+}
+
+bool GPU_UPMLFusionBox(Engine* eng, const std::vector<GPU_UPMLRegion>& regions, const unsigned int numLines[3],
+                       unsigned int start[3], unsigned int stop[3])
+{
+	if (!GPU_SetupFusionOrder(eng,regions.size())) return false;
 
 	// mark the region nodes, the others must form a box
 	const size_t nx = numLines[0], ny = numLines[1], nz = numLines[2];

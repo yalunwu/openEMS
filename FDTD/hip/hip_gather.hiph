@@ -1,0 +1,19 @@
+/* Copyright (C) 2026 openEMS Project; SPDX-License-Identifier: GPL-3.0-or-later */
+#ifndef HIP_GATHER_HIPH
+#define HIP_GATHER_HIPH
+__device__ inline double gather_raw(const float* field,const GPU_GatherEntry& entry,int k)
+{return entry.delta[k] ? double(field[entry.idx[k]])/entry.delta[k] : 0.0;}
+__device__ inline float gather_value(const float* field,const GPU_GatherEntry& entry)
+{
+	double value=0;
+	switch (entry.form)
+	{
+	case GPU_GatherEntry::RAW:value=gather_raw(field,entry,0);break;
+	case GPU_GatherEntry::LERP:value=gather_raw(field,entry,0)*(1.0-entry.rel)+gather_raw(field,entry,1)*entry.rel;break;
+	case GPU_GatherEntry::AVG4:
+		value=gather_raw(field,entry,0);value+=gather_raw(field,entry,1);value+=gather_raw(field,entry,2);value+=gather_raw(field,entry,3);value/=4;break;
+	default:break;
+	}
+	return float(value);
+}
+#endif

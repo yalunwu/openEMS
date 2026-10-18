@@ -16,7 +16,9 @@
 */
 
 #include "hip/hip_runtime.h"
+#include <iostream>
 #include "hip_internal.h"
+#include "setup_indices_hip.hiph"
 #include "FDTD/engine.h"
 #include "FDTD/extensions/operator_ext_lorentzmaterial.h"
 #include "FDTD/extensions/engine_ext_lorentzmaterial.h"
@@ -106,6 +108,23 @@ protected:
 HIP_Ext_LorentzMaterial::HIP_Ext_LorentzMaterial(GPU_Backend_HIP::Impl* impl, Operator_Ext_LorentzMaterial* op_ext)
 {
 	d = impl;
+	if (d->setup_result)
+	{
+		const auto prepared=d->setup_result->sparse.find(op_ext);
+		if (prepared!=d->setup_result->sparse.end())
+		{
+			for (const auto& block:prepared->second->blocks) for (unsigned int current=0;current<2;++current)
+			{
+				if (!block.count || !(block.flags&(1u<<current))) continue;
+				Order order;order.param.count=block.count;order.param.sn=d->numCells;order.param.lorentz=(block.flags&(4u<<current))!=0;
+				order.pos=HIP_WidenSetupIndices(d,block.nodes,block.count);order.c_int=block.coefficients[current*3]->values;order.c_ext=block.coefficients[current*3+1]->values;
+				order.c_lor=order.param.lorentz ? block.coefficients[current*3+2]->values : nullptr;
+				order.ade=d->Alloc<float>(3ull*block.count);order.lor=order.param.lorentz ? d->Alloc<float>(3ull*block.count) : nullptr;
+				(current ? m_Curr : m_Volt).push_back(order);
+			}
+			std::cout << "HIP Lorentz construction result adopted" << std::endl;return;
+		}
+	}
 	for (int o=0; o<op_ext->m_Order; ++o)
 	{
 		const size_t count = op_ext->m_LM_Count.at(o);

@@ -23,14 +23,17 @@
 #include "tools/constants.h"
 
 class Excitation;
+class CSPropExcitation;
 
 class Operator_Ext_TFSF : public Operator_Extension
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine_Ext_TFSF;
 	friend class HIP_Ext_TFSF;
 	friend class Metal_Ext_TFSF;
 public:
 	Operator_Ext_TFSF(Operator* op);
+	Operator_Ext_TFSF(Operator* op, CSPropExcitation* source);
 	~Operator_Ext_TFSF();
 
 	virtual Operator_Extension* Clone(Operator* op);
@@ -54,6 +57,8 @@ public:
 	virtual void Reset();
 
 protected:
+	CSPropExcitation* m_Source;
+	double m_SourceDelay;
 	Excitation* m_Exc;
 
 	bool m_IncLow[3];

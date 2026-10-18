@@ -72,13 +72,20 @@ Engine_Ext_Absorbing_BC::Engine_Ext_Absorbing_BC(Operator_Ext_Absorbing_BC* op_e
 	m_pos_ny0_I = m_posStart[m_ny] + (normalSignPositive ? 0 : -1);
 	m_pos_ny0_shift_I = m_posStart[m_ny] + (normalSignPositive ? 1 : -2);
 
-	m_V_nyP.Init("volt_nyP",m_numLines);
-	m_V_nyPP.Init("volt_nyPP",m_numLines);
-	m_I_nyP.Init("curr_nyP",m_numLines);
-	m_I_nyPP.Init("curr_nyPP",m_numLines);
+	if (!op_ext->HasDeviceConstruction()) PrepareHost();
 
 	// One thread per boundary
 	SetNumberOfThreads(1);
+}
+
+void Engine_Ext_Absorbing_BC::PrepareHost()
+{
+	m_Op_ABC->EnsureHostConstruction();
+	if (!m_V_nyP.valid())
+	{
+		m_V_nyP.Init("volt_nyP",m_numLines);m_V_nyPP.Init("volt_nyPP",m_numLines);
+		m_I_nyP.Init("curr_nyP",m_numLines);m_I_nyPP.Init("curr_nyPP",m_numLines);
+	}
 }
 
 Engine_Ext_Absorbing_BC::~Engine_Ext_Absorbing_BC()
@@ -108,6 +115,7 @@ void Engine_Ext_Absorbing_BC::SetNumberOfThreads(int nrThread)
 template <typename EngType>
 void Engine_Ext_Absorbing_BC::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
 {
+	PrepareHost();
 	if (IsActive()==false) return;
 
 	if (m_Eng==NULL) return;

@@ -29,6 +29,7 @@
   */
 class Operator_Ext_ConductingSheet : public Operator_Ext_LorentzMaterial
 {
+	friend class HIP_OperatorSetup;
 public:
 	Operator_Ext_ConductingSheet(Operator* op, double f_max);
 

@@ -22,6 +22,7 @@
 
 #include "CSPrimCurve.h"
 #include "CSPropExcitation.h"
+#include <algorithm>
 
 using std::cout;
 using std::cerr;
@@ -68,6 +69,7 @@ void Operator_Ext_Excitation::Init()
 void Operator_Ext_Excitation::Reset()
 {
 	Operator_Extension::Reset();
+	m_BoundaryDelay={};
 	delete[] Volt_delay;
 	Volt_delay = 0;
 	delete[] Volt_dir;
@@ -94,6 +96,16 @@ void Operator_Ext_Excitation::Reset()
 		Volt_Count_Dir[n] = 0;
 		Curr_Count_Dir[n] = 0;
 	}
+}
+
+int Operator_Ext_Excitation::GetBoundaryDelay(unsigned int normal,unsigned int line) const
+{
+	if (m_BoundaryDelay) return m_BoundaryDelay(normal,line);
+	int delay=-1;
+	for (unsigned int n=0;n<Volt_Count;++n)
+		if (Volt_dir[n]!=normal && Volt_index[normal][n]==line)
+			delay=std::max(delay,static_cast<int>(Volt_delay[n]));
+	return delay;
 }
 
 
@@ -240,9 +252,10 @@ bool Operator_Ext_Excitation::BuildExtension()
 	{
 		prop = vec_prop.at(p);
 		elec = prop->ToExcitation();
-		for (size_t n=0; n<prop->GetQtyPrimitives(); ++n)
+		if (!elec || !elec->GetEnabled()) continue;
+		for (size_t primitive_index=0; primitive_index<prop->GetQtyPrimitives(); ++primitive_index)
 		{
-			CSPrimitives* prim = prop->GetPrimitive(n);
+			CSPrimitives* prim = prop->GetPrimitive(primitive_index);
 			CSPrimCurve* curv = prim->ToCurve();
 			if (curv)
 			{
@@ -255,7 +268,7 @@ bool Operator_Ext_Excitation::BuildExtension()
 						prim->SetPrimitiveUsed(true);
 					for (size_t t=0; t<path.dir.size(); ++t)
 					{
-						n = path.dir.at(t);
+						const unsigned int n = path.dir.at(t);
 						pos[0] = path.posPath[0].at(t);
 						pos[1] = path.posPath[1].at(t);
 						pos[2] = path.posPath[2].at(t);

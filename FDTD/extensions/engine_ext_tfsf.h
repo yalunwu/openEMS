@@ -32,6 +32,7 @@ public:
 	virtual void DoPostCurrentUpdates();
 
 protected:
+	void PrepareHost();
 	Operator_Ext_TFSF* m_Op_TFSF;
 
 	unsigned int* m_DelayLookup;

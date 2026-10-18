@@ -33,6 +33,7 @@ Engine_Ext_Excitation::~Engine_Ext_Excitation()
 template <typename EngType>
 void Engine_Ext_Excitation::Apply2VoltagesImpl(EngType* eng)
 {
+	m_Op_Exc->EnsureHostConstruction();
 	//soft voltage excitation here (E-field excite)
 	int exc_pos;
 	unsigned int ny;
@@ -67,6 +68,7 @@ void Engine_Ext_Excitation::Apply2Voltages()
 template <typename EngType>
 void Engine_Ext_Excitation::Apply2CurrentImpl(EngType* eng)
 {
+	m_Op_Exc->EnsureHostConstruction();
 	//soft current excitation here (H-field excite)
 	int exc_pos;
 	unsigned int ny;

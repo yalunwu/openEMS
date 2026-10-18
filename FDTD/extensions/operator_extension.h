@@ -21,6 +21,8 @@
 #include <string>
 
 #include <iostream>
+#include <functional>
+#include <utility>
 
 #include "tools/global.h"
 
@@ -67,7 +69,13 @@ public:
 	virtual void SetActive(bool active=true) {m_Active=active;}
 
 	virtual void Init() {}
-	virtual void Reset() {}
+	virtual void Reset() {m_HostMaterializer={};m_DeviceConstruction=false;}
+	bool HasDeviceConstruction() const {return m_DeviceConstruction;}
+	void SetHostMaterializer(std::function<void()> materializer) {m_HostMaterializer=std::move(materializer);m_DeviceConstruction=true;}
+	void EnsureHostConstruction() const
+	{
+		if (m_HostMaterializer) {m_HostMaterializer();m_HostMaterializer={};}
+	}
 
 protected:
 	Operator_Extension(Operator* op);
@@ -75,6 +83,8 @@ protected:
 	Operator_Extension(Operator* op, Operator_Extension* op_ext);
 
 	bool m_Active;
+	bool m_DeviceConstruction=false;
+	mutable std::function<void()> m_HostMaterializer;
 
 	//FDTD Operator
 	Operator* m_Op;

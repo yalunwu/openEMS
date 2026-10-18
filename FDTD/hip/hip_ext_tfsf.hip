@@ -21,6 +21,22 @@
 #include "FDTD/excitation.h"
 #include "FDTD/extensions/operator_ext_tfsf.h"
 #include "FDTD/extensions/engine_ext_tfsf.h"
+#include <iostream>
+
+HIP_SetupTFSF::~HIP_SetupTFSF()
+{
+	hipStreamSynchronize(context->stream);
+	for (const auto& axis:planes) for (float* plane:axis) if (plane) hipFree(plane);
+}
+
+void HIP_SetupTFSF::Materialize(unsigned int axis,unsigned int side,std::vector<float>& output,bool diagnostics) const
+{
+	output.resize(12ull*counts[axis][side]);
+	const size_t bytes=output.size()*sizeof(float);
+	if (bytes) HIP_Check(hipMemcpyAsync(output.data(),planes[axis][side],bytes,hipMemcpyDeviceToHost,context->stream),"requested TFSF tables");
+	HIP_Check(hipStreamSynchronize(context->stream),"requested TFSF completion");
+	if (diagnostics) std::cout << "GPU requested host TFSF: d2h_bytes=" << bytes << std::endl;
+}
 
 // Total-field/scattered-field plane wave, see Engine_Ext_TFSF.
 // One launch per active box plane (planes share edges, so they run one after the
@@ -49,7 +65,7 @@ __device__ __forceinline__ unsigned int tfsf_lookup(unsigned int k, const TFSFPa
 }
 
 __global__ void tfsf_apply(float* field, const unsigned int* delay, const float* delta, const float* amp,
-                           const float* signal, HIP_GridDim N, TFSFParam P)
+                           const float* signal, HIP_GridDim N, TFSFParam P,const float* prepared)
 {
 	const unsigned int j = blockIdx.x*blockDim.x + threadIdx.x;
 	const unsigned int i = blockIdx.y*blockDim.y + threadIdx.y;
@@ -64,9 +80,11 @@ __global__ void tfsf_apply(float* field, const unsigned int* delay, const float*
 	{
 		const unsigned int k = c*count + i*P.nj + j;
 		const size_t g = nijk(N, (c==0) ? P.nP : P.nPP, pos[0], pos[1], pos[2]);
+		const unsigned int dt=prepared ? __float_as_uint(prepared[3*k]) : delay[k];
+		const float fraction=prepared ? prepared[3*k+1] : delta[k],amplitude=prepared ? prepared[3*k+2] : amp[k];
 		field[g] = field[g]
-		         + (1.0f-delta[k])*amp[k]*signal[tfsf_lookup(delay[k], P)]
-		         +       delta[k] *amp[k]*signal[tfsf_lookup(1+delay[k], P)];
+		         + (1.0f-fraction)*amplitude*signal[tfsf_lookup(dt, P)]
+		         +       fraction *amplitude*signal[tfsf_lookup(1+dt, P)];
 	}
 }
 
@@ -85,6 +103,7 @@ protected:
 		TFSFParam param;
 		unsigned int* delay;   //!< [component][i*nj+j]
 		float *delta, *amp;
+		const float* prepared=nullptr;
 	};
 
 	void SetupPlanes(std::vector<Plane>& planes, bool currents, Operator_Ext_TFSF* op_ext);
@@ -104,10 +123,16 @@ HIP_Ext_TFSF::HIP_Ext_TFSF(GPU_Backend_HIP::Impl* impl, Operator_Ext_TFSF* op_ex
 	m_Op_TFSF = op_ext;
 	m_Eng = eng;
 	const size_t length = op_ext->m_Exc->GetLength();
-	m_VoltSignal = d->Alloc<float>(length, op_ext->m_Exc->GetVoltageSignal());
-	m_CurrSignal = d->Alloc<float>(length, op_ext->m_Exc->GetCurrentSignal());
+	if (d->waveform_source==op_ext->m_Exc && d->waveform_length==length)
+	{m_VoltSignal=d->waveform[0];m_CurrSignal=d->waveform[1];}
+	else
+	{
+		m_VoltSignal = d->Alloc<float>(length, op_ext->m_Exc->GetVoltageSignal());
+		m_CurrSignal = d->Alloc<float>(length, op_ext->m_Exc->GetCurrentSignal());
+	}
 	SetupPlanes(m_VoltPlanes, false, op_ext);
 	SetupPlanes(m_CurrPlanes, true, op_ext);
+	if (op_ext->HasDeviceConstruction()) std::cout << "HIP TFSF construction result adopted" << std::endl;
 }
 
 void HIP_Ext_TFSF::SetupPlanes(std::vector<Plane>& planes, bool currents, Operator_Ext_TFSF* op_ext)
@@ -135,6 +160,15 @@ void HIP_Ext_TFSF::SetupPlanes(std::vector<Plane>& planes, bool currents, Operat
 			pl.param.nj = op_ext->m_numLines[nPP];
 
 			const size_t count = (size_t)pl.param.ni*pl.param.nj;
+			if (d->setup_result)
+			{
+				const auto prepared=d->setup_result->tfsf.find(op_ext);
+				if (prepared!=d->setup_result->tfsf.end())
+				{
+					pl.prepared=prepared->second->planes[n][l]+(currents ? 0 : 6*count);
+					pl.delay=nullptr;pl.delta=nullptr;pl.amp=nullptr;planes.push_back(pl);continue;
+				}
+			}
 			std::vector<unsigned int> delay(2*count);
 			std::vector<float> delta(2*count), amp(2*count);
 			for (int c=0; c<2; ++c)
@@ -168,7 +202,7 @@ void HIP_Ext_TFSF::Apply(std::vector<Plane>& planes, float* field, const float* 
 		pl.param.length = m_Op_TFSF->m_Exc->GetLength();
 		pl.param.period = period;
 		HIP_Launch(d, "tfsf_apply", tfsf_apply, pl.param.nj, pl.param.ni, 1, field, (const unsigned int*)pl.delay,
-		            (const float*)pl.delta, (const float*)pl.amp, signal, d->dim, pl.param);
+		            (const float*)pl.delta, (const float*)pl.amp, signal, d->dim, pl.param,pl.prepared);
 	}
 }
 

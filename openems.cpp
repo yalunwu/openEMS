@@ -22,6 +22,7 @@
 #include "tools/signal.h"
 #include "tools/useful.h"
 #include "tools/denormal.h"
+#include "tools/setup_timer.h"
 #include "FDTD/operator_cylinder.h"
 #include "FDTD/operator_cylindermultigrid.h"
 #include "FDTD/engine_multithread.h"
@@ -29,6 +30,7 @@
 #include "FDTD/operator_gpu.h"
 #include "FDTD/extensions/operator_ext_excitation.h"
 #include "FDTD/extensions/operator_ext_tfsf.h"
+#include "CSPropExcitation.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
 #include "FDTD/extensions/operator_ext_upml.h"
 #include "FDTD/extensions/operator_ext_lorentzmaterial.h"
@@ -94,6 +96,8 @@ openEMS::openEMS()
 
 	m_engine = EngineType_Multithreaded; //default engine type
 	m_engine_numThreads = 0;
+	m_GPUSetupMode = "cpu";
+	m_GPUSetupFallback = false;
 
 	m_Abort = false;
 	m_Exc = 0;
@@ -298,8 +302,17 @@ void openEMS::collectCommandLineArguments()
 							 << m_engine_numThreads << endl;
 				}
 			),
-			"Force use n threads for multithreaded engine "
-			"(needs: --engine=multithreaded)"
+			"CPU threads for the multithreaded engine and GPU operator setup "
+			"(0: automatic, 1: serial)"
+		)
+		(
+			"gpu-setup",
+			po::value<std::string>()->default_value("cpu")->notifier([&](const std::string& mode) {
+				if (mode!="cpu" && mode!="auto" && mode!="gpu")
+					throw std::invalid_argument("gpu-setup must be cpu, auto or gpu");
+				m_GPUSetupMode=mode;
+			}),
+			"GPU operator construction: cpu (default), auto (CPU fallback), gpu (required HIP construction; coverage in README)"
 		)
 		(
 			"no-simulation",
@@ -471,7 +484,7 @@ void openEMS::SetupAbsorbingSheets()
 
 			// Initialize all necessary parameters so the extension operator can be
 			// built later on.
-			if (op_ext_abc->SetInitParams(cPrimitive,cABCprops))
+			if (op_ext_abc->SetInitParams(cPrimitive,cABCprops,(m_engine==EngineType_GPU || m_engine==EngineType_GPU_Reference) && m_GPUSetupMode!="cpu" && !m_GPUSetupFallback))
 				// Finally, add the extension
 				FDTD_Op->AddExtension(op_ext_abc);
 			else
@@ -791,13 +804,15 @@ bool openEMS::SetupMaterialStorages()
 		if (db->GetQtyPrimitives()==0)
 			continue;
 		//check for current density dump types
+		if (Enable_Dumps && ((db->GetDumpType()>=20 && db->GetDumpType()<=22) || db->GetDumpType()==29))
+			FDTD_Op->SetCellMaterialStorage();
 		if ( ((db->GetDumpType()==2) || (db->GetDumpType()==12) || // current density storage
 			  (db->GetDumpType()==20) || (db->GetDumpType()==21) || (db->GetDumpType()==22)) && // SAR dump types
 			  Enable_Dumps )
 			FDTD_Op->SetMaterialStoreFlags(1,true); //tell operator to store kappa material data
-		if ( ((db->GetDumpType()==4) || (db->GetDumpType()==14)) || Enable_Dumps) // electric flux density storage
+		if ( ((db->GetDumpType()==4) || (db->GetDumpType()==14)) && Enable_Dumps) // electric flux density storage
 			FDTD_Op->SetMaterialStoreFlags(0,true); //tell operator to store epsR material data
-		if ( ((db->GetDumpType()==5) || (db->GetDumpType()==15)) || Enable_Dumps) // magnetic flux density storage
+		if ( ((db->GetDumpType()==5) || (db->GetDumpType()==15)) && Enable_Dumps) // magnetic flux density storage
 			FDTD_Op->SetMaterialStoreFlags(2,true); //tell operator to store mueR material data
 	}
 	return true;
@@ -813,6 +828,8 @@ bool openEMS::SetupOperator()
 {
 	// what defaults to AvailableThreads() (GPU operator build, field dumps, SAR, nf2ff) honours numThreads
 	SetThreadLimit(m_engine_numThreads);
+	if (m_GPUSetupMode=="gpu" && m_engine!=EngineType_GPU && m_engine!=EngineType_GPU_Reference)
+		throw GPU_SetupUnavailable("GPU construction requires a GPU engine");
 	if (CylinderCoords)
 	{
 		bool gpu = (m_engine == EngineType_GPU) || (m_engine == EngineType_GPU_Reference);
@@ -822,7 +839,8 @@ bool openEMS::SetupOperator()
 		if (op_cyl==NULL)
 			op_cyl = Operator_Cylinder::New(m_engine_numThreads);
 		if (gpu)
-			op_cyl->SetGPUBackend(m_engine == EngineType_GPU_Reference ? "reference" : "auto");
+			op_cyl->SetGPUBackend(m_engine == EngineType_GPU_Reference ? "reference" : "auto",nullptr,
+			                      m_GPUSetupFallback ? "cpu" : m_GPUSetupMode);
 		FDTD_Op = op_cyl;
 	}
 	else if (m_engine == EngineType_SSE)
@@ -839,12 +857,14 @@ bool openEMS::SetupOperator()
 	}
 	else if ((m_engine == EngineType_GPU) || (m_engine == EngineType_GPU_Reference))
 	{
-		FDTD_Op = Operator_GPU::New(m_engine == EngineType_GPU_Reference ? "reference" : "auto");
+		FDTD_Op = Operator_GPU::New(m_engine == EngineType_GPU_Reference ? "reference" : "auto", m_engine_numThreads,
+		                          m_GPUSetupFallback ? "cpu" : m_GPUSetupMode);
 	}
 	else
 	{
 		FDTD_Op = Operator::New();
 	}
+	FDTD_Op->SetSetupCancellation([this]() {return m_Abort.load();});
 	return true;
 }
 
@@ -888,6 +908,7 @@ void openEMS::Set_Mur_PhaseVel(int idx, double val)
 
 bool openEMS::ParseFDTDSetup(std::string file)
 {
+	SetupTimer timer("FDTD input");
 	Reset();
 
 	if (g_settings.GetVerboseLevel()>0)
@@ -925,7 +946,9 @@ bool openEMS::ParseFDTDSetup(std::string file)
 	this->SetCSX(csx);
 
 
-	return this->Parse_XML_FDTDSetup(FDTD_Opts);
+	const bool success = this->Parse_XML_FDTDSetup(FDTD_Opts);
+	timer.Report("XML and geometry parsing");
+	return success;
 }
 
 bool openEMS::Parse_XML_FDTDSetup(TiXmlElement* FDTD_Opts)
@@ -1215,10 +1238,12 @@ ContinuousStructure* openEMS::GetCSX() const
 	return m_CSX;
 }
 
-int openEMS::SetupFDTD()
+int openEMS::SetupFDTD() try
 {
+	SetupTimer timer("FDTD setup");
 	// of a previous setup that was not run
 	FreeSimulation();
+	if (m_Abort.load()) throw std::runtime_error("FDTD setup cancelled");
 
 	timeval startTime;
 	gettimeofday(&startTime,NULL);
@@ -1237,6 +1262,14 @@ int openEMS::SetupFDTD()
 		return 3;
 	}
 	std::string ec = m_CSX->Update();
+	struct UsedTransaction
+	{
+		std::vector<CSPrimitives*> primitives;std::vector<bool> original;bool committed=false;
+		explicit UsedTransaction(ContinuousStructure& csx) : primitives(csx.GetAllPrimitives())
+		{for (auto* primitive:primitives) original.push_back(primitive->GetPrimitiveUsed());}
+		void Restore() {if (!committed) for (size_t n=0;n<primitives.size();++n) primitives[n]->SetPrimitiveUsed(original[n]);committed=true;}
+		~UsedTransaction() {Restore();}
+	} used_transaction(*m_CSX);
 	if (!ec.empty())
 		cerr << ec << endl;
 	if (g_settings.GetVerboseLevel()>2)
@@ -1277,11 +1310,32 @@ int openEMS::SetupFDTD()
 	FDTD_Op->SetExcitationSignal(m_Exc);
 	FDTD_Op->AddExtension(new Operator_Ext_Excitation(FDTD_Op));
 	if (!CylinderCoords)
-		FDTD_Op->AddExtension(new Operator_Ext_TFSF(FDTD_Op));
-
-	if (FDTD_Op->SetGeometryCSX(m_CSX)==false)
 	{
-		return(2);
+		unsigned int sources=0;
+		for (CSProperties* property:m_CSX->GetPropertyByType(CSProperties::EXCITATION))
+		{
+			CSPropExcitation* source=property->ToExcitation();
+			if (source->GetExcitType()!=10) continue;
+			FDTD_Op->AddExtension(new Operator_Ext_TFSF(FDTD_Op,source));
+			++sources;
+		}
+		if (!sources) FDTD_Op->AddExtension(new Operator_Ext_TFSF(FDTD_Op));
+	}
+
+	try
+	{
+		if (FDTD_Op->SetGeometryCSX(m_CSX)==false)
+		{
+			Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+			return(2);
+		}
+	}
+	catch (const GPU_SetupUnavailable& error)
+	{
+		if (m_GPUSetupMode!="auto" || m_GPUSetupFallback) throw;
+		cout << "GPU construction: " << error.what() << "; rebuilding a fresh CPU operator" << endl;
+		used_transaction.Restore();m_GPUSetupFallback=true;
+		const int result=SetupFDTD();m_GPUSetupFallback=false;return result;
 	}
 
 	SetupBoundaryConditions();
@@ -1348,7 +1402,36 @@ int openEMS::SetupFDTD()
 	if (m_debugPEC)
 		debugFlags |= Operator::debugPEC;
 
-	FDTD_Op->CalcECOperator( debugFlags );
+	int operatorResult;
+	try { operatorResult=FDTD_Op->CalcECOperator(debugFlags); }
+	catch (const GPU_SetupTimestepChange& change)
+	{
+		if (!(change.timestep>0) || !std::isfinite(change.timestep) || m_GPUSetupTimestepRetries>=CYLIDINDERMULTIGRID_LIMIT+1)
+			throw std::runtime_error("GPU multigrid shared timestep did not converge");
+		const double previous=m_TS;m_TS=change.timestep;++m_GPUSetupTimestepRetries;
+		cout << "GPU construction: shared timestep changed; rebuilding a fresh GPU hierarchy" << endl;
+		used_transaction.Restore();
+		try {const int result=SetupFDTD();m_TS=previous;--m_GPUSetupTimestepRetries;return result;}
+		catch (...) {m_TS=previous;--m_GPUSetupTimestepRetries;throw;}
+	}
+	catch (const GPU_SetupUnavailable& error)
+	{
+		if (m_GPUSetupMode!="auto" || m_GPUSetupFallback) throw;
+		cout << "GPU construction: " << error.what() << "; rebuilding a fresh CPU operator" << endl;
+		// Discard the partial operator, including a failed result/packing allocation.
+		used_transaction.Restore();
+		m_GPUSetupFallback=true;
+		const int result=SetupFDTD();
+		m_GPUSetupFallback=false;
+		return result;
+	}
+	if (operatorResult != 0)
+	{
+		cerr << "openEMS::SetupFDTD: Error constructing the FDTD operator!" << endl;
+		Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+		FreeSimulation();
+		return 2;
+	}
 	/*******************************************************************************/
 
 	//reset flags for material storage, if no dump-box resets it to true, it will be cleaned up...
@@ -1361,8 +1444,20 @@ int openEMS::SetupFDTD()
 	if ((m_maxTime>0) && (maxTime_TS<NrTS))
 		NrTS = maxTime_TS;
 
-	if (!m_Exc->buildExcitationSignal(NrTS))
-		return 2;
+	try
+	{
+		if (!FDTD_Op->BuildExcitationSignal(NrTS)) return 2;
+	}
+	catch (const GPU_SetupUnavailable& error)
+	{
+		if (m_GPUSetupMode!="auto" || m_GPUSetupFallback) throw;
+		cout << "GPU construction: " << error.what() << "; rebuilding a fresh CPU operator" << endl;
+		used_transaction.Restore();
+		m_GPUSetupFallback=true;
+		const int result=SetupFDTD();
+		m_GPUSetupFallback=false;
+		return result;
+	}
 	m_Exc->DumpVoltageExcite("et");
 	m_Exc->DumpCurrentExcite("ht");
 
@@ -1401,20 +1496,17 @@ int openEMS::SetupFDTD()
 	if (m_no_simulation)
 	{
 		// simulation was disabled (to generate debug output only)
+		Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+		used_transaction.committed=true;
 		return 1;
 	}
 
-	//create FDTD engine
+	timer.Report("operator and waveform construction");
 	try
 	{
-		FDTD_Eng = FDTD_Op->CreateEngine();
-	}
-	catch (const std::exception& e)
-	{
-		// e.g. the GPU engine without a device: do not run something else instead
-		cerr << "openEMS::SetupFDTD: Error: creating the FDTD engine failed: " << e.what() << endl;
-		return 4;
-	}
+	//create FDTD engine
+	FDTD_Eng = FDTD_Op->CreateEngine();
+	timer.Report("backend and engine initialization");
 
 	if (Op_Ext_SSD)
 	{
@@ -1427,9 +1519,18 @@ int openEMS::SetupFDTD()
 	{
 		return 2;
 	}
+	if (FDTD_Op->GetConstruction()) PA->InitAll();
 
 	// Cleanup all unused material storages...
 	FDTD_Op->CleanupMaterialStorage();
+	}
+	catch (const GPU_SetupUnavailable& error)
+	{
+		if (m_GPUSetupMode!="auto" || m_GPUSetupFallback) throw;
+		cout << "GPU construction: " << error.what() << "; rebuilding a fresh CPU operator" << endl;
+		used_transaction.Restore();m_GPUSetupFallback=true;
+		const int result=SetupFDTD();m_GPUSetupFallback=false;return result;
+	}
 
 	//check and warn for unused properties and primitives
 	m_CSX->WarnUnusedPrimitves(cerr);
@@ -1440,7 +1541,18 @@ int openEMS::SetupFDTD()
 		PA->DumpBoxes2File("box_dump_");
 	}
 
+	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+	timer.Report("processing initialization and cleanup");
+	FDTD_Op->CheckSetupCancellation();
+	used_transaction.committed=true;
 	return 0;
+}
+catch (...)
+{
+	m_GPUSetupFallback=false;
+	Signal::SetupHandlerForSIGINT(SIGNAL_ORIGINAL);
+	FreeSimulation();
+	throw;
 }
 
 string FormatTime(int sec)
@@ -1509,7 +1621,11 @@ void openEMS::RunFDTD()
 	double maxE=0,currE=0;
 
 	//init processings
-	PA->InitAll();
+	if (!FDTD_Op->GetConstruction())
+	{
+		SetupTimer processing_timer("CPU processing setup");PA->InitAll();
+		processing_timer.Report("sampling and processing");
+	}
 
 	//add all timesteps to end-crit field processing with max excite amplitude
 	unsigned int maxExcite = FDTD_Op->GetExcitationSignal()->GetMaxExcitationTimestep();
@@ -1640,7 +1756,9 @@ void openEMS::RunFDTD()
 		DumpStatistics(OPENEMS_STAT_FILE, t_diff);
 
 	//*************** postproc ************//
+	SetupTimer finalTimer("FDTD output");
 	PA->PostProcess();
+	finalTimer.Report("finalization");
 
 	// the results are written: free the memory of the operator and the engine,
 	// e.g. for a post-processing in the same process (NF2FF, SAR)

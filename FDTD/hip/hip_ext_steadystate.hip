@@ -17,6 +17,7 @@
 
 #include "hip/hip_runtime.h"
 #include <cmath>
+#include <iostream>
 
 #include "hip_internal.h"
 #include "FDTD/engine_gpu.h"
@@ -24,18 +25,58 @@
 #include "FDTD/extensions/operator_ext_steadystate.h"
 #include "FDTD/extensions/engine_ext_steadystate.h"
 
-// Steady-state detection, see Engine_Ext_SteadyState. The probe voltages are
-// recorded on the device every timestep; once per period the fields and the
-// records are copied to the host, which compares the energy and the recorded
-// periods, and stores the result in the engine extension, where openEMS reads
-// it (GetLastDiff()).
+// Probe records and period comparisons stay on the device. The host receives
+// only the difference/validity scalars used by the shared stopping criterion.
 struct SSDParam { unsigned int count; unsigned int length; unsigned int rel_pos; };
+
+HIP_SetupSteadyState::~HIP_SetupSteadyState()
+{
+	hipStreamSynchronize(context->stream);
+	if (indices) hipFree(indices);if (records) hipFree(records);
+}
 
 __global__ void ssd_record(const float* volt, float* records, const size_t* index, SSDParam P)
 {
 	const unsigned int n = blockIdx.x*blockDim.x + threadIdx.x;
 	if (n<P.count)
 		records[n*P.length + P.rel_pos] = volt[index[n]];
+}
+
+__global__ void ssd_power(const float* records,unsigned int count,unsigned int period,unsigned int relative,double2* power)
+{
+	const unsigned int q=blockIdx.x*blockDim.x+threadIdx.x;
+	if (q>=count) return;
+	const unsigned int first=relative<=period ? 0 : period,old=period-first;
+	const float* values=records+size_t(q)*2*period;
+	double current=0,difference=0;
+	for (unsigned int i=0;i<period;++i)
+	{
+		const double a=values[first+i],b=values[old+i];
+		current+=a*a;difference+=(b-a)*(b-a);
+	}
+	power[q]=make_double2(current,difference);
+}
+
+__global__ void ssd_difference(const double2* power,unsigned int count,double* result)
+{
+	double maximum=0,difference=0,valid=0;
+	for (unsigned int i=0;i<count;++i)
+	{
+		if (!isfinite(power[i].x) || !isfinite(power[i].y)) {result[0]=0;result[1]=-1;return;}
+		maximum=fmax(maximum,power[i].x);
+	}
+	for (unsigned int i=0;i<count;++i) if (power[i].x>maximum*1e-2)
+	{
+		difference=fmax(difference,power[i].y/power[i].x);valid=1;
+	}
+	result[0]=difference;result[1]=valid;
+}
+
+
+__global__ void widen_steady_indices(const unsigned int* input,size_t* output,unsigned int count)
+{
+	const unsigned int i=blockIdx.x*blockDim.x+threadIdx.x;
+	if (i<count) output[i]=input[i];
 }
 
 class HIP_Ext_SteadyState : public GPU_Extension
@@ -55,7 +96,8 @@ protected:
 	unsigned int m_Count;        //!< number of probes
 	size_t* m_Index;             //!< flat NIJK index of the probed voltages
 	float* m_Records;            //!< [probe][2*period]: the two periods CheckPeriod() compares
-	std::vector<float> m_HostRecords;
+	double2* m_Power;
+	double* m_Difference;
 };
 
 HIP_Ext_SteadyState::HIP_Ext_SteadyState(GPU_Backend_HIP::Impl* impl, Operator_Ext_SteadyState* op_ext, Engine_Ext_SteadyState* eng_ext, Engine_GPU* eng)
@@ -65,14 +107,24 @@ HIP_Ext_SteadyState::HIP_Ext_SteadyState(GPU_Backend_HIP::Impl* impl, Operator_E
 	m_Eng = eng;
 	m_Period = op_ext->m_TS_period;
 	m_Count = op_ext->m_E_probe_dir.size();
+	m_Power=d->Alloc<double2>(std::max(m_Count,1u));m_Difference=d->Alloc<double>(2);
+	if (d->setup_result)
+	{
+		const auto prepared=d->setup_result->steady_state.find(op_ext);
+		if (prepared!=d->setup_result->steady_state.end())
+		{
+			m_Index=d->Alloc<size_t>(m_Count);m_Records=prepared->second->records;
+			HIP_Launch(d,"widen_steady_indices",widen_steady_indices,m_Count,1,1,static_cast<const unsigned int*>(prepared->second->indices),m_Index,m_Count);
+			std::cout << "HIP steady-state construction result adopted" << std::endl;return;
+		}
+	}
 
 	std::vector<size_t> index(std::max(m_Count, 1u), 0);
 	for (unsigned int n=0; n<m_Count; ++n)
 		index[n] = (((size_t)op_ext->m_E_probe_dir.at(n)*d->dim.nx + op_ext->m_E_probe_pos[0].at(n))*d->dim.ny
 		            + op_ext->m_E_probe_pos[1].at(n))*d->dim.nz + op_ext->m_E_probe_pos[2].at(n);
 	m_Index = d->Alloc<size_t>(index.size(), index.data());
-	m_HostRecords.resize(std::max(m_Count, 1u)*2*(size_t)m_Period);
-	m_Records = d->Alloc<float>(m_HostRecords.size());
+	m_Records = d->Alloc<float>(std::max(m_Count,1u)*2*size_t(m_Period));
 }
 
 void HIP_Ext_SteadyState::Apply2Voltages()
@@ -91,17 +143,19 @@ void HIP_Ext_SteadyState::Apply2Voltages()
 		CheckPeriod(rel_pos);
 }
 
-// the check of Engine_Ext_SteadyState, on the records downloaded from the device
+// Reduce the recorded periods on the device; read only the comparison scalars.
 void HIP_Ext_SteadyState::CheckPeriod(unsigned int rel_pos)
 {
 	const unsigned int p = m_Period;
 
-	// the energy comes from the GPU engine interface, computed on the device
-	HIP_Check(hipMemcpyAsync(m_HostRecords.data(), m_Records, m_HostRecords.size()*sizeof(float), hipMemcpyDeviceToHost, d->Stream()), "copy the steady-state records");
-	d->Flush();
+	HIP_Launch(d,"ssd_power",ssd_power,m_Count,1,1,static_cast<const float*>(m_Records),m_Count,p,rel_pos,m_Power);
+	ssd_difference<<<1,1,0,d->Stream()>>>(m_Power,m_Count,m_Difference);
+	HIP_Check(hipGetLastError(),"steady-state period reduction");
+	double difference[2];
+	HIP_Check(hipMemcpyAsync(difference,m_Difference,sizeof(difference),hipMemcpyDeviceToHost,d->Stream()),"steady-state result metadata");d->Flush();
+	if (difference[1]<0) throw std::runtime_error("non-finite steady-state records");
+	m_Eng_SSD->SetPeriodDifference(difference[0],difference[1]!=0);
 
-	const float* records = m_HostRecords.data();
-	m_Eng_SSD->CheckPeriod(rel_pos, [records, p](size_t n, unsigned int t) {return (double)records[n*2*(size_t)p + t];});
 }
 
 GPU_Extension* HIP_CreateExt_SteadyState(GPU_Backend_HIP::Impl* d, Engine_Extension* eng_ext, Engine* eng)

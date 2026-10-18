@@ -24,7 +24,13 @@ Engine_Ext_TFSF::Engine_Ext_TFSF(Operator_Ext_TFSF* op_ext) : Engine_Extension(o
 	m_Op_TFSF = op_ext;
 	m_Priority = ENG_EXT_PRIO_TFSF;
 
-	m_DelayLookup = new unsigned int[m_Op_TFSF->m_maxDelay+1];
+	m_DelayLookup = op_ext->HasDeviceConstruction() ? nullptr : new unsigned int[m_Op_TFSF->m_maxDelay+1];
+}
+
+void Engine_Ext_TFSF::PrepareHost()
+{
+	m_Op_TFSF->EnsureHostConstruction();
+	if (!m_DelayLookup) m_DelayLookup=new unsigned int[m_Op_TFSF->m_maxDelay+1];
 }
 
 Engine_Ext_TFSF::~Engine_Ext_TFSF()
@@ -35,6 +41,7 @@ Engine_Ext_TFSF::~Engine_Ext_TFSF()
 
 void Engine_Ext_TFSF::DoPostVoltageUpdates()
 {
+	PrepareHost();
 	unsigned int numTS = m_Eng->GetNumberOfTimesteps();
 	unsigned int length = m_Op_TFSF->m_Exc->GetLength();
 
@@ -125,6 +132,7 @@ void Engine_Ext_TFSF::DoPostVoltageUpdates()
 
 void Engine_Ext_TFSF::DoPostCurrentUpdates()
 {
+	PrepareHost();
 	unsigned int numTS = m_Eng->GetNumberOfTimesteps();
 	unsigned int length = m_Op_TFSF->m_Exc->GetLength();
 

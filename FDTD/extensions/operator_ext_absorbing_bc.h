@@ -41,6 +41,7 @@
 
 class Operator_Ext_Absorbing_BC : public Operator_Extension
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine_Ext_Absorbing_BC;
 	friend class HIP_Ext_Absorbing_BC;
 	friend class Metal_Ext_Absorbing_BC;
@@ -74,12 +75,14 @@ public:
 	virtual void ShowStat(std::ostream &ostr) const;
 
 	//! Initialize all parameters, so the extension can be built later
-	virtual bool SetInitParams(CSPrimitives* prim, CSPropAbsorbingBC* abc_prop);
+	virtual bool SetInitParams(CSPrimitives* prim, CSPropAbsorbingBC* abc_prop,bool defer=false);
 
 protected:
 
 	Operator_Ext_Absorbing_BC(Operator* op, Operator_Ext_Absorbing_BC* op_ext);
 	void Initialize();
+	CSPrimitives* m_PendingPrimitive=nullptr;
+	CSPropAbsorbingBC* m_PendingProperty=nullptr;
 
 	size_t					m_numCells;		// Number of cells in each primitive
 

@@ -23,14 +23,22 @@ Engine_Ext_LorentzMaterial::Engine_Ext_LorentzMaterial(Operator_Ext_LorentzMater
 {
 	m_Op_Ext_Lor = op_ext_lorentz;
 	m_Order = m_Op_Ext_Lor->GetDispersionOrder();
+	curr_Lor_ADE=nullptr;volt_Lor_ADE=nullptr;
+	if (!op_ext_lorentz->HasDeviceConstruction()) PrepareLorentzHost();
+}
+
+void Engine_Ext_LorentzMaterial::PrepareLorentzHost()
+{
+	PrepareHost();
+	if (curr_Lor_ADE) return;
 	int order = m_Op_Ext_Lor->m_Order;
 
-	curr_Lor_ADE = new FDTD_FLOAT**[order];
-	volt_Lor_ADE = new FDTD_FLOAT**[order];
+	curr_Lor_ADE = new FDTD_FLOAT**[order]();
+	volt_Lor_ADE = new FDTD_FLOAT**[order]();
 	for (int o=0;o<order;++o)
 	{
-		curr_Lor_ADE[o] = new FDTD_FLOAT*[3];
-		volt_Lor_ADE[o] = new FDTD_FLOAT*[3];
+		curr_Lor_ADE[o] = new FDTD_FLOAT*[3]();
+		volt_Lor_ADE[o] = new FDTD_FLOAT*[3]();
 		for (int n=0; n<3; ++n)
 		{
 			if (m_Op_Ext_Lor->m_curr_Lor_ADE_On[o]==true)
@@ -56,19 +64,12 @@ Engine_Ext_LorentzMaterial::Engine_Ext_LorentzMaterial(Operator_Ext_LorentzMater
 
 Engine_Ext_LorentzMaterial::~Engine_Ext_LorentzMaterial()
 {
-	if (curr_Lor_ADE==NULL && volt_Lor_ADE==NULL)
-		return;
-
-	for (int o=0;o<m_Op_Ext_Lor->m_Order;++o)
-	{
-		for (int n=0; n<3; ++n)
+	for (auto arrays:{curr_Lor_ADE,volt_Lor_ADE}) if (arrays)
+		for (int o=0;o<m_Op_Ext_Lor->m_Order;++o) if (arrays[o])
 		{
-			delete[] curr_Lor_ADE[o][n];
-			delete[] volt_Lor_ADE[o][n];
+			for (int n=0;n<3;++n) delete[] arrays[o][n];
+			delete[] arrays[o];
 		}
-		delete[] curr_Lor_ADE[o];
-		delete[] volt_Lor_ADE[o];
-	}
 	delete[] curr_Lor_ADE;
 	curr_Lor_ADE=NULL;
 
@@ -79,6 +80,7 @@ Engine_Ext_LorentzMaterial::~Engine_Ext_LorentzMaterial()
 template <typename EngType>
 void Engine_Ext_LorentzMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 {
+	PrepareLorentzHost();
 	for (int o=0;o<m_Order;++o)
 	{
 		if (m_Op_Ext_Lor->m_volt_ADE_On[o]==false) continue;
@@ -127,6 +129,7 @@ void Engine_Ext_LorentzMaterial::DoPreVoltageUpdates()
 template <typename EngType>
 void Engine_Ext_LorentzMaterial::DoPreCurrentUpdatesImpl(EngType* eng)
 {
+	PrepareLorentzHost();
 	for (int o=0;o<m_Order;++o)
 	{
 		if (m_Op_Ext_Lor->m_curr_ADE_On[o]==false) continue;

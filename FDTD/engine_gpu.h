@@ -31,7 +31,7 @@ class GPU_Extension;
 //! FDTD engine running the main updates on a GPU backend
 /*!
   The fields live on the device (see GPU_Backend). The base class arrays
-  (volt_ptr, curr_ptr) serve as host mirror in the basic engine layout, read by
+  (volt_ptr, curr_ptr) provide lazy host storage in the basic engine layout, read by
   the field processing through GetVolt/GetCurr and by the engine extensions.
   If the device shares its memory with the host, the host mirror is a view of
   the device memory and no copies are needed.
@@ -61,7 +61,8 @@ class Engine_GPU : public Engine
 {
 public:
 	//! Create the engine for \a op on the GPU backend \a backend (see GPU_Backend::New), or for a sub-grid on a backend sharing the work stream of \a parent
-	static Engine_GPU* New(const Operator* op, const std::string& backend, GPU_Backend* parent=NULL);
+	//! Takes ownership of prepared (if supplied), including when initialization fails.
+	static Engine_GPU* New(const Operator* op, const std::string& backend, GPU_Backend* parent=NULL, GPU_Backend* prepared=NULL);
 	virtual ~Engine_GPU();
 
 	//! Create the backend, the device extensions and decide device or host fallback
@@ -89,13 +90,16 @@ public:
 
 	//! True if the extensions run on the host mirror, which is then kept in sync during IterateTS()
 	bool FieldsOnHost() const {return m_FieldsOnHost;}
+	bool HostDumpsOnly() const {return m_DumpPath>=2;}
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>* FieldArray(bool currents) const {return currents ? curr_ptr : volt_ptr;}
 
 	//! Sums of the squared voltages and currents on the device (see GPU_Backend::CalcFastEnergy()); false if it has none or the fields are on the host
 	bool CalcFastEnergy(const unsigned int numNodes[3], double& E_energy, double& H_energy) const;
 
 	//! Host mirror of the fields (basic engine layout)
-	ArrayLib::ArrayNIJK<FDTD_FLOAT>& HostVoltages() const {return *volt_ptr;}
-	ArrayLib::ArrayNIJK<FDTD_FLOAT>& HostCurrents() const {return *curr_ptr;}
+	ArrayLib::ArrayNIJK<FDTD_FLOAT>& HostVoltages() const;
+	ArrayLib::ArrayNIJK<FDTD_FLOAT>& HostCurrents() const;
+	size_t HostFieldStorageBytes() const {return (volt_ptr && volt_ptr->owner() ? volt_ptr->bytes() : 0)+(curr_ptr && curr_ptr->owner() ? curr_ptr->bytes() : 0);}
 
 	//! Make the device results visible in the host mirror
 	void VoltagesToHost();
@@ -111,6 +115,8 @@ public:
 	virtual bool CanSnapshotGather() const;
 	//! Add the raw values \a region of a dump to the snapshots, at \a offset of the voltages or currents (\a h_field)
 	virtual bool AddSnapshotGather(bool h_field, const Engine_GatherRegion& region, size_t& offset);
+	bool AddPreparedSnapshotGather(bool h_field,const std::shared_ptr<GPU_FieldGather>& gather,size_t& offset);
+	int AddPreparedFieldDFT(bool h_field,const std::shared_ptr<GPU_FieldGather>& gather,unsigned int count);
 
 	//! Sums of the weighted raw values \a region on the device, see GPU_Backend::AddFieldDFT(); -1 if not available
 	int AddFieldDFT(bool h_field, const Engine_GatherRegion& region, unsigned int count);
@@ -122,11 +128,16 @@ public:
 	virtual FDTD_FLOAT GetVolt(unsigned int n, const unsigned int pos[3]) const {return GetVolt(n, pos[0], pos[1], pos[2]);}
 	virtual FDTD_FLOAT GetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const;
 	virtual FDTD_FLOAT GetCurr(unsigned int n, const unsigned int pos[3]) const {return GetCurr(n, pos[0], pos[1], pos[2]);}
+	virtual void SetVolt(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value);
+	virtual void SetVolt(unsigned int n, const unsigned int pos[3], FDTD_FLOAT value) {SetVolt(n,pos[0],pos[1],pos[2],value);}
+	virtual void SetCurr(unsigned int n, unsigned int x, unsigned int y, unsigned int z, FDTD_FLOAT value);
+	virtual void SetCurr(unsigned int n, const unsigned int pos[3], FDTD_FLOAT value) {SetCurr(n,pos[0],pos[1],pos[2],value);}
 	//! Make the host mirror changes visible to the device
 	void VoltagesToDevice();
 	void CurrentsToDevice();
 
 protected:
+	void AllocateHostField(bool currents);
 	Engine_GPU(const Operator* op, const std::string& backend, GPU_Backend* parent);
 
 	std::string m_BackendName;
@@ -142,6 +153,10 @@ protected:
 	//! How far the field dumps may use the device (OPENEMS_GPU_DUMPS, for tests and bug reports):
 	//! 0 (device): device sums and snapshots, 1 (snapshot): no device sums, 2 (host): neither
 	int m_DumpPath;
+	std::vector<std::shared_ptr<GPU_FieldGather>> m_PreparedSnapshot[2];
+	size_t m_PreparedSnapshotCount[2]={};
+	bool m_Diagnostics;
+	size_t m_Batches,m_BatchTimesteps;
 
 	//! device implementations of the engine extensions, same order as m_Eng_exts (fast path only)
 	std::vector<GPU_Extension*> m_GPU_exts;

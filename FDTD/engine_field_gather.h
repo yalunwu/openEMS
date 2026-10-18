@@ -21,9 +21,30 @@
 
 #include <complex>
 #include <vector>
+#include <memory>
+#include <mutex>
 #include "Common/engine_interface_base.h"
 #include "tools/constants.h"
 #include "tools/arraylib/array_nijk.h"
+
+struct Engine_GatherEntry
+{
+	enum Form { ZERO, RAW, LERP, AVG4 };
+	unsigned int form;
+	unsigned int idx[4];
+	double delta[4];
+	double rel;
+};
+
+class GPU_FieldGather
+{
+public:
+	virtual ~GPU_FieldGather() {}
+	virtual size_t Count() const=0;
+	virtual void Read(std::vector<Engine_GatherEntry>& output) const=0;
+	virtual bool Evaluate(float* output,size_t count) const {return false;}
+};
+
 
 class Engine_Interface_FDTD;
 class Operator;
@@ -93,6 +114,37 @@ protected:
 	std::vector<unsigned int> m_RegionPos[3][3];  //!< [n][direction][line]: position of the line in region.lines[n][direction]
 	bool m_RegionSnapshot;   //!< a snapshot holds the raw values of the region, see SetSnapshotRegion()
 	size_t m_Offset;
+};
+
+
+//! Device-owned sampling map; host entries are read only for an explicit host dump.
+class Prepared_Field_Gather_FDTD : public Engine_Field_Gather
+{
+public:
+	Prepared_Field_Gather_FDTD(const ArrayLib::ArrayNIJK<FDTD_FLOAT>* volt,
+							  const ArrayLib::ArrayNIJK<FDTD_FLOAT>* curr,
+							  bool magnetic,unsigned int nj,unsigned int nk,bool device=true)
+		: m_Volt(volt),m_Curr(curr),m_H(magnetic),m_nj(nj),m_nk(nk),m_Device(device),m_Snapshot(false),m_Offset(0) {}
+	std::shared_ptr<GPU_FieldGather> prepared;
+	mutable std::vector<Engine_GatherEntry> entries;
+	void EnsureHost() const {std::call_once(m_Read,[this](){prepared->Read(entries);});}
+	bool HField() const {return m_H;}
+	size_t EntryCount() const {return prepared->Count();}
+	unsigned int NumLinesJ() const {return m_nj;}
+	unsigned int NumLinesK() const {return m_nk;}
+	void SetSnapshotEvaluated(size_t offset) {m_Snapshot=true;m_Offset=offset;}
+	bool EvaluateDevice(ArrayLib::ArrayNIJK<float>& field) const override
+	{return m_Device && prepared->Evaluate(field.data(),field.size());}
+	void Evaluate(size_t first,size_t last,ArrayLib::ArrayNIJK<float>& field,const float* src=nullptr) const override;
+	void EvaluateSums(const std::complex<float>* sums,ArrayLib::ArrayNIJK<std::complex<float>>& field) const;
+private:
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>* m_Volt;
+	const ArrayLib::ArrayNIJK<FDTD_FLOAT>* m_Curr;
+	bool m_H;
+	unsigned int m_nj,m_nk;
+	bool m_Device,m_Snapshot;
+	size_t m_Offset;
+	mutable std::once_flag m_Read;
 };
 
 #endif // ENGINE_FIELD_GATHER_H

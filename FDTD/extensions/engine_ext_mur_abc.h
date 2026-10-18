@@ -45,6 +45,7 @@ public:
 	unsigned int GetStartTimestep() const {return m_start_TS;}
 
 protected:
+	void PrepareHost();
 	template <typename EngType>
 	void DoPreVoltageUpdatesImpl(EngType* eng, int threadID);
 

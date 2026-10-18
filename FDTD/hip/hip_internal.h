@@ -30,6 +30,8 @@
 
 #include "gpu_backend_hip.h"
 #include "FDTD/gpu_coeff_sets.h"
+#include "hip_setup_result.h"
+#include "hip_diagnostics.h"
 
 //! Grid size (number of mesh lines) as passed to the kernels
 struct HIP_GridDim
@@ -101,6 +103,11 @@ void HIP_Check(hipError_t err, const char* what);
 //! Device and work stream, shared by the backends of all grids of a simulation (see NewSubGridBackend())
 struct HIP_Context
 {
+	HIP_SetupDiagnostics setup_diagnostics;
+	Excitation* waveform_source=nullptr;
+	unsigned int waveform_length=0;
+	std::weak_ptr<float> waveform[2];
+	size_t setup_start_free=0,setup_future_bytes=0;
 	int device;
 	hipStream_t stream;
 	hipStream_t copy_stream;   //!< downloads of field snapshots, overlapping the work (see GPU_Backend_HIP::SnapshotFields())
@@ -115,9 +122,16 @@ struct HIP_Context
 struct GPU_Backend_HIP::Impl
 {
 	std::shared_ptr<HIP_Context> ctx;
+	std::shared_ptr<HIP_SetupResult> setup_result;
+	Excitation* waveform_source;
+	unsigned int waveform_length;
+	float* waveform[2];
+	std::shared_ptr<float> waveform_owner[2];
 
 	HIP_GridDim dim;
 	size_t numCells;    //!< nx*ny*nz, the field buffers hold 3*numCells values
+	bool diagnostics;
+	size_t stream_waits, range_downloads, range_bytes, field_downloads, field_bytes;
 
 	float *volt, *curr;
 	float2* energy;                      //!< per-line energy sums, see GPU_Backend_HIP::CalcFastEnergy()
@@ -144,6 +158,8 @@ struct GPU_Backend_HIP::Impl
 	int fused_blockers;                      //!< extensions or grids that do not allow it
 	float *volt_next, *curr_next;
 	std::vector<size_t> volt_modified;       //!< flat indices of the voltages the extensions register as changed between the half-steps (excitation, lumped RLC)
+	struct DeviceIndexList {const unsigned int* index;unsigned int count,stride;};
+	std::vector<DeviceIndexList> device_volt_modified;
 	HIP_FusedRegions fregions;              //!< the UPML regions in the kernel (see HIP_Ext_UPML::CanFuse())
 	size_t* fixup;                           //!< main nodes whose currents are recomputed after the voltage extensions
 	unsigned int fixup_count;
@@ -157,6 +173,7 @@ struct GPU_Backend_HIP::Impl
 	std::vector<HIP_GatherRegion> snap_regions[2];   //!< of the voltages, of the currents
 	std::vector<void*> snap_lines;    //!< device line tables of the regions
 	unsigned int snap_nv, snap_n;     //!< number of raw voltages, of all raw values
+	GPU_GatherEntry* snap_entries=nullptr;
 	float* snap_dev;                  //!< the raw values
 	float* snap_host;                 //!< the downloaded raw values
 	hipEvent_t snap_evaluated;       //!< snap_dev is written
@@ -171,6 +188,9 @@ struct GPU_Backend_HIP::Impl
 		unsigned int count;   //!< number of sums per raw value
 		bool currents;        //!< raw values of the currents, else of the voltages
 		float2* sums;         //!< sum k of raw value e at [k*region.total + e]
+		GPU_GatherEntry* entries=nullptr;
+		unsigned int n=0;
+		std::shared_ptr<GPU_FieldGather> prepared;
 	};
 	//! Device copy of the line tables of \a region (one buffer, see TryAlloc()); NULL if out of memory
 	void* UploadRegion(const Engine_GatherRegion& region, HIP_GatherRegion& dev);
@@ -186,8 +206,11 @@ struct GPU_Backend_HIP::Impl
 	T* Alloc(size_t count, const T* host=NULL)
 	{
 		T* ptr = NULL;
-		HIP_Check(hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T)), "hipMalloc");
-		m_Allocations.push_back(ptr);
+		const hipError_t status=HIP_AllocateDevice(Stream(),&ptr, std::max(count, (size_t)1)*sizeof(T));
+		if (status==hipErrorOutOfMemory && (setup_result || ctx->setup_start_free))
+		{hipGetLastError();throw GPU_SetupUnavailable("insufficient device memory during engine initialization");}
+		HIP_Check(status, "hipMalloc");
+		try {m_Allocations.push_back(ptr);} catch (...) {hipFree(ptr);throw;}
 		// on the work stream: it does not synchronize with the legacy default stream
 		if (host && count)
 			HIP_Check(hipMemcpyAsync(ptr, host, count*sizeof(T), hipMemcpyHostToDevice, Stream()), "hipMemcpy");
@@ -203,12 +226,12 @@ struct GPU_Backend_HIP::Impl
 	T* TryAlloc(size_t count)
 	{
 		T* ptr = NULL;
-		if (hipMalloc(&ptr, std::max(count, (size_t)1)*sizeof(T))!=hipSuccess)
+		if (HIP_AllocateDevice(Stream(),&ptr, std::max(count, (size_t)1)*sizeof(T))!=hipSuccess)
 		{
 			(void)hipGetLastError();   // not sticky, but reported by the next CheckLaunch()
 			return NULL;
 		}
-		m_Allocations.push_back(ptr);
+		try {m_Allocations.push_back(ptr);} catch (...) {hipFree(ptr);throw;}
 		return ptr;
 	}
 
@@ -219,6 +242,16 @@ struct GPU_Backend_HIP::Impl
 			return;
 		m_Allocations.erase(std::remove(m_Allocations.begin(), m_Allocations.end(), ptr), m_Allocations.end());
 		hipFree(ptr);
+	}
+
+	//! Take ownership only after registration succeeds; failure leaves the result intact.
+	template <typename T>
+	T* Adopt(T*& buffer)
+	{
+		m_Allocations.push_back(buffer);
+		T* ptr=buffer;
+		buffer=NULL;
+		return ptr;
 	}
 
 	//! Device buffer of the set indices of \a sets (16 or 32 bit)

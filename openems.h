@@ -26,6 +26,7 @@
 #endif
 #include <ctime>
 #include <vector>
+#include <atomic>
 
 #include "openems_global.h"
 
@@ -162,11 +163,14 @@ protected:
 
 	Excitation* m_Exc;
 
-	bool m_Abort;
+	std::atomic<bool> m_Abort;
 
 	enum EngineType {EngineType_Basic, EngineType_SSE, EngineType_SSE_Compressed, EngineType_Multithreaded, EngineType_GPU, EngineType_GPU_Reference};
 	EngineType m_engine;
 	unsigned int m_engine_numThreads;
+	std::string m_GPUSetupMode;
+	bool m_GPUSetupFallback;
+	unsigned int m_GPUSetupTimestepRetries=0;
 
 	//! Setup an operator matching the requested engine
 	virtual bool SetupOperator();

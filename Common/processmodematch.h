@@ -77,6 +77,7 @@ protected:
 
 	unsigned int m_numLines[2];
 	ArrayLib::ArrayIJK<double> m_ModeDist;
+	std::shared_ptr<Engine_SetupTable> m_PreparedMode;
 };
 
 #endif // PROCESSMODEMATCH_H

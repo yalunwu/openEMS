@@ -100,6 +100,7 @@ protected:
 
 	//! precomputed E/H evaluation at the dumped nodes (if the engine interface has one), created at the first CalcField()
 	Engine_Field_Gather* m_Gather;
+	std::shared_ptr<Engine_SamplingMesh> m_SamplingMesh;
 	bool m_GatherTried;
 	double* discLines[3];		//mesh disc lines to dump
 

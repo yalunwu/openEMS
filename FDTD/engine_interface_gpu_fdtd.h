@@ -24,6 +24,7 @@
 #include "engine_interface_fdtd.h"
 
 class Field_Gather_FDTD;
+class Prepared_Field_Gather_FDTD;
 
 class Engine_GPU;
 
@@ -47,6 +48,8 @@ public:
 	virtual ~Engine_Interface_GPU_FDTD();
 
 	virtual double CalcFastEnergy() const;
+	std::shared_ptr<Engine_SetupTable> BuildModeMatch(const Engine_ModeTableInput& input) override;
+	std::shared_ptr<Engine_CellMaterialTable> BuildCellMaterials(const unsigned int lines[3],unsigned int* const positions[3],const std::shared_ptr<Engine_SamplingMesh>& mesh={}) override;
 
 	virtual void PrepareFieldAccess();
 	virtual bool TakeFieldSnapshot(const float* &volt, const float* &curr);
@@ -58,13 +61,14 @@ public:
 	virtual void AccumulateFieldDFT(int id, const std::vector<std::complex<float>>& weights);
 	virtual bool ReadFieldDFT(int id, std::vector<ArrayLib::ArrayNIJK<std::complex<float>>*>& fields);
 
-	virtual Engine_Field_Gather* CreateFieldGather(bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3]) const;
+	virtual Engine_Field_Gather* CreateFieldGather(bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3],const std::shared_ptr<Engine_SamplingMesh>& mesh={}) const;
 
 protected:
 	Engine_GPU* m_Eng_GPU;
 
 	//! the gathers of the field DFTs of the engine, by id (see CreateFieldDFT()); owned by their dumps
 	std::map<int, const Field_Gather_FDTD*> m_FieldDFT;
+	std::map<int, const Prepared_Field_Gather_FDTD*> m_PreparedFieldDFT;
 };
 
 #endif // ENGINE_INTERFACE_GPU_FDTD_H

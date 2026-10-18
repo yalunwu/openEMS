@@ -24,15 +24,21 @@
 #include "Common/operator_base.h"
 
 #include "tools/arraylib/array_nijk.h"
+#include <functional>
+#include <stdexcept>
 
 class Operator_Extension;
 class Operator_Ext_Excitation;
 class Engine;
 class TiXmlElement;
+class GPU_OperatorSetup;
+class GPU_SetupController;
 
 //! Basic FDTD-operator
 class Operator : public Operator_Base
 {
+	friend class HIP_OperatorSetup;
+	friend class GPU_SetupController;
 	friend class Engine;
 	friend class Engine_Interface_FDTD;
 	friend class Operator_Ext_LorentzMaterial;
@@ -59,6 +65,11 @@ public:
 	virtual bool SetGeometryCSX(ContinuousStructure* geo);
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
+	virtual GPU_OperatorSetup* GetSetupBackend() const {return NULL;}
+	virtual GPU_SetupController* GetConstruction() const {return nullptr;}
+	void SetCellMaterialStorage(bool value=true) {m_StoreCellMaterials=value;}
+	void SetSetupCancellation(std::function<bool()> cancelled) {m_SetupCancelled=std::move(cancelled);}
+	void CheckSetupCancellation() const {if (m_SetupCancelled && m_SetupCancelled()) throw std::runtime_error("FDTD setup cancelled");}
 
 	// the next four functions need to be reimplemented in a derived class
 	inline virtual FDTD_FLOAT GetVV(unsigned int n, unsigned int x, unsigned int y, unsigned int z) const
@@ -226,6 +237,7 @@ public:
 
 	virtual void SetExcitationSignal(Excitation* exc);
 	virtual Excitation* GetExcitationSignal() const {return m_Exc;}
+	virtual bool BuildExcitationSignal(unsigned int maxTS);
 
 	Operator_Ext_Excitation* GetExcitationExtension() const;
 
@@ -266,6 +278,7 @@ protected:
 	int m_TimeStepVar;
 	double m_TimeStepFactor;
 	virtual double CalcTimestep();
+	virtual void ApplyTimestepSettings();
 	double opt_dT;
 	bool m_InvaildTimestep;
 	std::string m_Used_TS_Name;
@@ -323,6 +336,9 @@ protected:
 
 	//! Calc operator at certain \a pos
 	virtual void Calc_ECOperatorPos(int n, unsigned int* pos);
+	//! Same coefficient arithmetic with an already computed EC index; does not move MainOp's cursor.
+	void Calc_ECOperatorPos(int n, unsigned int* pos, unsigned int index);
+	virtual void CalcCoefficients();
 
 	//! Calculate and setup lumped elements
 	virtual bool Calc_LumpedElements();
@@ -338,6 +354,8 @@ protected:
 	ArrayLib::ArrayNIJK<float>* m_kappa_ptr;
 	ArrayLib::ArrayNIJK<float>* m_mueR_ptr;
 	ArrayLib::ArrayNIJK<float>* m_sigma_ptr;
+	bool m_StoreCellMaterials=false;
+	std::function<bool()> m_SetupCancelled;
 
 	//EC elements, internal only!
 	virtual void Init_EC();

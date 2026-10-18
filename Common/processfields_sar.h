@@ -58,6 +58,7 @@ protected:
 
 	//! frequency domain current density storage (the electric field is in m_FD_Fields)
 	std::vector<ArrayLib::ArrayNIJK<std::complex<float>>*> m_J_FD_Fields;
+	std::shared_ptr<Engine_CellMaterialTable> m_PreparedMaterials;
 };
 
 #endif // PROCESSFIELDS_SAR_H

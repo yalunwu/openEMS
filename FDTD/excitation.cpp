@@ -19,6 +19,7 @@
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
+#include <memory>
 #include "fparser.hh"
 #include "excitation.h"
 
@@ -28,6 +29,7 @@ Excitation::Excitation()
 {
 	m_signal_volt = 0;
 	m_signal_curr = 0;
+	m_MaterializeSignal = {};
 
 	this->Reset(0);
 
@@ -42,7 +44,10 @@ Excitation::~Excitation()
 
 void Excitation::Reset( double timestep )
 {
+	m_MaterializeSignal = {};
 	m_length = 0;
+	m_HasDevicePeak = false;
+	m_DevicePeak = 0;
 	delete[] m_signal_volt;
 	m_signal_volt = 0;
 	delete[] m_signal_curr;
@@ -136,6 +141,7 @@ bool Excitation::buildExcitationSignal(unsigned int maxTS)
 
 unsigned int Excitation::GetMaxExcitationTimestep() const
 {
+	if (m_HasDevicePeak) return m_DevicePeak;
 	FDTD_FLOAT maxAmp=0;
 	unsigned int maxStep=0;
 	for (unsigned int n=0; n<m_length; ++n)
@@ -148,6 +154,21 @@ unsigned int Excitation::GetMaxExcitationTimestep() const
 	}
 	return maxStep;
 }
+
+FDTD_FLOAT* Excitation::MaterializeSignal(bool current) const
+{
+	FDTD_FLOAT*& signal=current ? m_signal_curr : m_signal_volt;
+	if (!signal && m_length && m_MaterializeSignal)
+	{
+		std::unique_ptr<FDTD_FLOAT[]> values(new FDTD_FLOAT[m_length]);
+		m_MaterializeSignal(current,values.get(),m_length);
+		signal=values.release();
+	}
+	return signal;
+}
+
+FDTD_FLOAT* Excitation::GetVoltageSignal() const {return MaterializeSignal(false);}
+FDTD_FLOAT* Excitation::GetCurrentSignal() const {return MaterializeSignal(true);}
 
 void Excitation::CalcGaussianPulsExcitation(double f0, double fc, int nTS)
 {
@@ -280,8 +301,9 @@ void Excitation::DumpVoltageExcite(string filename)
 	file.open( filename.c_str() );
 	if (file.fail())
 		return;
+	const FDTD_FLOAT* signal=GetVoltageSignal();
 	for (unsigned int n=0; n<m_length; ++n)
-		file << n*m_dT << "\t" << m_signal_volt[n] << "\n";
+		file << n*m_dT << "\t" << signal[n] << "\n";
 	file.close();
 }
 
@@ -291,8 +313,9 @@ void Excitation::DumpCurrentExcite(string filename)
 	file.open( filename.c_str() );
 	if (file.fail())
 		return;
+	const FDTD_FLOAT* signal=GetCurrentSignal();
 	for (unsigned int n=0; n<m_length; ++n)
-		file << n*m_dT + 0.5*m_dT << "\t" << m_signal_curr[n] << "\n";
+		file << n*m_dT + 0.5*m_dT << "\t" << signal[n] << "\n";
 	file.close();
 }
 

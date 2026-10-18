@@ -22,13 +22,21 @@
 Engine_Ext_DebyeMaterial::Engine_Ext_DebyeMaterial(Operator_Ext_DebyeMaterial* op_ext_debye) : Engine_Ext_Dispersive(op_ext_debye)
 {
 	m_Op_Ext_Deb = op_ext_debye;
+	volt_pole_ADE=nullptr;volt_pre_ADE=nullptr;
+	if (!op_ext_debye->HasDeviceConstruction()) PrepareDebyeHost();
+}
+
+void Engine_Ext_DebyeMaterial::PrepareDebyeHost()
+{
+	PrepareHost();
+	if (volt_pole_ADE) return;
 	// the base allocated volt_ADE[0], which carries the joint correction
 	size_t count = m_Op_Ext_Deb->m_LM_Count.at(0);
 
-	volt_pole_ADE = new FDTD_FLOAT**[m_Op_Ext_Deb->m_PoleCount];
+	volt_pole_ADE = new FDTD_FLOAT**[m_Op_Ext_Deb->m_PoleCount]();
 	for (int o=0; o<m_Op_Ext_Deb->m_PoleCount; ++o)
 	{
-		volt_pole_ADE[o] = new FDTD_FLOAT*[3];
+		volt_pole_ADE[o] = new FDTD_FLOAT*[3]();
 		for (int n=0; n<3; ++n)
 		{
 			volt_pole_ADE[o][n] = new FDTD_FLOAT[count];
@@ -37,7 +45,7 @@ Engine_Ext_DebyeMaterial::Engine_Ext_DebyeMaterial(Operator_Ext_DebyeMaterial* o
 		}
 	}
 
-	volt_pre_ADE = new FDTD_FLOAT*[3];
+	volt_pre_ADE = new FDTD_FLOAT*[3]();
 	for (int n=0; n<3; ++n)
 	{
 		volt_pre_ADE[n] = new FDTD_FLOAT[count];
@@ -52,6 +60,7 @@ Engine_Ext_DebyeMaterial::~Engine_Ext_DebyeMaterial()
 	{
 		for (int o=0; o<m_Op_Ext_Deb->m_PoleCount; ++o)
 		{
+			if (!volt_pole_ADE[o]) continue;
 			for (int n=0; n<3; ++n)
 				delete[] volt_pole_ADE[o][n];
 			delete[] volt_pole_ADE[o];
@@ -70,6 +79,7 @@ Engine_Ext_DebyeMaterial::~Engine_Ext_DebyeMaterial()
 template <typename EngType>
 void Engine_Ext_DebyeMaterial::DoPreVoltageUpdatesImpl(EngType* eng)
 {
+	PrepareDebyeHost();
 	unsigned int **pos = m_Op_Ext_Deb->m_LM_pos[0];
 	int poles = m_Op_Ext_Deb->m_PoleCount;
 
@@ -100,6 +110,7 @@ void Engine_Ext_DebyeMaterial::DoPreVoltageUpdates()
 template <typename EngType>
 void Engine_Ext_DebyeMaterial::DoPostVoltageUpdatesImpl(EngType* eng)
 {
+	PrepareDebyeHost();
 	unsigned int **pos = m_Op_Ext_Deb->m_LM_pos[0];
 	int poles = m_Op_Ext_Deb->m_PoleCount;
 

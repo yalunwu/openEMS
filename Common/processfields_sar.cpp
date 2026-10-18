@@ -16,6 +16,7 @@
 */
 
 #include "processfields_sar.h"
+#include <stdexcept>
 #include "operator_base.h"
 #include "tools/vtk_file_writer.h"
 #include "tools/hdf5_file_writer.h"
@@ -88,6 +89,7 @@ void ProcessFieldsSAR::InitProcess()
 
 	if (Enabled==false) return;
 
+	m_PreparedMaterials=m_Eng_Interface->BuildCellMaterials(numLines,posLines,m_SamplingMesh);
 	// the E field in the frequency domain arrays of ProcessFieldsFD, the J field here
 	if (!m_UseCellKappa)
 		for (size_t n = 0; n<m_FD_Samples.size(); ++n)
@@ -173,6 +175,7 @@ int ProcessFieldsSAR::Process()
 void ProcessFieldsSAR::DumpFDData()
 {
 	if (Enabled==false) return;
+
 	unsigned int pos[3];
 	unsigned int orig_pos[3];
 	ArrayLib::ArrayIJK<float> SAR("SAR", numLines);
@@ -188,9 +191,21 @@ void ProcessFieldsSAR::DumpFDData()
 		cell_kappa.Init("cell_kappa", numLines);
 
 	bool found_UnIsotropic=false;
+	if (m_PreparedMaterials)
+	{
+		const size_t count=size_t(numLines[0])*numLines[1]*numLines[2];
+		if (m_PreparedMaterials->Count()!=3*count) throw std::logic_error("prepared SAR material dimensions differ");
+		std::vector<double> samples(3*count);m_PreparedMaterials->Read(samples.data(),samples.size());
+		for (size_t n=0;n<count;++n)
+		{
+			cell_volume.data()[n]=float(samples[n]);cell_density.data()[n]=float(samples[count+n]);
+			if (m_UseCellKappa) cell_kappa.data()[n]=float(samples[2*count+n]);
+		}
+		found_UnIsotropic=m_PreparedMaterials->AnyAnisotropic();
+	}
 
 	// calculate volumes and masses for all cells
-	for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+	for (pos[0]=0; !m_PreparedMaterials && pos[0]<numLines[0]; ++pos[0])
 	{
 		orig_pos[0] = posLines[0][pos[0]];
 		for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])

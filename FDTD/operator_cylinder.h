@@ -21,6 +21,10 @@
 #define OPERATOR_CYLINDER_CLOSED_ALPHA_THRESHOLD 1e-6
 
 #include "operator_multithread.h"
+#include <memory>
+
+class GPU_SetupController;
+struct GPU_MultiGridInterpolation;
 
 class GPU_Backend;
 
@@ -96,7 +100,25 @@ public:
 
 	//! Create a GPU engine on backend \a backend (see GPU_Backend::New) instead of the multithreaded engine; empty: multithreaded engine.
 	//! A multi-grid sub-grid passes the backend of its parent grid as \a parent (see GPU_Backend::NewSubGridBackend()).
-	void SetGPUBackend(const std::string& backend, GPU_Backend* parent=NULL) {m_GPU_Backend = backend; m_GPU_Parent = parent;}
+	void SetGPUBackend(const std::string& backend,GPU_Backend* parent=NULL,const std::string& setup="");
+	GPU_OperatorSetup* GetSetupBackend() const override;
+	GPU_SetupController* GetConstruction() const override;
+	bool HasDeviceConstruction() const;
+	void MaterializeMultiGrid(GPU_MultiGridInterpolation& output) const;
+	bool BuildExcitationSignal(unsigned int maxTS) override;
+	FDTD_FLOAT GetVV(unsigned int n,unsigned int x,unsigned int y,unsigned int z) const override;
+	FDTD_FLOAT GetVI(unsigned int n,unsigned int x,unsigned int y,unsigned int z) const override;
+	FDTD_FLOAT GetII(unsigned int n,unsigned int x,unsigned int y,unsigned int z) const override;
+	FDTD_FLOAT GetIV(unsigned int n,unsigned int x,unsigned int y,unsigned int z) const override;
+	using Operator_Multithread::GetVV;using Operator_Multithread::GetVI;using Operator_Multithread::GetII;using Operator_Multithread::GetIV;
+	void SetVV(unsigned int n,unsigned int x,unsigned int y,unsigned int z,FDTD_FLOAT value) override;
+	void SetVI(unsigned int n,unsigned int x,unsigned int y,unsigned int z,FDTD_FLOAT value) override;
+	void SetII(unsigned int n,unsigned int x,unsigned int y,unsigned int z,FDTD_FLOAT value) override;
+	void SetIV(unsigned int n,unsigned int x,unsigned int y,unsigned int z,FDTD_FLOAT value) override;
+	void ApplyElectricBC(bool* dirs) override;
+	void DumpOperator2File(std::string filename) override;
+	void DumpPEC2File(std::string filename,unsigned int* range=nullptr) override;
+	void ShowStat() const override;
 
 	virtual void AddExtension(Operator_Extension* op_ext);
 
@@ -122,11 +144,18 @@ protected:
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
 	virtual double CalcTimestep();
+	void Init_EC() override;
+	void InitOperator() override;
+	bool Calc_EC() override;
+	void CalcCoefficients() override;
+	bool CalcPEC() override;
 	bool CC_closedAlpha;
 	bool CC_R0_included;
 
 	std::string m_GPU_Backend;
 	GPU_Backend* m_GPU_Parent;
+	std::string m_GPU_SetupMode;
+	std::unique_ptr<GPU_SetupController> m_GPUConstruction;
 	Operator_Ext_Cylinder* m_Cyl_Ext;
 };
 

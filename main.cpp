@@ -18,6 +18,7 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <exception>
 
 #include "openems.h"
 
@@ -29,7 +30,7 @@
 
 using namespace std;
 
-int main(int argc, const char* argv[])
+int main(int argc, const char* argv[]) try
 {
 	openEMS FDTD;
 
@@ -61,4 +62,14 @@ int main(int argc, const char* argv[])
 	}
 
 	return 0;
+}
+catch (const std::exception& error)
+{
+	cerr << "openEMS: " << error.what() << endl;
+	return 2;
+}
+catch (...)
+{
+	cerr << "openEMS: Unknown exception during simulation setup or execution" << endl;
+	return 2;
 }

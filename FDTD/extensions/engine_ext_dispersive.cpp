@@ -22,13 +22,21 @@
 Engine_Ext_Dispersive::Engine_Ext_Dispersive(Operator_Ext_Dispersive* op_ext_disp) : Engine_Extension(op_ext_disp)
 {
 	m_Op_Ext_Disp = op_ext_disp;
+	curr_ADE=nullptr;volt_ADE=nullptr;
+	if (!op_ext_disp->HasDeviceConstruction()) PrepareHost();
+}
+
+void Engine_Ext_Dispersive::PrepareHost()
+{
+	m_Op_Ext_Disp->EnsureHostConstruction();
+	if (curr_ADE) return;
 	int order = m_Op_Ext_Disp->m_Order;
-	curr_ADE = new FDTD_FLOAT**[order];
-	volt_ADE = new FDTD_FLOAT**[order];
+	curr_ADE = new FDTD_FLOAT**[order]();
+	volt_ADE = new FDTD_FLOAT**[order]();
 	for (int o=0;o<order;++o)
 	{
-		curr_ADE[o] = new FDTD_FLOAT*[3];
-		volt_ADE[o] = new FDTD_FLOAT*[3];
+		curr_ADE[o] = new FDTD_FLOAT*[3]();
+		volt_ADE[o] = new FDTD_FLOAT*[3]();
 		for (int n=0; n<3; ++n)
 		{
 			if (m_Op_Ext_Disp->m_curr_ADE_On[o]==true)
@@ -53,19 +61,12 @@ Engine_Ext_Dispersive::Engine_Ext_Dispersive(Operator_Ext_Dispersive* op_ext_dis
 
 Engine_Ext_Dispersive::~Engine_Ext_Dispersive()
 {
-	if (curr_ADE==NULL && volt_ADE==NULL)
-		return;
-
-	for (int o=0;o<m_Op_Ext_Disp->m_Order;++o)
-	{
-		for (int n=0; n<3; ++n)
+	for (auto arrays:{curr_ADE,volt_ADE}) if (arrays)
+		for (int o=0;o<m_Op_Ext_Disp->m_Order;++o) if (arrays[o])
 		{
-			delete[] curr_ADE[o][n];
-			delete[] volt_ADE[o][n];
+			for (int n=0;n<3;++n) delete[] arrays[o][n];
+			delete[] arrays[o];
 		}
-		delete[] curr_ADE[o];
-		delete[] volt_ADE[o];
-	}
 	delete[] curr_ADE;
 	curr_ADE=NULL;
 
@@ -76,6 +77,7 @@ Engine_Ext_Dispersive::~Engine_Ext_Dispersive()
 template <typename EngType>
 void Engine_Ext_Dispersive::Apply2VoltagesImpl(EngType* eng)
 {
+	PrepareHost();
 	for (int o=0;o<m_Op_Ext_Disp->m_Order;++o)
 	{
 		if (m_Op_Ext_Disp->m_volt_ADE_On[o]==false) continue;
@@ -105,6 +107,7 @@ void Engine_Ext_Dispersive::Apply2Voltages()
 template <typename EngType>
 void Engine_Ext_Dispersive::Apply2CurrentImpl(EngType* eng)
 {
+	PrepareHost();
 	for (int o=0;o<m_Op_Ext_Disp->m_Order;++o)
 	{
 		if (m_Op_Ext_Disp->m_curr_ADE_On[o]==false) continue;

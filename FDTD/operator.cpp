@@ -19,11 +19,15 @@
 #include <algorithm>
 #include <stdexcept>
 #include "operator.h"
+#include "gpu_setup_processing.h"
+#include "gpu_operator_setup.h"
+#include "gpu_setup_controller.h"
 #include "engine.h"
 #include "extensions/operator_extension.h"
 #include "extensions/operator_ext_excitation.h"
 #include "Common/processfields.h"
 #include "tools/vtk_file_writer.h"
+#include "tools/setup_timer.h"
 #include "fparser.hh"
 #include "extensions/operator_ext_excitation.h"
 
@@ -74,6 +78,7 @@ Engine* Operator::CreateEngine()
 
 void Operator::Init()
 {
+	m_StoreCellMaterials=false;
 	CSX = NULL;
 	m_Engine = NULL;
 
@@ -101,6 +106,7 @@ void Operator::Init()
 
 	m_Exc = 0;
 	m_TimeStepFactor = 1;
+	for (int n=0;n<6;++n) m_BC_Size[n]=0;
 	SetMaterialAvgMethod(QuarterCell);
 }
 
@@ -283,6 +289,8 @@ unsigned int Operator::SnapToMeshLine(int ny, double coord, bool &inside, bool d
 
 bool Operator::SnapToMesh(const double* dcoord, unsigned int* uicoord, bool dualMesh, bool fullMesh, bool* inside) const
 {
+	int dimension=0;unsigned int last[3];
+	if (GPU_SetupProcessingSnap(this,dcoord,dcoord,uicoord,last,dualMesh,fullMesh,0,true,inside,nullptr,dimension)) return dimension==3;
 	bool meshInside=false;
 	bool ok=true;
 	for (int n=0; n<3; ++n)
@@ -297,6 +305,10 @@ bool Operator::SnapToMesh(const double* dcoord, unsigned int* uicoord, bool dual
 
 int Operator::SnapBox2Mesh(const double* start, const double* stop, unsigned int* uiStart, unsigned int* uiStop, bool dualMesh, bool fullMesh, int SnapMethod, bool* bStartIn, bool* bStopIn) const
 {
+	if (GetSetupBackend() && !bStartIn && !bStopIn)
+		return GetSetupBackend()->SnapBox2Mesh(start,stop,uiStart,uiStop,dualMesh,fullMesh,SnapMethod);
+	int dimension=0;
+	if (GPU_SetupProcessingSnap(this,start,stop,uiStart,uiStop,dualMesh,fullMesh,SnapMethod,false,bStartIn,bStopIn,dimension)) return dimension;
 	double l_start[3], l_stop[3];
 	for (int n=0;n<3;++n)
 	{
@@ -571,6 +583,7 @@ void Operator::DumpOperator2File(std::string filename)
 
 	if (Op_Ext_Exc)
 	{
+		Op_Ext_Exc->EnsureHostConstruction();
 		if (Op_Ext_Exc->Volt_Count>0)
 		{
 			ArrayLib::ArrayNIJK<FDTD_FLOAT> exc("exc", numLines);
@@ -748,9 +761,22 @@ void Operator::DumpMaterial2File(std::string filename)
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> mue("mueR", numLines);
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> kappa("kappa", numLines);
 	ArrayLib::ArrayNIJK<FDTD_FLOAT> sigma("sigma", numLines);
+	auto* construction=GetConstruction();
+	const bool prepared=construction && m_epsR_ptr && m_kappa_ptr && m_mueR_ptr && m_sigma_ptr;
+	if (prepared)
+	{
+		construction->ReadMaterials(0,0,epsilon.size(),epsilon.data());
+		construction->ReadMaterials(1,0,kappa.size(),kappa.data());
+		construction->ReadMaterials(2,0,mue.size(),mue.data());
+		construction->ReadMaterials(3,0,sigma.size(),sigma.data());
+		for (size_t n=0;n<epsilon.size();++n) {epsilon.data()[n]/=EPS0;mue.data()[n]/=MUE0;}
+	}
 
 	unsigned int pos[3];
-	for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+	// An explicit post-setup dump can request materials that were not retained.
+	// This explicit CPU output consumer keeps the original query semantics.
+	if (construction && !prepared) cout << "GPU requested host material debug evaluation (storage was not retained)" << endl;
+	for (pos[0]=0; !prepared && pos[0]<numLines[0]; ++pos[0])
 	{
 		for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
 		{
@@ -851,6 +877,12 @@ void Operator::InitOperator()
 
 void Operator::InitDataStorage()
 {
+	if (GetSetupBackend())
+	{
+		ArrayLib::ArrayNIJK<float>** arrays[]={&m_epsR_ptr,&m_kappa_ptr,&m_mueR_ptr,&m_sigma_ptr};
+		for (int k=0;k<4;++k) {delete *arrays[k];*arrays[k]=m_StoreMaterial[k] ? new ArrayLib::ArrayNIJK<float>() : nullptr;}
+		return;
+	}
 	if (m_StoreMaterial[0])
 	{
 		if (g_settings.GetVerboseLevel()>0)
@@ -911,6 +943,10 @@ void Operator::CleanupMaterialStorage()
 
 double Operator::GetDiscMaterial(int type, int n, const unsigned int pos[3]) const
 {
+	ArrayLib::ArrayNIJK<float>* arrays[]={m_epsR_ptr,m_kappa_ptr,m_mueR_ptr,m_sigma_ptr};
+	if (type>=0 && type<4 && arrays[type] && !arrays[type]->valid())
+		if (auto* construction=GetConstruction())
+			return construction->Material(type,((size_t(n)*numLines[0]+pos[0])*numLines[1]+pos[1])*numLines[2]+pos[2]);
 	switch (type)
 	{
 	case 0:
@@ -954,9 +990,19 @@ void Operator::SetExcitationSignal(Excitation* exc)
 	m_Exc=exc;
 }
 
+bool Operator::BuildExcitationSignal(unsigned int maxTS)
+{
+	return m_Exc && m_Exc->buildExcitationSignal(maxTS);
+}
+
 void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 {
 	unsigned int i = MainOp->SetPos(pos[0],pos[1],pos[2]);
+	Calc_ECOperatorPos(n, pos, i);
+}
+
+void Operator::Calc_ECOperatorPos(int n, unsigned int* pos, unsigned int i)
+{
 	double C = EC_C[n][i];
 	double G = EC_G[n][i];
 	if (C>0)
@@ -986,11 +1032,14 @@ void Operator::Calc_ECOperatorPos(int n, unsigned int* pos)
 
 int Operator::CalcECOperator( DebugFlags debugFlags )
 {
+	SetupTimer timer("Operator setup");
 	Init_EC();
 	InitDataStorage();
+	timer.Report("allocation");
 
 	if (Calc_EC()==0)
 		return -1;
+	timer.Report("material averaging");
 
 	m_InvaildTimestep = false;
 	opt_dT = 0;
@@ -1009,37 +1058,18 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	}
 	else
 		CalcTimestep();
+	timer.Report("timestep");
 
-	dT*=m_TimeStepFactor;
-
-	if (m_Exc->GetSignalPeriod()>0)
-	{
-		unsigned int TS = ceil(m_Exc->GetSignalPeriod()/dT);
-		double new_dT = m_Exc->GetSignalPeriod()/TS;
-		cout << "Operartor::CalcECOperator: Decreasing timestep by " << round((dT-new_dT)/dT*1000)/10.0 << "% to " << new_dT << " (" << dT << ") to match periodic signal" << endl;
-		dT = new_dT;
-	}
+	ApplyTimestepSettings();
 
 	m_Exc->Reset(dT);
 
 	InitOperator();
+	timer.Report("excitation and coefficient allocation");
 
-	unsigned int pos[3];
+	CalcCoefficients();
 
-	for (int n=0; n<3; ++n)
-	{
-		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
-		{
-			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
-			{
-				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
-				{
-					Calc_ECOperatorPos(n,pos);
-				}
-			}
-		}
-	}
-
+	timer.Report("coefficients");
 	//Apply PEC to all boundary's
 	bool PEC[6]={1,1,1,1,1,1};
 	//make an exception for BC == -1
@@ -1056,10 +1086,12 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 	for (int n=0; n<6; ++n)
 		PMC[n] = m_BC[n]==1;
 	ApplyMagneticBC(PMC);
+	timer.Report("PEC, lumped RC and boundaries");
 
 	//all information available for extension... create now...
+	GPU_OperatorSetup* setup=GetSetupBackend();
 	for (size_t n=0; n<m_Op_exts.size(); ++n)
-		if (m_Op_exts.at(n)->BuildExtension()==false)
+		if ((setup ? setup->BuildExtension(*m_Op_exts.at(n)) : m_Op_exts.at(n)->BuildExtension())==false)
 			m_Op_exts.at(n)->SetActive(false); //extension has nothing to do or failed to build, drop it below
 
 	//remove inactive extensions
@@ -1073,6 +1105,12 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		}
 		else
 			++it;
+	}
+	timer.Report("extensions");
+	if (setup)
+	{
+		setup->SynchronizeOperator();
+		timer.Report("final host synchronization");
 	}
 
 	if (debugFlags & debugMaterial)
@@ -1095,7 +1133,30 @@ int Operator::CalcECOperator( DebugFlags debugFlags )
 		EC_R[n]=NULL;
 	}
 
+	timer.Report("debug output and cleanup");
 	return 0;
+}
+
+void Operator::ApplyTimestepSettings()
+{
+	dT*=m_TimeStepFactor;
+	if (m_Exc->GetSignalPeriod()>0)
+	{
+		unsigned int TS=ceil(m_Exc->GetSignalPeriod()/dT);
+		double new_dT=m_Exc->GetSignalPeriod()/TS;
+		cout << "Operartor::CalcECOperator: Decreasing timestep by " << round((dT-new_dT)/dT*1000)/10.0 << "% to " << new_dT << " (" << dT << ") to match periodic signal" << endl;
+		dT=new_dT;
+	}
+}
+
+void Operator::CalcCoefficients()
+{
+	unsigned int pos[3];
+	for (int n=0; n<3; ++n)
+		for (pos[0]=0; pos[0]<numLines[0]; ++pos[0])
+			for (pos[1]=0; pos[1]<numLines[1]; ++pos[1])
+				for (pos[2]=0; pos[2]<numLines[2]; ++pos[2])
+					Calc_ECOperatorPos(n,pos);
 }
 
 void Operator::ApplyElectricBC(bool* dirs)
@@ -1644,22 +1705,27 @@ bool Operator::Calc_LumpedElements()
 				unsigned int pos[3];
 				double unitGC=0;
 				int ipos=0;
-				for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
+				if (GetSetupBackend())
+					unitGC=GetSetupBackend()->LumpedGeometry(ny,uiStart,uiStop);
+				else
 				{
-					double unitGC_Plane=0;
-					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
+					for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
 					{
-						for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
+						double unitGC_Plane=0;
+						for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
 						{
-							// capacity/conductivity in parallel: add values
-							unitGC_Plane += GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
+							for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
+							{
+								// capacity/conductivity in parallel: add values
+								unitGC_Plane += GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
+							}
 						}
-					}
 
-					//capacity/conductivity in series: add reciprocal values
-					unitGC += 1/unitGC_Plane;
+						//capacity/conductivity in series: add reciprocal values
+						unitGC += 1/unitGC_Plane;
+					}
+					unitGC = 1/unitGC;
 				}
-				unitGC = 1/unitGC;
 
 				bool caps = PLE->GetCaps();
 				double kappa = 0;
@@ -1678,64 +1744,69 @@ bool Operator::Calc_LumpedElements()
 					}
 				}
 
-				for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
+				if (GetSetupBackend())
+					GetSetupBackend()->ApplyLumpedRC(ny,uiStart,uiStop,C,R,epsilon,kappa,caps);
+				else
 				{
-					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
+					for (pos[ny]=uiStart[ny];pos[ny]<uiStop[ny];++pos[ny])
 					{
-						for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
+						for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
 						{
-							ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
-							if (C>0)
-								EC_C[ny][ipos] = epsilon * GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
-							if (R>0)
-								EC_G[ny][ipos] = kappa * GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
-
-							if (R==0) //make lumped element a PEC if resistance is zero
+							for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
 							{
-								SetVV(ny,pos[0],pos[1],pos[2], 0 );
-								SetVI(ny,pos[0],pos[1],pos[2], 0 );
+								ipos = MainOp->SetPos(pos[0],pos[1],pos[2]);
+								if (C>0)
+									EC_C[ny][ipos] = epsilon * GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
+								if (R>0)
+									EC_G[ny][ipos] = kappa * GetEdgeArea(ny,pos)/GetEdgeLength(ny,pos);
+
+								if (R==0) //make lumped element a PEC if resistance is zero
+								{
+									SetVV(ny,pos[0],pos[1],pos[2], 0 );
+									SetVI(ny,pos[0],pos[1],pos[2], 0 );
+								}
+								else //recalculate operator inside the lumped element
+									Calc_ECOperatorPos(ny,pos);
 							}
-							else //recalculate operator inside the lumped element
-								Calc_ECOperatorPos(ny,pos);
 						}
 					}
-				}
 
-				// setup metal caps
-				if (caps)
-				{
-					for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
+					// setup metal caps
+					if (caps)
 					{
-						for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
+						for (pos[nyP]=uiStart[nyP];pos[nyP]<=uiStop[nyP];++pos[nyP])
 						{
-							pos[ny]=uiStart[ny];
-							if (pos[nyP]<uiStop[nyP])
+							for (pos[nyPP]=uiStart[nyPP];pos[nyPP]<=uiStop[nyPP];++pos[nyPP])
 							{
-								SetVV(nyP,pos[0],pos[1],pos[2], 0 );
-								SetVI(nyP,pos[0],pos[1],pos[2], 0 );
-								++m_Nr_PEC[nyP];
-							}
+								pos[ny]=uiStart[ny];
+								if (pos[nyP]<uiStop[nyP])
+								{
+									SetVV(nyP,pos[0],pos[1],pos[2], 0 );
+									SetVI(nyP,pos[0],pos[1],pos[2], 0 );
+									++m_Nr_PEC[nyP];
+								}
 
-							if (pos[nyPP]<uiStop[nyPP])
-							{
-								SetVV(nyPP,pos[0],pos[1],pos[2], 0 );
-								SetVI(nyPP,pos[0],pos[1],pos[2], 0 );
-								++m_Nr_PEC[nyPP];
-							}
+								if (pos[nyPP]<uiStop[nyPP])
+								{
+									SetVV(nyPP,pos[0],pos[1],pos[2], 0 );
+									SetVI(nyPP,pos[0],pos[1],pos[2], 0 );
+									++m_Nr_PEC[nyPP];
+								}
 
-							pos[ny]=uiStop[ny];
-							if (pos[nyP]<uiStop[nyP])
-							{
-								SetVV(nyP,pos[0],pos[1],pos[2], 0 );
-								SetVI(nyP,pos[0],pos[1],pos[2], 0 );
-								++m_Nr_PEC[nyP];
-							}
+								pos[ny]=uiStop[ny];
+								if (pos[nyP]<uiStop[nyP])
+								{
+									SetVV(nyP,pos[0],pos[1],pos[2], 0 );
+									SetVI(nyP,pos[0],pos[1],pos[2], 0 );
+									++m_Nr_PEC[nyP];
+								}
 
-							if (pos[nyPP]<uiStop[nyPP])
-							{
-								SetVV(nyPP,pos[0],pos[1],pos[2], 0 );
-								SetVI(nyPP,pos[0],pos[1],pos[2], 0 );
-								++m_Nr_PEC[nyPP];
+								if (pos[nyPP]<uiStop[nyPP])
+								{
+									SetVV(nyPP,pos[0],pos[1],pos[2], 0 );
+									SetVI(nyPP,pos[0],pos[1],pos[2], 0 );
+									++m_Nr_PEC[nyPP];
+								}
 							}
 						}
 					}
@@ -2129,6 +2200,7 @@ void Operator::DeleteExtension(Operator_Extension* op_ext)
 
 double Operator::CalcNumericPhaseVelocity(unsigned int start[3], unsigned int stop[3], double propDir[3], float freq) const
 {
+	if (GetSetupBackend()) return GetSetupBackend()->CalcNumericPhaseVelocity(start,stop,propDir,freq);
 	double average_mesh_disc[3];
 	double c0 = C0/sqrt(GetBackgroundEpsR()*GetBackgroundMueR());
 

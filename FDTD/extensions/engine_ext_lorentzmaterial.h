@@ -33,6 +33,7 @@ public:
 	virtual void DoPreCurrentUpdates();
 
 protected:
+	void PrepareLorentzHost();
 	template <typename EngType>
 	void DoPreVoltageUpdatesImpl(EngType* eng);
 

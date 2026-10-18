@@ -20,6 +20,7 @@
 #include "FDTD/engine.h"
 #include "FDTD/extensions/operator_ext_absorbing_bc.h"
 #include "FDTD/extensions/engine_ext_absorbing_bc.h"
+#include <iostream>
 
 // Local absorbing sheet (first order Mur, optionally with super-absorption of the
 // currents), see Engine_Ext_Absorbing_BC. One thread per (i,j) of the sheet,
@@ -145,10 +146,22 @@ HIP_Ext_Absorbing_BC::HIP_Ext_Absorbing_BC(GPU_Backend_HIP::Impl* impl, Operator
 	m_CurrParam.nj = nj>0 ? nj-1 : 0;
 
 	const size_t count = (size_t)ni*nj;
-	const float* k1_nyP  = d->Alloc<float>(count, op_ext->m_K1_nyP.data());
-	const float* k1_nyPP = d->Alloc<float>(count, op_ext->m_K1_nyPP.data());
-	const float* k2_nyP  = d->Alloc<float>(count, op_ext->m_K2_nyP.valid() ? op_ext->m_K2_nyP.data() : NULL);
-	const float* k2_nyPP = d->Alloc<float>(count, op_ext->m_K2_nyPP.valid() ? op_ext->m_K2_nyPP.data() : NULL);
+	const float *k1_nyP=nullptr,*k1_nyPP=nullptr,*k2_nyP=nullptr,*k2_nyPP=nullptr;
+	if (d->setup_result)
+	{
+		const auto prepared=d->setup_result->extension_tables.find(op_ext);
+		if (prepared!=d->setup_result->extension_tables.end())
+		{
+			k1_nyP=prepared->second->values;k1_nyPP=k1_nyP+count;k2_nyP=k1_nyPP+count;k2_nyPP=k2_nyP+count;
+			std::cout << "HIP local absorber construction result adopted" << std::endl;
+		}
+	}
+	if (!k1_nyP)
+	{
+		k1_nyP=d->Alloc<float>(count,op_ext->m_K1_nyP.data());k1_nyPP=d->Alloc<float>(count,op_ext->m_K1_nyPP.data());
+		k2_nyP=d->Alloc<float>(count,op_ext->m_K2_nyP.valid()?op_ext->m_K2_nyP.data():nullptr);
+		k2_nyPP=d->Alloc<float>(count,op_ext->m_K2_nyPP.valid()?op_ext->m_K2_nyPP.data():nullptr);
+	}
 
 	m_VoltData.s_nyP  = d->Alloc<float>(count);
 	m_VoltData.s_nyPP = d->Alloc<float>(count);

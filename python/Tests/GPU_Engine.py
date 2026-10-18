@@ -26,7 +26,8 @@
    HIP backend, cases pml, pml_upml_regions and pml_upml_separate: the UPML is updated in the
      fused step, by region kernels (OPENEMS_HIP_FUSED_STEP=0) and by separate kernels
      (OPENEMS_HIP_UPML_FUSION=0), each bit-identical; pml_index32: the fused step with 32 bit
-     indices (OPENEMS_HIP_INDEX=32, the default on NVIDIA), bit-identical
+     indices (OPENEMS_HIP_INDEX=32, the default on NVIDIA), and pml_index64 with
+     64 bit indices (OPENEMS_HIP_INDEX=64), bit-identical
    device backend, cases dumps and sar: the FD dumps (the E field of the SAR) are accumulated on
      the device (DEVICE_DFT_BACKENDS)
    device backend, cases coeff_index32 and coeff_full: the update coefficients as sets with
@@ -43,6 +44,7 @@
 
 """
 
+import argparse
 import os, re, sys, glob, tempfile, ctypes, ctypes.util
 import numpy as np
 import h5py
@@ -52,7 +54,7 @@ from CSXCAD.CSProperties import CSPropLorentzMaterial, CSPropDebyeMaterial
 from CSXCAD.CSProperties import ABCtype
 from openEMS.physical_constants import C0
 from openEMS import openEMS
-from openEMS.compare import compare_sim_results, deviation
+from openEMS.compare import compare_sim_results, compare_sim_metrics, deviation
 from openEMS.ports import LumpedPort
 
 unit = 1e-3   # drawing unit: mm
@@ -495,7 +497,64 @@ def case_coeff_full():
     return coeff_case([graded(70), graded(70), graded(70)])
 
 
-def run_captured(case, Sim_Path, engine):
+def case_cpu_setup():
+    """Weighted anisotropic materials and transformed geometry exercise worker query state."""
+    FDTD = openEMS(NrTS=120, EndCriteria=0)
+    FDTD.SetGaussExcite(5e9, 4e9)
+    FDTD.SetBoundaryCond(['PEC'] * 6)
+    CSX = ContinuousStructure()
+    FDTD.SetCSX(CSX)
+    mesh = CSX.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for ax, count in zip('xyz', (31, 21, 17)):
+        mesh.AddLine(ax, np.linspace(-10, 10, count))
+    mat = CSX.AddMaterial('weighted', epsilon=[2, 3, 4], kappa=[0.01, 0.02, 0.03])
+    mat.SetIsotropy(False)
+    mat.SetMaterialWeight(epsilon='1+0.001*x*x+0.002*y*y+0.003*z*z+0.0001*sin(x*y)')
+    box = mat.AddBox([-8, -7, -6], [8, 7, 6], priority=5)
+    box.AddTransform('RotateAxis', 'z', 0.3, deg=False)
+    CSX.AddMaterial('overlap', epsilon=1.5).AddBox([-3]*3, [3]*3, priority=5)
+    metal = CSX.AddMetal('rotated_pec').AddBox([-1, -6, -6], [1, 6, 6], priority=10)
+    metal.AddTransform('RotateAxis', 'y', 0.2, deg=False)
+    source_x = float(mesh.GetLines('x')[7])
+    CSX.AddExcitation('source', exc_type=0, exc_val=[0, 0, 1]).AddBox([source_x, 0, -1], [source_x, 0, 1])
+    CSX.AddProbe('ep', p_type=2).AddPoint([5, 2, 1])
+    CSX.AddDump('Et', dump_type=0, file_type=1).AddBox([-10, -10, 0], [10, 10, 0])
+    return FDTD, CSX
+
+
+def case_tfsf_multiple(sources=('a', 'b'), disabled=False):
+    """Overlapping plane-wave boxes, orthogonal directions and a fractional delay."""
+    fdtd = openEMS(NrTS=160, EndCriteria=0)
+    fdtd.SetGaussExcite(6e9, 4e9)
+    fdtd.SetBoundaryCond(['PEC'] * 6)
+    csx = ContinuousStructure()
+    fdtd.SetCSX(csx)
+    mesh = csx.GetGrid()
+    mesh.SetDeltaUnit(unit)
+    for axis in 'xyz':
+        mesh.AddLine(axis, np.arange(-6, 7))
+    if disabled:
+        source = csx.AddExcitation('disabled', exc_type=10, exc_val=[0, 4, 0])
+        source.SetPropagationDir([0, 0, 1])
+        source.SetEnabled(False)
+        source.AddBox([-4, -4, -4], [4, 4, 4])
+    if 'a' in sources:
+        source = csx.AddExcitation('a', exc_type=10, exc_val=[1, 0, 0])
+        source.SetPropagationDir([0, 0, 1])
+        source.AddBox([-3, -3, -3], [2, 2, 2])
+    if 'b' in sources:
+        source = csx.AddExcitation('b', exc_type=10, exc_val=[0, 0, 0.7])
+        source.SetPropagationDir([0, -1, 0])
+        source.SetDelay(2e-12)
+        source.AddBox([-2, -2, -2], [3, 3, 3])
+    csx.AddProbe('e', p_type=2).AddPoint([0, 0, 0])
+    csx.AddProbe('h', p_type=3).AddPoint([1, -1, 0])
+    return fdtd, csx
+
+
+def run_captured(case, Sim_Path, engine, **options):
+    options.setdefault("verbose",2)
     """ Run a case with the given engine, return the openEMS console output """
     FDTD, CSX = case()
     log_file = Sim_Path + '.log'
@@ -507,7 +566,7 @@ def run_captured(case, Sim_Path, engine):
             # the backends are compared value by value, so every run has to stop at the
             # same timestep: the end criteria is otherwise evaluated on a wall-clock
             # schedule and the faster backend runs a few timesteps further
-            FDTD.Run(Sim_Path, cleanup=True, engine=engine, exact_endcriteria=True, verbose=2)   # verbose 2: the paths the GPU engine takes
+            FDTD.Run(Sim_Path, cleanup=True, engine=engine, exact_endcriteria=True, **options)
         finally:
             try:   # flush the C stdio buffer of the openEMS library
                 ctypes.CDLL(ctypes.util.find_library('c')).fflush(None)
@@ -519,25 +578,29 @@ def run_captured(case, Sim_Path, engine):
         return log.read()
 
 
-def compare_outputs(path_a, path_b, rtol=0):
-    """ compare all probe files and field dumps (openEMS.compare), return the (name, deviation)
-        above rtol, the numbers of probe files and of HDF5 dumps, and the max. deviation """
-    files = [f for f in os.listdir(path_a) if os.path.isfile(os.path.join(path_a, f))]
-    probes = [f for f in files if '.' not in f]   # probe and port files have no extension
-    dumps  = [f for f in files if f.endswith('.h5')]
+def compare_outputs(path_a, path_b, rtol=0, require_nonzero=False):
+    if require_nonzero:
+        files = [f for f in os.listdir(path_a) if os.path.isfile(os.path.join(path_a, f))]
+        probes = [f for f in files if '.' not in f]   # probe and port files have no extension
+        dumps  = [f for f in files if f.endswith('.h5')]
+        assert probes, f'FAIL: no probe files in {path_a}'
+        for f in probes:
+            assert np.any(np.loadtxt(os.path.join(path_a, f), comments='%')[:, 1:]), \
+                f'FAIL: the probe {f} of {path_a} is zero, the comparison would test nothing'
+        for f in dumps:
+            with h5py.File(os.path.join(path_a, f), 'r') as a:
+                fields = []
+                a.visititems(lambda name, obj: fields.append(obj[()]) if isinstance(obj, h5py.Dataset) and name.startswith('FieldData') else None)
+                assert max([np.max(np.abs(x)) for x in fields] or [0]) > 0, \
+                    f'FAIL: the field dump {f} of {path_a} is zero, the comparison would test nothing'
+    metrics = compare_sim_metrics(path_a, path_b)
+    l2_rtol = 1e-3 if rtol else 0
+    diff = [(name, max(peak, l2)) for name, peak, l2 in metrics
+            if not np.isfinite(peak) or not np.isfinite(l2) or peak > rtol or l2 > l2_rtol]
+    probes = sum('.' not in name for name, _, _ in metrics)
+    dumps = sum(name.endswith('.h5') for name, _, _ in metrics)
     assert probes, f'FAIL: no probe files in {path_a}'
-    for f in probes:
-        assert np.any(np.loadtxt(os.path.join(path_a, f), comments='%')[:, 1:]), \
-            f'FAIL: the probe {f} of {path_a} is zero, the comparison would test nothing'
-    for f in dumps:
-        with h5py.File(os.path.join(path_a, f), 'r') as a:
-            fields = []
-            a.visititems(lambda name, obj: fields.append(obj[()]) if isinstance(obj, h5py.Dataset) and name.startswith('FieldData') else None)
-            assert max([np.max(np.abs(x)) for x in fields] or [0]) > 0, \
-                f'FAIL: the field dump {f} of {path_a} is zero, the comparison would test nothing'
-    diff = compare_sim_results(path_a, path_b)
-    worst = max(d for _, d in diff)
-    return [(n, d) for n, d in diff if d > rtol], len(probes), len(dumps), worst
+    return diff, probes, dumps, max(peak for _, peak, _ in metrics)
 
 
 def case_coax_resonator():
@@ -577,16 +640,19 @@ def case_coax_resonator():
 
 
 # (name, case, every extension the case uses has a device implementation)
-cases = [('excitation',     case_excitation,     True),
+cases = [('cpu_setup',      case_cpu_setup,      True),
+         ('excitation',     case_excitation,     True),
          ('pml',            case_pml,            True),
          ('pml_upml_regions', case_pml,          True),
          ('pml_upml_separate', case_pml,         True),
          ('pml_index32',    case_pml,            True),
+         ('pml_index64',    case_pml,            True),
          ('mur',            case_mur,            True),
          ('materials',      case_materials,      True),
          ('lumped',         case_lumped,         True),
          ('lumped_pml',     case_lumped_pml,     True),
          ('tfsf',           case_tfsf,           True),
+         ('tfsf_multiple',  case_tfsf_multiple,  True),
          ('absorbers',      case_absorbers,      True),
          ('cylinder_closed', case_cylinder_closed, True),
          ('cylinder_wedge', case_cylinder_wedge,  True),
@@ -611,10 +677,12 @@ cases = [('excitation',     case_excitation,     True),
 CASE_ENV = {'dumps_snapshot_host_dft': {'OPENEMS_GPU_DUMPS': 'snapshot'},
             'pml_upml_regions': {'OPENEMS_HIP_FUSED_STEP': '0'},
             'pml_upml_separate': {'OPENEMS_HIP_UPML_FUSION': '0'},
-            'pml_index32': {'OPENEMS_HIP_INDEX': '32'}}
+            'pml_index32': {'OPENEMS_HIP_INDEX': '32'},
+            'pml_index64': {'OPENEMS_HIP_INDEX': '64'}}
 # the messages of the HIP backend for these UPML updates: (expected, not expected)
 UPML_MODES = {'pml': ('UPML regions in the kernel', None),
               'pml_index32': ('fused voltage and current updates, 32 bit indices', None),
+              'pml_index64': ('fused voltage and current updates', '32 bit indices'),
               'pml_upml_regions': ('UPML regions fused with the main updates', 'UPML regions in the kernel'),
               'pml_upml_separate': (None, 'UPML regions fused with the main updates')}
 
@@ -625,68 +693,80 @@ FULL_DEVICE_BACKENDS = ('HIP', 'Metal')
 DEVICE_DFT_BACKENDS = ('HIP',)
 engines = ('basic', 'gpu-reference', 'gpu')
 
-for name, case, on_device in cases:
-    print(f'Testing case: {name}')
-    paths = {engine: os.path.join(tempfile.gettempdir(), f'GPU_Engine_{name}_{engine}') for engine in engines}
-    os.environ.update(CASE_ENV.get(name, {}))
-    try:
-        logs = {engine: run_captured(case, paths[engine], engine) for engine in engines}
-    finally:
-        for var in CASE_ENV.get(name, {}):
-            del os.environ[var]
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--require-backend', choices=('HIP', 'Metal', 'reference'))
+    parser.add_argument('--case', action='append', choices=[name for name, _, _ in cases])
+    args = parser.parse_args()
+    for name, case, on_device in cases:
+        if args.case and name not in args.case:
+            continue
+        print(f'Testing case: {name}')
+        paths = {engine: os.path.join(tempfile.gettempdir(), f'GPU_Engine_{name}_{engine}') for engine in engines}
+        os.environ.update(CASE_ENV.get(name, {}))
+        try:
+            logs = {engine: run_captured(case, paths[engine], engine) for engine in engines}
+        finally:
+            for var in CASE_ENV.get(name, {}):
+                del os.environ[var]
 
-    assert 'Create FDTD engine (GPU' not in logs['basic'], \
-        f'FAIL [{name}]: engine=basic created the GPU engine'
-    assert 'Create FDTD engine (GPU, backend: reference' in logs['gpu-reference'], \
-        f'FAIL [{name}]: engine=gpu-reference did not create the GPU engine with the reference backend'
+        assert 'Create FDTD engine (GPU' not in logs['basic'], \
+            f'FAIL [{name}]: engine=basic created the GPU engine'
+        assert 'Create FDTD engine (GPU, backend: reference' in logs['gpu-reference'], \
+            f'FAIL [{name}]: engine=gpu-reference did not create the GPU engine with the reference backend'
 
-    diff, n_probes, n_dumps, _ = compare_outputs(paths['basic'], paths['gpu-reference'])
-    print(f'  reference backend: compared {n_probes} probe files and {n_dumps} field dumps')
-    assert not diff, f'FAIL [{name}]: reference backend differs from the basic engine in: {", ".join(n for n, _ in diff)}'
+        diff, n_probes, n_dumps, _ = compare_outputs(paths['basic'], paths['gpu-reference'],require_nonzero=True)
+        print(f'  reference backend: compared {n_probes} probe files and {n_dumps} field dumps')
+        assert not diff, f'FAIL [{name}]: reference backend differs from the basic engine in: {", ".join(n for n, _ in diff)}'
 
-    if name=='cylinder_closed':
-        # the H and the B field are interpolated alike, also on the alpha seam of the mesh
-        with h5py.File(os.path.join(paths['basic'], 'Ht_node.h5'), 'r') as H, h5py.File(os.path.join(paths['basic'], 'Bt_node.h5'), 'r') as B:
-            ts = sorted(H['FieldData/TD'].keys())[-1]
-            dev = deviation(H['FieldData/TD'][ts][()], B['FieldData/TD'][ts][()]/(4e-7*np.pi))
-        assert dev<1e-6, f'FAIL [{name}]: the B field dump is not mue0 times the H field dump ({dev:.1e} of the peak)'
+        if name=='cylinder_closed':
+            # the H and the B field are interpolated alike, also on the alpha seam of the mesh
+            with h5py.File(os.path.join(paths['basic'], 'Ht_node.h5'), 'r') as H, h5py.File(os.path.join(paths['basic'], 'Bt_node.h5'), 'r') as B:
+                ts = sorted(H['FieldData/TD'].keys())[-1]
+                dev = deviation(H['FieldData/TD'][ts][()], B['FieldData/TD'][ts][()]/(4e-7*np.pi))
+            assert dev<1e-6, f'FAIL [{name}]: the B field dump is not mue0 times the H field dump ({dev:.1e} of the peak)'
 
-    backend = re.search(r'Create FDTD engine \(GPU, backend: (\w+)', logs['gpu'])
-    backend = backend.group(1) if backend else None
-    if backend and backend!='reference':
-        if on_device and backend in FULL_DEVICE_BACKENDS:
-            assert ('Engine_GPU: all extensions run on the device' in logs['gpu']) and ('host fallback' not in logs['gpu']), \
-                f'FAIL [{name}]: the {backend} backend did not run all extensions on the device'
-        if name in ('dumps_snapshot', 'multigrid_snapshot', 'dumps_snapshot_host_dft') and backend in FULL_DEVICE_BACKENDS:
-            assert 'Engine_GPU: field dumps from snapshots' in logs['gpu'], \
-                f'FAIL [{name}]: the {backend} backend did not take field snapshots for the dumps'
-        if name=='dumps_snapshot_host_dft':
-            assert 'frequency domain dumps accumulated on the device' not in logs['gpu'], \
-                f'FAIL [{name}]: OPENEMS_GPU_DUMPS=snapshot did not keep the sums off the device'
-        if name in ('dumps', 'sar') and backend in DEVICE_DFT_BACKENDS:
-            assert 'Engine_GPU: frequency domain dumps accumulated on the device' in logs['gpu'], \
-                f'FAIL [{name}]: the {backend} backend did not accumulate the frequency domain dumps'
-        if name=='coeff_index32' and backend in FULL_DEVICE_BACKENDS:
-            assert 'compressed update coefficients (32 bit index)' in logs['gpu'], \
-                f'FAIL [{name}]: the {backend} backend did not use a 32 bit coefficient set index'
-        if name=='coeff_full' and backend in FULL_DEVICE_BACKENDS:
-            assert 'compressed update coefficients' not in logs['gpu'], \
-                f'FAIL [{name}]: the {backend} backend did not use the full coefficient arrays'
-        if name in UPML_MODES and backend=='HIP':
-            expected, unexpected = UPML_MODES[name]
-            assert (expected is None or expected in logs['gpu']) and (unexpected is None or unexpected not in logs['gpu']), \
-                f'FAIL [{name}]: the HIP backend did not take the intended UPML update'
-        diff, _, _, worst = compare_outputs(paths['basic'], paths['gpu'], rtol=DEVICE_RTOL)
-        print(f'  {backend} backend: max. deviation {worst:.1e} of the peak value')
-        assert not diff, f'FAIL [{name}]: {backend} backend deviates from the basic engine: ' + \
-            ', '.join(f'{n} ({d:.1e})' for n, d in diff)
-        if name in UPML_MODES and backend=='HIP':
-            assert worst==0, f'FAIL [{name}]: the HIP UPML update is not bit-identical ({worst:.1e})'
-    else:
-        # no silent fallback to the (slow) reference backend
-        assert 'Running FDTD engine' not in logs['gpu'], \
-            f'FAIL [{name}]: engine=gpu ran without a GPU device'
-        print('  no GPU device, device backend not tested')
-    print('PASS [{}]'.format(name))
+        backend = re.search(r'Create FDTD engine \(GPU, backend: (\w+)', logs['gpu'])
+        backend = backend.group(1) if backend else None
+        if args.require_backend:
+            assert backend==args.require_backend, f'FAIL: required {args.require_backend}, got {backend}'
+        if backend and backend!='reference':
+            if on_device and backend in FULL_DEVICE_BACKENDS:
+                assert ('Engine_GPU: all extensions run on the device' in logs['gpu']) and ('host fallback' not in logs['gpu']), \
+                    f'FAIL [{name}]: the {backend} backend did not run all extensions on the device'
+            if name in ('dumps_snapshot', 'multigrid_snapshot', 'dumps_snapshot_host_dft') and backend in FULL_DEVICE_BACKENDS:
+                assert 'Engine_GPU: field dumps from snapshots' in logs['gpu'], \
+                    f'FAIL [{name}]: the {backend} backend did not take field snapshots for the dumps'
+            if name=='dumps_snapshot_host_dft':
+                assert 'frequency domain dumps accumulated on the device' not in logs['gpu'], \
+                    f'FAIL [{name}]: OPENEMS_GPU_DUMPS=snapshot did not keep the sums off the device'
+            if name in ('dumps', 'sar') and backend in DEVICE_DFT_BACKENDS:
+                assert 'Engine_GPU: frequency domain dumps accumulated on the device' in logs['gpu'], \
+                    f'FAIL [{name}]: the {backend} backend did not accumulate the frequency domain dumps'
+            if name=='coeff_index32' and backend in FULL_DEVICE_BACKENDS:
+                assert 'compressed update coefficients (32 bit index)' in logs['gpu'], \
+                    f'FAIL [{name}]: the {backend} backend did not use a 32 bit coefficient set index'
+            if name=='coeff_full' and backend in FULL_DEVICE_BACKENDS:
+                assert 'compressed update coefficients' not in logs['gpu'], \
+                    f'FAIL [{name}]: the {backend} backend did not use the full coefficient arrays'
+            if name in UPML_MODES and backend=='HIP':
+                expected, unexpected = UPML_MODES[name]
+                assert (expected is None or expected in logs['gpu']) and (unexpected is None or unexpected not in logs['gpu']), \
+                    f'FAIL [{name}]: the HIP backend did not take the intended UPML update'
+            diff, _, _, worst = compare_outputs(paths['basic'], paths['gpu'], rtol=DEVICE_RTOL,require_nonzero=True)
+            print(f'  {backend} backend: max. deviation {worst:.1e} of the peak value')
+            assert not diff, f'FAIL [{name}]: {backend} backend deviates from the basic engine: ' + \
+                ', '.join(f'{n} ({d:.1e})' for n, d in diff)
+            if name in UPML_MODES and backend=='HIP':
+                assert worst==0, f'FAIL [{name}]: the HIP UPML update is not bit-identical ({worst:.1e})'
+        else:
+            # no silent fallback to the (slow) reference backend
+            assert 'Running FDTD engine' not in logs['gpu'], \
+                f'FAIL [{name}]: engine=gpu ran without a GPU device'
+            print('  no GPU device, device backend not tested')
+        print('PASS [{}]'.format(name))
 
-print('PASS')
+    print('PASS')
+
+if __name__ == '__main__':
+    main()

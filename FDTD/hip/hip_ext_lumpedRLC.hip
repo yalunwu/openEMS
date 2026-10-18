@@ -17,8 +17,10 @@
 
 #include "hip/hip_runtime.h"
 #include <set>
+#include <iostream>
 
 #include "hip_internal.h"
+#include "setup_indices_hip.hiph"
 #include "FDTD/engine.h"
 #include "FDTD/extensions/operator_ext_lumpedRLC.h"
 #include "FDTD/extensions/engine_ext_lumpedRLC.h"
@@ -111,6 +113,20 @@ HIP_Ext_LumpedRLC::HIP_Ext_LumpedRLC(GPU_Backend_HIP::Impl* impl, Operator_Ext_L
 	m_Serial = false;
 	if (count==0)
 		return;
+	if (d->setup_result)
+	{
+		const auto prepared=d->setup_result->sparse.find(op_ext);
+		if (prepared!=d->setup_result->sparse.end())
+		{
+			const auto& block=prepared->second->blocks.at(0);m_Serial=(block.flags&1u)!=0;m_Data.index=HIP_WidenSetupIndices(d,block.nodes,count);
+			d->device_volt_modified.push_back({block.nodes,count,1});
+			m_Data.il=d->Alloc<float>(count);m_Data.vd=d->Alloc<float>(3ull*count);m_Data.j=d->Alloc<float>(3ull*count);
+			const float* values=block.coefficients[0]->values;
+			m_Data.ilv=values;m_Data.i2v=values+count;m_Data.vv2=values+2ull*count;m_Data.vj1=values+3ull*count;
+			m_Data.vj2=values+4ull*count;m_Data.vvd=values+5ull*count;m_Data.ib0=values+6ull*count;m_Data.b1=values+7ull*count;m_Data.b2=values+8ull*count;
+			std::cout << "HIP RLC construction result adopted: " << count << " contributions, serial=" << m_Serial << std::endl;return;
+		}
+	}
 
 	std::vector<size_t> index(count);
 	std::set<size_t> edges;

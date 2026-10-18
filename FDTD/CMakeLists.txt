@@ -2,6 +2,20 @@
 if(ENABLE_HIP)
   set(HIP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/gpu_backend_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/operator_setup_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_packing_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_geometry_index_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_scan_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_candidates_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_metadata_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_diagnostics_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_multigrid_plan_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_sampling_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_processing_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_upml_fusion_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_mode_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_cell_material_hip.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip/setup_waveform_hip.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_ext_excitation.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_ext_upml.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/hip/hip_ext_mur_abc.hip
@@ -59,6 +73,13 @@ set(SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_interface_gpu_fdtd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_field_gather.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/operator_gpu.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/operator_gpu_setup.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gpu_setup_adapters.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gpu_setup_geometry_export.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gpu_setup_expression_export.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gpu_setup_input_export.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gpu_setup_mode_export.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gpu_setup_waveform_export.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_gpu.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/engine_gpu_cylindermultigrid.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gpu_backend.cpp

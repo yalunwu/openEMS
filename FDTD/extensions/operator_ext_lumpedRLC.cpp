@@ -85,7 +85,7 @@ Operator_Ext_LumpedRLC::~Operator_Ext_LumpedRLC()
 		// Additional containers
 		delete[] v_RLC_dir;
 
-		for (unsigned int dIdx = 0 ; dIdx < 3 ; dIdx++)
+		for (unsigned int dIdx = 0 ; v_RLC_pos && dIdx < 3 ; dIdx++)
 			delete[] v_RLC_pos[dIdx];
 
 		delete[] v_RLC_pos;

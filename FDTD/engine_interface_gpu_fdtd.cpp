@@ -70,6 +70,12 @@ bool Engine_Interface_GPU_FDTD::PrepareSnapshotGather(Engine_Field_Gather* gathe
 	if (!m_Eng_GPU->CanSnapshotGather())
 		return true;   // plain field snapshots, if the engine has any: evaluated on the host
 	// the engine only snapshots the raw values the dump reads, so it has to know them beforehand
+	if (auto* prepared=dynamic_cast<Prepared_Field_Gather_FDTD*>(gather))
+	{
+		size_t offset=0;
+		if (!m_Eng_GPU->AddPreparedSnapshotGather(prepared->HField(),prepared->prepared,offset)) return false;
+		prepared->SetSnapshotEvaluated(offset);return true;
+	}
 	Field_Gather_FDTD* g = dynamic_cast<Field_Gather_FDTD*>(gather);
 	size_t offset = 0;
 	if (!g || !m_Eng_GPU->AddSnapshotGather(g->HField(), g->region, offset))
@@ -78,13 +84,24 @@ bool Engine_Interface_GPU_FDTD::PrepareSnapshotGather(Engine_Field_Gather* gathe
 	return true;
 }
 
-Engine_Field_Gather* Engine_Interface_GPU_FDTD::CreateFieldGather(bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3]) const
+Engine_Field_Gather* Engine_Interface_GPU_FDTD::CreateFieldGather(bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3],const std::shared_ptr<Engine_SamplingMesh>& mesh) const
 {
-	return new Field_Gather_FDTD(this, m_Op, &m_Eng_GPU->HostVoltages(), &m_Eng_GPU->HostCurrents(), h_field, numLines, posLines);
+	if (auto table=m_Eng_GPU->GetBackend()->BuildFieldGather(m_Op,m_InterpolType,h_field,numLines,posLines,mesh))
+	{
+		auto* gather=new Prepared_Field_Gather_FDTD(m_Eng_GPU->FieldArray(false),m_Eng_GPU->FieldArray(true),h_field,numLines[1],numLines[2],!m_Eng_GPU->HostDumpsOnly());
+		gather->prepared=table;return gather;
+	}
+	return new Field_Gather_FDTD(this, m_Op, m_Eng_GPU->FieldArray(false), m_Eng_GPU->FieldArray(true), h_field, numLines, posLines);
 }
 
 int Engine_Interface_GPU_FDTD::CreateFieldDFT(const Engine_Field_Gather* gather, unsigned int count)
 {
+	if (const auto* prepared=dynamic_cast<const Prepared_Field_Gather_FDTD*>(gather))
+	{
+		const int id=m_Eng_GPU->AddPreparedFieldDFT(prepared->HField(),prepared->prepared,count);
+		if (id>=0) m_PreparedFieldDFT[id]=prepared;
+		return id;
+	}
 	const Field_Gather_FDTD* g = dynamic_cast<const Field_Gather_FDTD*>(gather);
 	if (!g || (g->region.Size()==0))
 		return -1;
@@ -101,6 +118,17 @@ void Engine_Interface_GPU_FDTD::AccumulateFieldDFT(int id, const std::vector<std
 
 bool Engine_Interface_GPU_FDTD::ReadFieldDFT(int id, std::vector<ArrayLib::ArrayNIJK<std::complex<float>>*>& fields)
 {
+	const auto prepared=m_PreparedFieldDFT.find(id);
+	if (prepared!=m_PreparedFieldDFT.end())
+	{
+		std::vector<std::complex<float>> sums;
+		for (size_t f=0;f<fields.size();++f)
+		{
+			if (!m_Eng_GPU->ReadFieldDFT(id,f,sums) || sums.size()!=prepared->second->EntryCount()) return false;
+			prepared->second->EvaluateSums(sums.data(),*fields[f]);
+		}
+		return true;
+	}
 	std::map<int, const Field_Gather_FDTD*>::const_iterator it = m_FieldDFT.find(id);
 	if (it==m_FieldDFT.end())
 		return false;
@@ -114,3 +142,8 @@ bool Engine_Interface_GPU_FDTD::ReadFieldDFT(int id, std::vector<ArrayLib::Array
 	}
 	return true;
 }
+
+std::shared_ptr<Engine_SetupTable> Engine_Interface_GPU_FDTD::BuildModeMatch(const Engine_ModeTableInput& input)
+{return m_Eng_GPU->GetBackend()->BuildModeMatch(m_Op,input);}
+std::shared_ptr<Engine_CellMaterialTable> Engine_Interface_GPU_FDTD::BuildCellMaterials(const unsigned int lines[3],unsigned int* const positions[3],const std::shared_ptr<Engine_SamplingMesh>& mesh)
+{return m_Eng_GPU->GetBackend()->BuildCellMaterials(lines,positions,mesh);}

@@ -24,20 +24,13 @@ using std::cout;
 using std::cerr;
 using std::endl;
 
-Engine_GPU_CylinderMultiGrid* Engine_GPU_CylinderMultiGrid::New(const Operator_CylinderMultiGrid* op, const std::string& backend, GPU_Backend* parent)
+Engine_GPU_CylinderMultiGrid* Engine_GPU_CylinderMultiGrid::New(const Operator_CylinderMultiGrid* op,const std::string& backend,GPU_Backend* parent,GPU_Backend* prepared)
 {
 	cout << "Create FDTD engine (GPU, cylindrical multi-grid level " << op->GetMultiGridLevel() << ")" << endl;
-	Engine_GPU_CylinderMultiGrid* e = new Engine_GPU_CylinderMultiGrid(op, backend, parent);
-	try
-	{
-		e->Init();
-	}
-	catch (...)
-	{
-		delete e;
-		throw;
-	}
-	return e;
+	std::unique_ptr<GPU_Backend> owner(prepared);
+	std::unique_ptr<Engine_GPU_CylinderMultiGrid> e(new Engine_GPU_CylinderMultiGrid(op,backend,parent));e->m_Backend=owner.release();
+	e->Init();
+	return e.release();
 }
 
 Engine_GPU_CylinderMultiGrid::Engine_GPU_CylinderMultiGrid(const Operator_CylinderMultiGrid* op, const std::string& backend, GPU_Backend* parent)
@@ -59,6 +52,7 @@ void Engine_GPU_CylinderMultiGrid::Init()
 	Engine_GPU::Init();
 
 	m_Interpol.split_pos = Op_CMG->m_Split_Pos;
+	if (!Op_CMG->HasDeviceConstruction())
 	for (int n=0; n<2; ++n)
 		for (unsigned int a=0; a<numLines[1]; ++a)
 		{
@@ -85,6 +79,7 @@ void Engine_GPU_CylinderMultiGrid::Init()
 		m_Link = m_Backend->CreateMultiGridLink(m_InnerEngine->GetBackend(), m_Interpol);
 	if (m_Link==NULL)
 	{
+		if (Op_CMG->HasDeviceConstruction()) throw std::runtime_error("GPU multigrid construction result could not be adopted");
 		if (!m_FieldsOnHost || !m_InnerEngine->FieldsOnHost())
 			cerr << "Engine_GPU_CylinderMultiGrid::Init: Warning: multi-grid level " << Op_CMG->GetMultiGridLevel()
 			     << " and its sub-grid run in the host fallback" << endl;
@@ -104,6 +99,7 @@ void Engine_GPU_CylinderMultiGrid::Reset()
 
 void Engine_GPU_CylinderMultiGrid::ForceHostFallback()
 {
+	if (Op_CMG->HasDeviceConstruction() && m_Interpol.pos_v_2p[0].empty()) Op_CMG->MaterializeMultiGrid(m_Interpol);
 	delete m_Link;
 	m_Link = NULL;
 	Engine_GPU::ForceHostFallback();

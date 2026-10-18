@@ -25,6 +25,7 @@ class Operator_Cylinder;
 
 class Operator_Ext_Cylinder : public Operator_Extension
 {
+	friend class HIP_OperatorSetup;
 	friend class Engine_Ext_Cylinder;
 	friend class HIP_Ext_Cylinder;
 	friend class Metal_Ext_Cylinder;

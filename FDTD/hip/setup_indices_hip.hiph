@@ -1,0 +1,25 @@
+/* Copyright (C) 2026 openEMS Project; SPDX-License-Identifier: GPL-3.0-or-later */
+#ifndef SETUP_INDICES_HIPH
+#define SETUP_INDICES_HIPH
+#include "FDTD/gpu_setup_memory.h"
+
+__global__ static void widen_setup_indices(const unsigned int* input,size_t* output,size_t count)
+{
+	const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+	if (i<count) output[i]=input[i];
+}
+
+static size_t* HIP_WidenSetupIndices(GPU_Backend_HIP::Impl* backend,const unsigned int* input,size_t count)
+{
+	const size_t bytes=GPU_SetupMultiply(count,sizeof(size_t));
+	size_t available=0,total=0;
+	HIP_Check(hipMemGetInfo(&available,&total),"extension index memory query");
+	const size_t cap=GPU_SetupMemoryLimit();
+	const size_t live=backend->ctx->setup_start_free>available ? backend->ctx->setup_start_free-available : 0;
+	if (bytes>available || live>cap || bytes>cap-live)
+		throw GPU_SetupUnavailable("insufficient device memory for 64-bit extension indices");
+	auto* output=backend->Alloc<size_t>(count);
+	HIP_Launch(backend,"widen_setup_indices",widen_setup_indices,count,1,1,input,output,count);
+	return output;
+}
+#endif

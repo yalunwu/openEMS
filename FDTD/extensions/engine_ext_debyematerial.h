@@ -61,6 +61,7 @@ public:
 	virtual void DoPostVoltageUpdates();
 
 protected:
+	void PrepareDebyeHost();
 	template <typename EngType>
 	void DoPreVoltageUpdatesImpl(EngType* eng);
 

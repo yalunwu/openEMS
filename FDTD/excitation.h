@@ -20,10 +20,12 @@
 
 #include <vector>
 #include <string>
+#include <functional>
 #include "tools/constants.h"
 
 class Excitation
 {
+	friend class HIP_SetupWaveform;
 public:
 	enum ExciteTypes {UNDEFINED=-1, GaussianPulse=0, Sinusoidal=1, DiracPulse=2, Step=3, CustomExcite=10};
 	Excitation();
@@ -75,19 +77,25 @@ public:
 
 	std::string GetCustomFunction() const {return m_CustomExc_Str;}
 
-	FDTD_FLOAT* GetVoltageSignal() const {return m_signal_volt;}
-	FDTD_FLOAT* GetCurrentSignal() const {return m_signal_curr;}
+	FDTD_FLOAT* GetVoltageSignal() const;
+	FDTD_FLOAT* GetCurrentSignal() const;
 
 protected:
 	double m_dT;
+	bool m_HasDevicePeak;
+	unsigned int m_DevicePeak;
 	unsigned int m_nyquistTS;
 	double m_SignalPeriod;
 	ExciteTypes m_Excit_Type;
 
 	//Excitation time-signal
 	unsigned int m_length;
-	FDTD_FLOAT* m_signal_volt;
-	FDTD_FLOAT* m_signal_curr;
+	mutable FDTD_FLOAT* m_signal_volt;
+	mutable FDTD_FLOAT* m_signal_curr;
+	// A device constructor retains the signal owner here. Only an explicit
+	// getter or ASCII dump materializes that signal on the host.
+	std::function<void(bool,FDTD_FLOAT*,unsigned int)> m_MaterializeSignal;
+	FDTD_FLOAT* MaterializeSignal(bool current) const;
 
 	// center frequency
 	double m_f0;

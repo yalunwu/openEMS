@@ -62,6 +62,7 @@ public:
 	Operator_Cylinder* GetInnerOperator() const {return m_InnerOp;}
 
 	virtual void SetExcitationSignal(Excitation* exc);
+	void SetTimestepFactor(double factor) override;
 
 	virtual void ShowStat() const;
 
@@ -77,6 +78,7 @@ protected:
 	virtual bool SetupCSXGrid(CSRectGrid* grid);
 
 	virtual int CalcECOperator( DebugFlags debugFlags = None );
+	void ApplyTimestepSettings() override;
 
 	virtual void DumpPEC2File( std::string filename, unsigned int *range = NULL );
 
@@ -89,6 +91,7 @@ protected:
 	unsigned int m_Split_Pos;
 
 	Operator_Cylinder* m_InnerOp;
+	std::unique_ptr<GPU_Backend> m_GPUSetupContext;
 
 	// sub-grid to base interpolation coefficients
 	unsigned int* m_interpol_pos_v_2p[2];

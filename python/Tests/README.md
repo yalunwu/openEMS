@@ -20,6 +20,29 @@ python3 run_testsuite.py --unittests        # those plus the unittest modules
 python3 run_testsuite.py --only-unittests   # just the fast ones
 ```
 
+Run `GPU_Engine.py --require-backend HIP` (or `Metal`) for device acceptance;
+without this flag device tests may be skipped when no GPU is available.
+`--case cpu_setup` selects the worker isolation/thread-count regression.
+The shared comparator checks exact sampling and finite data, with `1e-4`
+peak-relative and `1e-3` per-file relative-L2 limits for device output.
+`test_compare.py` also covers group-level HDF5 metadata, NF2FF scalar results
+and VTR normalization/coordinates. Its VTR tests isolate comparison arithmetic
+from the optional VTK reader; they do not constitute a reader integration test.
+`GPU_Setup.py --require-backend HIP` separately compares CPU/HIP construction
+with the same HIP stepping backend and stock CSXCAD/fparser. Retained fixtures
+cover constant inputs, nonuniform/transformed primitives, curve sources,
+Cartesian/cylindrical/nested multigrid, default UPML, all extension tables,
+constant-function mode matching, SAR, NF2FF and device sampling/DFT maps.
+Activation assertions require direct adoption of the core and extension results.
+Spatial weights, polyhedra, voxel materials, file-weighted sources, custom
+waveforms and spatial/file-based mode matching have CPU-fallback comparisons
+and strict rejection checks. Resource limits, malformed budgets, cancellation,
+partial-hierarchy rollback and solver reuse are checked too.
+Native query/path/input tests use `OPENEMS_BUILD_TESTS=ON`; HIP builds add device
+oracles and bitwise coefficient-palette checks at the 16/32-bit transition and
+dense fallback. CPU results do not validate HIP compilation or execution; see
+`GPU_SETUP_STATUS.md` for the current gaps.
+
 The runner reports PASS/FAIL/ERROR per test, prints a summary and exits non-zero
 if anything failed, so it can be used from CI. A failing test does not abort the
 run.
@@ -111,9 +134,15 @@ rather than a shell, and captured output is decoded with replacement so a
 console encoding cannot end a run. Of the behaviour above, only the
 `DISPLAY`/`WAYLAND_DISPLAY` removal is specific to X11 and Wayland.
 
-The full-simulation tests themselves have only ever been run on Linux, though --
-CI runs `test_*.py` everywhere but no simulation, so expect to adjust a
-tolerance when you first run them on Windows or macOS.
+CI runs `test_*.py` everywhere. Most analytical simulation scripts are validated
+on Linux; `GPU_Engine.py` and `GPU_Setup.py` also run on Windows MSVC/HIP.
+Investigate platform differences before changing a numerical tolerance.
+
+`GPU_Setup.py` compares CPU and strict HIP construction with identical HIP
+stepping. It requires device phase/adoption markers and includes nonzero SAR
+fields, dump subsampling/resolution, nested hierarchy failures and reuse.
+Native CTest contracts additionally compare exact material IDs, snapping and
+multigrid indices, extension tables, PEC masks, timestep and EC coefficients.
 
 ## No engine selection
 

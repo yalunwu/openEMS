@@ -27,6 +27,7 @@
 #include "tools/hdf5_file_writer.h"
 #include "processfields.h"
 #include "FDTD/engine_interface_fdtd.h"
+#include "FDTD/gpu_setup_processing.h"
 
 using std::cerr;
 using std::endl;
@@ -239,6 +240,18 @@ void ProcessFields::SetOptResolution(double optRes, int dir)
 
 void ProcessFields::CalcMeshPos()
 {
+	m_SamplingMesh=GPU_SetupSamplingMesh(Op,start,stop,m_dualMesh,m_SampleType==OPT_RESOLUTION,subSample,optResolution);
+	if (m_SamplingMesh)
+	{
+		for (int n=0;n<3;++n)
+		{
+			numLines[n]=m_SamplingMesh->Lines(n);
+			delete[] posLines[n];posLines[n]=new unsigned int[numLines[n]];
+			delete[] discLines[n];discLines[n]=new double[numLines[n]];
+		}
+		m_SamplingMesh->Read(posLines,discLines);
+		return;
+	}
 	if ((m_SampleType==SUBSAMPLE) || (m_SampleType==NONE))
 	{
 		std::vector<unsigned int> tmp_pos;
@@ -377,7 +390,7 @@ const Engine_Field_Gather* ProcessFields::GetGather()
 	if (!m_GatherTried)
 	{
 		m_GatherTried = true;
-		m_Gather = m_Eng_Interface->CreateFieldGather(type==H_FIELD_DUMP, numLines, posLines);
+		m_Gather = m_Eng_Interface->CreateFieldGather(type==H_FIELD_DUMP, numLines, posLines,m_SamplingMesh);
 	}
 	return m_Gather;
 }
@@ -415,6 +428,7 @@ bool ProcessFields::CalcField(ArrayLib::ArrayNIJK<FDTD_FLOAT> &field, const floa
 
 	// E and H dumps with the precomputed node evaluation, if the engine interface has one
 	const Engine_Field_Gather* gather = GetGather();
+	if (gather && !src && gather->EvaluateDevice(field)) return true;
 	if (src && !gather)
 		return false;   // a snapshot needs the precomputed evaluation
 

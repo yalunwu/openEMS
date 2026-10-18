@@ -16,6 +16,7 @@
 */
 
 #include "hip/hip_runtime.h"
+#include <iostream>
 #include "hip_internal.h"
 #include "FDTD/engine.h"
 #include "FDTD/extensions/operator_ext_mur_abc.h"
@@ -113,6 +114,15 @@ HIP_Ext_Mur_ABC::HIP_Ext_Mur_ABC(GPU_Backend_HIP::Impl* impl, Operator_Ext_Mur_A
 	const size_t count = (size_t)m_Param.ni*m_Param.nj;
 	m_Volt_nyP  = d->Alloc<float>(count);
 	m_Volt_nyPP = d->Alloc<float>(count);
+	if (d->setup_result)
+	{
+		const auto prepared=d->setup_result->extension_tables.find(op_ext);
+		if (prepared!=d->setup_result->extension_tables.end())
+		{
+			m_Coeff_nyP=prepared->second->values;m_Coeff_nyPP=m_Coeff_nyP+count;
+			std::cout << "HIP Mur construction result adopted" << std::endl;return;
+		}
+	}
 	m_Coeff_nyP  = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyP.data());
 	m_Coeff_nyPP = d->Alloc<float>(count, op_ext->m_Mur_Coeff_nyPP.data());
 }

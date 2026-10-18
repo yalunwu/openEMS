@@ -53,14 +53,16 @@ void Operator_Ext_DebyeMaterial::DeleteArrays()
 {
 	for (int o=0; o<m_PoleCount; ++o)
 	{
-		if (v_relax_ADE!=NULL)
+		if (v_relax_ADE && v_relax_ADE[o])
 		{
 			for (int n=0; n<3; ++n)
-			{
 				delete[] v_relax_ADE[o][n];
-				delete[] v_drive_ADE[o][n];
-			}
 			delete[] v_relax_ADE[o];
+		}
+		if (v_drive_ADE && v_drive_ADE[o])
+		{
+			for (int n=0; n<3; ++n)
+				delete[] v_drive_ADE[o][n];
 			delete[] v_drive_ADE[o];
 		}
 	}
@@ -232,21 +234,21 @@ bool Operator_Ext_DebyeMaterial::BuildExtension()
 	// cell list is shared, not replicated per pole.
 	m_Order = 1;
 	m_LM_Count.push_back(count);
-	m_volt_ADE_On = new bool[1];
-	m_curr_ADE_On = new bool[1];
+	m_volt_ADE_On = new bool[1]();
+	m_curr_ADE_On = new bool[1]();
 	m_volt_ADE_On[0] = true;
 	m_curr_ADE_On[0] = false;
 
-	m_LM_pos = new unsigned int**[1];
-	m_LM_pos[0] = new unsigned int*[3];
+	m_LM_pos = new unsigned int**[1]();
+	m_LM_pos[0] = new unsigned int*[3]();
 
-	v_solve_ADE = new FDTD_FLOAT*[3];
-	v_relax_ADE  = new FDTD_FLOAT**[m_PoleCount];
-	v_drive_ADE   = new FDTD_FLOAT**[m_PoleCount];
+	v_solve_ADE = new FDTD_FLOAT*[3]();
+	v_relax_ADE  = new FDTD_FLOAT**[m_PoleCount]();
+	v_drive_ADE   = new FDTD_FLOAT**[m_PoleCount]();
 	for (int o=0; o<m_PoleCount; ++o)
 	{
-		v_relax_ADE[o] = new FDTD_FLOAT*[3];
-		v_drive_ADE[o]  = new FDTD_FLOAT*[3];
+		v_relax_ADE[o] = new FDTD_FLOAT*[3]();
+		v_drive_ADE[o]  = new FDTD_FLOAT*[3]();
 	}
 
 	for (int n=0; n<3; ++n)

@@ -21,6 +21,8 @@
 #include "tools/global.h"
 #include <complex>
 #include <vector>
+#include <memory>
+#include "engine_setup_tables.h"
 
 #include "tools/arraylib/array_nijk.h"
 
@@ -35,6 +37,7 @@ class Engine_Field_Gather
 {
 public:
 	virtual ~Engine_Field_Gather() {}
+	virtual bool EvaluateDevice(ArrayLib::ArrayNIJK<float>& field) const {return false;}
 	//! Evaluate the (x,y) lines [line_start, line_stop) of the dump (line i*numLines[1]+j) into \a field, thread-safe
 	/*!
 	  \param src The voltages (E) or currents (H) to read in the engine layout, e.g. a snapshot (see Engine_Interface_Base::TakeFieldSnapshot()), NULL: the current fields
@@ -70,6 +73,9 @@ public:
 
 	//! Called before several threads read the fields concurrently (Get*Field()), e.g. to copy device fields to the host
 	virtual void PrepareFieldAccess() {}
+	virtual std::shared_ptr<Engine_SetupTable> BuildModeMatch(const Engine_ModeTableInput& input) {UNUSED(input);return {};}
+	virtual std::shared_ptr<Engine_CellMaterialTable> BuildCellMaterials(const unsigned int lines[3],unsigned int* const positions[3],const std::shared_ptr<Engine_SamplingMesh>& mesh={})
+	{UNUSED(lines);UNUSED(positions);UNUSED(mesh);return {};}
 
 	//! Copy the current fields into the snapshot for a later Engine_Field_Gather::Evaluate(), returns the voltages and currents (engine layout), or false if the engine has no snapshots
 	/*!
@@ -98,8 +104,8 @@ public:
 	/*!
 	  Returns NULL if the interface has none for its engine. It's the responsibility of the caller to free it.
 	  */
-	virtual Engine_Field_Gather* CreateFieldGather(bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3]) const
-	{UNUSED(h_field); UNUSED(numLines); UNUSED(posLines); return NULL;}
+	virtual Engine_Field_Gather* CreateFieldGather(bool h_field, const unsigned int numLines[3], unsigned int* const posLines[3],const std::shared_ptr<Engine_SamplingMesh>& mesh={}) const
+	{UNUSED(h_field); UNUSED(numLines); UNUSED(posLines);UNUSED(mesh); return NULL;}
 
 	//! Get the (interpolated) electric field at \p pos. \sa SetInterpolationType
 	virtual double* GetEField(const unsigned int* pos, double* out) const =0;

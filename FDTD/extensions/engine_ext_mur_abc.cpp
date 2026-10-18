@@ -28,9 +28,7 @@ using std::endl;
 Engine_Ext_Mur_ABC::Engine_Ext_Mur_ABC(Operator_Ext_Mur_ABC* op_ext) :
 	Engine_Extension(op_ext),
 	m_Mur_Coeff_nyP (op_ext->m_Mur_Coeff_nyP),
-	m_Mur_Coeff_nyPP(op_ext->m_Mur_Coeff_nyPP),
-	m_volt_nyP ("volt_nyP",  op_ext->m_numLines),
-	m_volt_nyPP("volt_nyPP", op_ext->m_numLines)
+	m_Mur_Coeff_nyPP(op_ext->m_Mur_Coeff_nyPP)
 {
 	m_Op_mur = op_ext;
 	m_numLines[0] = m_Op_mur->m_numLines[0];
@@ -40,21 +38,13 @@ Engine_Ext_Mur_ABC::Engine_Ext_Mur_ABC(Operator_Ext_Mur_ABC* op_ext) :
 	m_nyPP = m_Op_mur->m_nyPP;
 	m_LineNr = m_Op_mur->m_LineNr;
 	m_LineNr_Shift = m_Op_mur->m_LineNr_Shift;
+	if (!op_ext->HasDeviceConstruction()) PrepareHost();
 
 	//find if some excitation is on this mur-abc and find the max length of this excite, so that the abc can start after the excitation is done...
 	int maxDelay=-1;
 	Operator_Ext_Excitation* Exc_ext = m_Op_mur->m_Op->GetExcitationExtension();
 	if (Exc_ext) //an unused excitation extension is dropped by the operator
-	{
-		for (size_t n=0; n<Exc_ext->GetVoltCount(); ++n)
-		{
-			if ( ((Exc_ext->Volt_dir[n]==m_nyP) || (Exc_ext->Volt_dir[n]==m_nyPP)) && (Exc_ext->Volt_index[m_ny][n]==m_LineNr) )
-			{
-				if ((int)Exc_ext->Volt_delay[n]>maxDelay)
-					maxDelay = (int)Exc_ext->Volt_delay[n];
-			}
-		}
-	}
+		maxDelay=Exc_ext->GetBoundaryDelay(m_ny,m_LineNr);
 	m_start_TS = 0;
 	if (maxDelay>=0)
 	{
@@ -63,6 +53,13 @@ Engine_Ext_Mur_ABC::Engine_Ext_Mur_ABC(Operator_Ext_Mur_ABC* op_ext) :
 	}
 
 	SetNumberOfThreads(1);
+}
+
+void Engine_Ext_Mur_ABC::PrepareHost()
+{
+	m_Op_mur->EnsureHostConstruction();
+	if (!m_volt_nyP.valid()) m_volt_nyP.Init("volt_nyP",m_numLines);
+	if (!m_volt_nyPP.valid()) m_volt_nyPP.Init("volt_nyPP",m_numLines);
 }
 
 Engine_Ext_Mur_ABC::~Engine_Ext_Mur_ABC()
@@ -85,6 +82,7 @@ void Engine_Ext_Mur_ABC::SetNumberOfThreads(int nrThread)
 template <typename EngType>
 void Engine_Ext_Mur_ABC::DoPreVoltageUpdatesImpl(EngType* eng, int threadID)
 {
+	PrepareHost();
 	if (IsActive()==false) return;
 	if (m_Eng==NULL) return;
 	if (threadID>=m_NrThreads)

@@ -21,20 +21,27 @@
 #include "operator_ext_steadystate.h"
 #include "FDTD/engine_sse.h"
 #include "FDTD/engine_interface_fdtd.h"
+#include <memory>
 
 Engine_Ext_SteadyState::Engine_Ext_SteadyState(Operator_Ext_SteadyState* op_ext): Engine_Extension(op_ext)
 {
 	m_Op_SS = op_ext;
 	m_Priority = ENG_EXT_PRIO_STEADYSTATE;
 
-	for (size_t n=0;n<m_Op_SS->m_E_probe_dir.size();++n)
-	{
-		double* rec = new double[m_Op_SS->m_TS_period*2];
-		m_E_records.push_back(rec);
-	}
+	if (!op_ext->HasDeviceConstruction()) PrepareHost();
 	m_last_max_diff = 1;
 	last_total_energy = 0;
 	m_Eng_Interface = NULL;
+}
+
+void Engine_Ext_SteadyState::PrepareHost()
+{
+	m_Op_SS->EnsureHostConstruction();
+	while (m_E_records.size()<m_Op_SS->m_E_probe_dir.size())
+	{
+		std::unique_ptr<double[]> record(new double[size_t(m_Op_SS->m_TS_period)*2]());
+		m_E_records.push_back(record.get());record.release();
+	}
 }
 
 Engine_Ext_SteadyState::~Engine_Ext_SteadyState()
@@ -51,6 +58,7 @@ Engine_Ext_SteadyState::~Engine_Ext_SteadyState()
 
 void Engine_Ext_SteadyState::Apply2Voltages()
 {
+	PrepareHost();
 	unsigned int p = m_Op_SS->m_TS_period;
 	unsigned int TS = m_Eng->GetNumberOfTimesteps();
 	unsigned int rel_pos = m_Eng->GetNumberOfTimesteps()%(2*p);
@@ -64,15 +72,8 @@ void Engine_Ext_SteadyState::CheckPeriod(unsigned int rel_pos, const std::functi
 {
 	const unsigned int p = m_Op_SS->m_TS_period;
 	const size_t count = m_Op_SS->m_E_probe_dir.size();
-	bool no_valid = true;
-	m_last_max_diff = 0;
-	double curr_total_energy = m_Eng_Interface->CalcFastEnergy();
-	if (last_total_energy>0)
-	{
-		m_last_max_diff = std::fabs(curr_total_energy-last_total_energy)/last_total_energy;
-		no_valid = false;
-	}
-	last_total_energy = curr_total_energy;
+	bool valid=false;
+	double difference=0;
 	unsigned int old_pos = 0;
 	unsigned int new_pos = p;
 	if (rel_pos<=p)
@@ -97,12 +98,25 @@ void Engine_Ext_SteadyState::CheckPeriod(unsigned int rel_pos, const std::functi
 	{
 		if (curr_pow[n]>max_pow*1e-2)
 		{
-			m_last_max_diff = std::max(m_last_max_diff, diff_pow[n]/curr_pow[n]);
-			no_valid = false;
+			difference = std::max(difference, diff_pow[n]/curr_pow[n]);
+			valid = true;
 		}
 	}
-	if ((no_valid) || (m_last_max_diff>1))
-		m_last_max_diff = 1;
+	SetPeriodDifference(difference,valid);
+}
+
+
+void Engine_Ext_SteadyState::SetPeriodDifference(double difference,bool valid)
+{
+	m_last_max_diff=difference;
+	const double energy=m_Eng_Interface->CalcFastEnergy();
+	if (last_total_energy>0)
+	{
+		m_last_max_diff=std::max(m_last_max_diff,std::fabs(energy-last_total_energy)/last_total_energy);
+		valid=true;
+	}
+	last_total_energy=energy;
+	if (!valid || m_last_max_diff>1) m_last_max_diff=1;
 }
 
 void Engine_Ext_SteadyState::Apply2Current()

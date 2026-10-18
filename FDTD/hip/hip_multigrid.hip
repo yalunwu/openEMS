@@ -17,6 +17,40 @@
 
 #include "hip/hip_runtime.h"
 #include "hip_internal.h"
+#include <iostream>
+#include <cstdlib>
+
+HIP_SetupMultiGrid::~HIP_SetupMultiGrid()
+{
+	hipStreamSynchronize(context->stream);
+	for (uint32_t k=0;k<4;++k) {if (positions[k]) hipFree(positions[k]);if (weights[k]) hipFree(weights[k]);}
+}
+
+void HIP_SetupMultiGrid::Read(GPU_MultiGridInterpolation& output,bool diagnostics) const
+{
+	output.split_pos=split;
+	std::vector<unsigned int>* p[4]={output.pos_v_2p,output.pos_v_2pp,output.pos_i_2p,output.pos_i_2pp};
+	std::vector<float>* w[4]={output.w_v_2p,output.w_v_2pp,output.w_i_2p,output.w_i_2pp};
+	std::vector<unsigned int> indices(2ull*alpha);std::vector<float> values(2ull*alpha);
+	for (uint32_t k=0;k<4;++k)
+	{
+		HIP_Check(hipMemcpyAsync(indices.data(),positions[k],indices.size()*sizeof(unsigned int),hipMemcpyDeviceToHost,context->stream),"requested multigrid positions");
+		HIP_Check(hipMemcpyAsync(values.data(),weights[k],values.size()*sizeof(float),hipMemcpyDeviceToHost,context->stream),"requested multigrid weights");
+		HIP_Check(hipStreamSynchronize(context->stream),"requested multigrid completion");
+		for (uint32_t n=0;n<2;++n)
+		{
+			p[k][n].assign(indices.begin()+size_t(n)*alpha,indices.begin()+size_t(n+1)*alpha);
+			w[k][n].assign(values.begin()+size_t(n)*alpha,values.begin()+size_t(n+1)*alpha);
+		}
+	}
+	if (diagnostics) std::cout << "GPU requested host multigrid: d2h_bytes=" << 16ull*alpha*sizeof(float) << std::endl;
+}
+
+void HIP_SetupResult::ReadMultiGrid(GPU_MultiGridInterpolation& output) const
+{
+	if (!multigrid) throw std::logic_error("multigrid construction result is missing");
+	multigrid->Read(output,std::getenv("OPENEMS_GPU_DIAGNOSTICS") && std::atoi(std::getenv("OPENEMS_GPU_DIAGNOSTICS"))!=0);
+}
 
 // Coupling of a cylindrical multi-grid level (base) and its sub-grid, see
 // Engine_CylinderMultiGrid and Engine_Ext_CylinderMultiGrid. Both grids share the
@@ -82,6 +116,14 @@ HIP_MultiGridLink::HIP_MultiGridLink(GPU_Backend_HIP::Impl* base, GPU_Backend_HI
 	b = base;
 	s = sub;
 	m_SplitPos = interpol.split_pos;
+	if (b->setup_result && b->setup_result->multigrid)
+	{
+		const auto& result=*b->setup_result->multigrid;
+		if (result.split!=m_SplitPos || result.alpha!=b->dim.ny) throw std::runtime_error("multigrid construction dimensions changed");
+		m_Volt={result.positions[0],result.positions[1],result.weights[0],result.weights[1]};
+		m_Curr={result.positions[2],result.positions[3],result.weights[2],result.weights[3]};
+		std::cout << "HIP multigrid construction result adopted" << std::endl;return;
+	}
 	m_Volt = Upload(interpol.pos_v_2p, interpol.pos_v_2pp, interpol.w_v_2p, interpol.w_v_2pp);
 	m_Curr = Upload(interpol.pos_i_2p, interpol.pos_i_2pp, interpol.w_i_2p, interpol.w_i_2pp);
 }

@@ -41,6 +41,7 @@ public:
 	virtual void Apply2Voltages();
 
 protected:
+	void PrepareHost();
 	template <typename EngType>
 	void Apply2VoltagesImpl(EngType* eng);
 

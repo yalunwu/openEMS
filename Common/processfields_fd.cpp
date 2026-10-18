@@ -69,22 +69,22 @@ void ProcessFieldsFD::InitProcess()
 		m_HDF5_Dump_File->WriteAttribute("/FieldData/FD","frequency",m_FD_Samples);
 	}
 
-	//create data structures...
-	for (size_t n = 0; n<m_FD_Samples.size(); ++n)
-	{
-		ArrayLib::ArrayNIJK<std::complex<float>>* field_fd = new ArrayLib::ArrayNIJK<std::complex<float>>("FD field", numLines);
-		m_FD_Fields.push_back(field_fd);
-	}
-
 	// let the engine keep the sums (e.g. on the device), else sum them from field snapshots
-	// in the background. Both need the node gather, so not the SAR dumps, whose dump type
-	// has none, and both are decided before the run: the engine takes the dumped nodes of
+	// in the background. Both need the node gather and are decided before the run: the engine takes the dumped nodes of
 	// every dump before the first snapshot
 	if (GetGather())
 	{
 		m_FieldDFT = m_Eng_Interface->CreateFieldDFT(m_Gather, m_FD_Samples.size());
 		if (m_FieldDFT<0)
 			m_Snapshots = m_Eng_Interface->PrepareSnapshotGather(m_Gather);
+	}
+	// Device DFT sums need host storage only
+	// when output is requested after stepping.
+	for (size_t n=0;n<m_FD_Samples.size();++n)
+	{
+		auto* field=new ArrayLib::ArrayNIJK<std::complex<float>>();
+		m_FD_Fields.push_back(field);
+		if (m_FieldDFT<0) field->Init("FD field",numLines);
 	}
 }
 
@@ -168,6 +168,8 @@ void ProcessFieldsFD::FinishAsync()
 void ProcessFieldsFD::PostProcess()
 {
 	FinishAsync();
+	if (m_FieldDFT>=0)
+		for (auto* field:m_FD_Fields) field->Init("requested FD field",numLines);
 	if ((m_FieldDFT>=0) && !m_Eng_Interface->ReadFieldDFT(m_FieldDFT, m_FD_Fields))
 		cerr << "ProcessFieldsFD::PostProcess: can't read the frequency domain fields of the engine!" << endl;
 	DumpFDData();

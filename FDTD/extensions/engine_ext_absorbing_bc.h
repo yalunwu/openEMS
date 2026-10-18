@@ -49,6 +49,7 @@ public:
 	virtual void Apply2Current(int threadID);
 
 protected:
+	void PrepareHost();
 	Operator_Ext_Absorbing_BC* m_Op_ABC;
 
 	template <typename EngType>

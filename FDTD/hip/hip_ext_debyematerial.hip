@@ -16,7 +16,9 @@
 */
 
 #include "hip/hip_runtime.h"
+#include <iostream>
 #include "hip_internal.h"
+#include "setup_indices_hip.hiph"
 #include "FDTD/engine.h"
 #include "FDTD/extensions/operator_ext_debyematerial.h"
 #include "FDTD/extensions/engine_ext_debyematerial.h"
@@ -127,6 +129,17 @@ HIP_Ext_DebyeMaterial::HIP_Ext_DebyeMaterial(GPU_Backend_HIP::Impl* impl, Operat
 	m_Param.sn = d->numCells;
 	if (count==0)
 		return;
+	if (d->setup_result)
+	{
+		const auto prepared=d->setup_result->sparse.find(op_ext);
+		if (prepared!=d->setup_result->sparse.end())
+		{
+			const auto& block=prepared->second->blocks.at(0);m_Pos=HIP_WidenSetupIndices(d,block.nodes,block.count);
+			m_Solve=block.coefficients[0]->values;m_Relax=block.coefficients[1]->values;m_Drive=block.coefficients[2]->values;
+			m_Pole=d->Alloc<float>(size_t(m_Param.poles)*3*count);m_Pre=d->Alloc<float>(3ull*count);m_ADE=d->Alloc<float>(3ull*count);
+			std::cout << "HIP Debye construction result adopted" << std::endl;return;
+		}
+	}
 
 	unsigned int** pos = op_ext->m_LM_pos[0];
 	std::vector<size_t> flat(count);
